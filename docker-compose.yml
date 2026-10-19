@@ -1,0 +1,40 @@
+services:
+  nvidia-asr:
+    build:
+      context: .
+    image: nvidia-asr:local
+    ports:
+      - "${HOST_PORT:-8000}:8000"
+    env_file:
+      - .env
+    environment:
+      JOBS_DIR: /data/jobs
+      MOCK_PIPELINE: ${MOCK_PIPELINE:-0}
+      # Pinned backend contract (pipeline/transcribe.py). CRISPASR_GPU_BACKEND
+      # stays literal "cuda": the crispasr CLI silently falls back to CPU when
+      # libcudart/libcublas are missing, and the --version probe must fail
+      # fast on that instead of spending minutes per job.
+      CRISPASR_BIN: ${CRISPASR_BIN:-/opt/crispasr/crispasr}
+      GGUF_MODEL: ${GGUF_MODEL:-/opt/models/nemotron-3.5-asr-streaming-0.6b-q4_k.gguf}
+      CRISPASR_LIB_DIR: ${CRISPASR_LIB_DIR:-/usr/local/cuda-13.0/targets/x86_64-linux/lib}
+      CRISPASR_GPU_BACKEND: cuda
+      DIAR_METHOD: foxnose
+      VRAM_LIMIT_MIB: 3584
+      CRISPASR_TIMEOUT_SECONDS: 1800
+    volumes:
+      # foxnose embedder + any --auto-download artifacts persist here;
+      # the Q4_K GGUF itself is baked into the image at /opt/models.
+      - crispasr-cache:/var/cache/crispasr
+      - jobs-data:/data/jobs
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    restart: unless-stopped
+
+volumes:
+  crispasr-cache:
+  jobs-data:

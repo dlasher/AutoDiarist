@@ -1,0 +1,22 @@
+# Python build/test artifacts
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.venv/
+.venv*/
+
+# Secrets — copy .env.example to .env locally
+.env
+
+# Audio fixtures are local-only (repo stays < 5MB; audio.wav is a 74MB
+# untracked test fixture — see README "Quickstart")
+*.wav
+
+# Quarantined pre-pivot / dev leftovers
+_quarantine-mock-*/
+
+# Job output dirs (container writes /data/jobs; local runs may drop ./jobs)
+/jobs/
+/data/

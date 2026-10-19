@@ -1,0 +1,17 @@
+# Local configuration and runtime state
+.env
+/models
+/data
+
+# Python build and test artifacts
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.coverage
+
+# Repository metadata and editor state
+.git/
+.gitignore
+.venv/
+venv/
