@@ -98,16 +98,16 @@ def _pipeline_value(meta: Mapping[str, Any]) -> str:
     deliberately ignored — the NeMo label no longer describes the backend.
     """
     if os.environ.get("MOCK_PIPELINE") == "1":
-        return "nvidia-asr v1 (mock)"
+        return "autodiarist v1 (mock)"
     label = meta.get("backend_label")
     if label:
-        return f"nvidia-asr v1 ({label})"
+        return f"autodiarist v1 ({label})"
     try:
         from pipeline.transcribe import backend_identity
         identity = backend_identity()
     except ImportError:  # pragma: no cover - transcribe is stdlib-only
         identity = "CrispASR nemotron Q4_K @unknown"
-    return f"nvidia-asr v1 ({identity})"
+    return f"autodiarist v1 ({identity})"
 
 
 def _segment_dict(segment: Any) -> dict[str, Any]:

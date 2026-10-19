@@ -285,7 +285,7 @@ def test_pipeline_stamp_mock_mode(monkeypatch):
 
     rendered = render_markdown(fixture_segments()[:1], fixture_meta())
 
-    assert "| Pipeline | nvidia-asr v1 (mock) |" in rendered
+    assert "| Pipeline | autodiarist v1 (mock) |" in rendered
     # mock wins even when a caller supplied a backend label
     assert "CrispASR" not in rendered
 
@@ -304,7 +304,7 @@ def test_pipeline_stamp_uses_cached_probe_identity(monkeypatch):
 
     rendered = render_markdown(fixture_segments()[:1], _meta_without_label())
 
-    assert "| Pipeline | nvidia-asr v1 (CrispASR nemotron Q4_K @v0.8.43) |" in rendered
+    assert "| Pipeline | autodiarist v1 (CrispASR nemotron Q4_K @v0.8.43) |" in rendered
 
 
 def test_pipeline_stamp_unprobed_falls_back_to_unknown(monkeypatch):
@@ -314,7 +314,7 @@ def test_pipeline_stamp_unprobed_falls_back_to_unknown(monkeypatch):
 
     rendered = render_markdown(fixture_segments()[:1], _meta_without_label())
 
-    assert "| Pipeline | nvidia-asr v1 (CrispASR nemotron Q4_K @unknown) |" in rendered
+    assert "| Pipeline | autodiarist v1 (CrispASR nemotron Q4_K @unknown) |" in rendered
     assert "NeMo Speech" not in rendered
     # legacy meta keys must no longer leak into the stamp
     legacy = render_markdown(

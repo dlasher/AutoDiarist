@@ -4,10 +4,10 @@
 
 - Renderer pipeline stamp now reports the actual backend identity
   (card t_3275e056, follow-up to the docs rewrite):
-  `nvidia-asr v1 (CrispASR nemotron Q4_K @<version>)`, with `<version>`
+  `autodiarist v1 (CrispASR nemotron Q4_K @<version>)`, with `<version>`
   parsed from the `crispasr --version` probe output and cached alongside
   the backend registration; `@unknown` only until a probe has run.
-  `MOCK_PIPELINE=1` renders the deterministic `nvidia-asr v1 (mock)`.
+  `MOCK_PIPELINE=1` renders the deterministic `autodiarist v1 (mock)`.
   The legacy `NeMo Speech @<sha>` label and the `nemo_speech_sha`/
   `nemo_sha` meta keys are retired from `pipeline/renderer.py`; golden
   fixture, `tests/pipeline/test_renderer.py`, and the PIPELINE.md

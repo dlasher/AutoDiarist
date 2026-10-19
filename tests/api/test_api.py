@@ -77,6 +77,6 @@ def test_mock_job_lifecycle(client):
     assert dl_res.status_code == 200
     # Matches pipeline.transcribe._mock_segments() output (the old "Mock
     # transcript text" fixture string no longer exists in the pipeline).
-    assert "NVIDIA ASR pipeline demo" in dl_res.text
+    assert "AutoDiarist pipeline demo" in dl_res.text
     md_res = client.get(f"/v1/jobs/{token}/download?format=md")
     assert md_res.status_code == 200

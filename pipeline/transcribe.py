@@ -580,7 +580,7 @@ def _probe_duration(path: str | Path) -> float:
 
 def _mock_segments() -> list[dict[str, Any]]:
     return [
-        {"text": "Hello and welcome to the NVIDIA ASR pipeline demo.",
+        {"text": "Hello and welcome to the AutoDiarist pipeline demo.",
          "t0": 0.0, "t1": 3.5, "speaker": "Speaker 1"},
         {"text": "Thanks for having me, let's review the diarization results.",
          "t0": 3.8, "t1": 7.2, "speaker": "Speaker 2"},
@@ -609,7 +609,7 @@ def transcribe_and_diarize(
     if progress is not None:
         completed += 1
         progress("asr", completed, total_units)
-    with tempfile.TemporaryDirectory(prefix="nvidia-asr-crispasr-") as work_dir:
+    with tempfile.TemporaryDirectory(prefix="autodiarist-crispasr-") as work_dir:
         segments = _run_crispasr(str(audio_path), work_dir)
     if progress is not None:
         completed += 1

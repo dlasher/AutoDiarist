@@ -1,4 +1,4 @@
-# NVIDIA ASR Service
+# AutoDiarist
 
 Asynchronous HTTP job API that takes WAV/MP3/M4A/AAC/OGG/FLAC uploads and
 returns a diarized Markdown transcript. Backend per the spike GO verdict
@@ -43,8 +43,8 @@ capability 7.5) on which the pinned engine build's real `sm_75` kernels were
 validated during the spike; other architectures were not the release target.
 
 ```bash
-git clone <repository-url> nvidia-asr
-cd nvidia-asr
+git clone <repository-url> autodiarist
+cd autodiarist
 cp .env.example .env
 docker compose up --build
 ```
@@ -76,8 +76,8 @@ Prerequisites: Python 3.10+ only. `ffmpeg` is required exclusively for real
 transcription runs; mock mode never touches it.
 
 ```bash
-git clone <repository-url> nvidia-asr
-cd nvidia-asr
+git clone <repository-url> autodiarist
+cd autodiarist
 python3 -m venv .venv
 . .venv/bin/activate
 python3 -m pip install --upgrade pip
@@ -102,7 +102,7 @@ test fixture** — `.gitignore` excludes `*.wav` so the repo stays under 5 MB.
 Place any WAV file at `./audio.wav` in the repo root to follow the
 curl examples above. Mock mode (`MOCK_PIPELINE=1`) never reads the bytes;
 real runs need 16 kHz-capable content (any standard WAV is accepted —
-`ffmpeg` normalizes it). To generate a placeholder locally:
+`ffmpeg` normalizes it). To generate a stand-in tone locally:
 
 ```bash
 ffmpeg -f lavfi -i sine=frequency=440:duration=5 -ac 1 -ar 16000 audio.wav
@@ -114,6 +114,67 @@ ffmpeg -f lavfi -i sine=frequency=440:duration=5 -ac 1 -ar 16000 audio.wav
 passes `-l en-US` (overridable via `CRISPASR_LANGUAGE` for local per-locale
 experimentation) and the rendered metadata table reports `en-US`. No
 `language` request parameter is accepted.
+
+## Other backends
+
+The image pins the `cuda13` Linux release asset, but the engine itself
+carries a wider build matrix. The authoritative source for per-asset
+detail is upstream: CrispASR
+[docs/install.md](https://github.com/CrispStrobe/CrispASR/blob/main/docs/install.md)
+("Prebuilt Linux tarballs") and
+[docs/environment-variables.md](https://github.com/CrispStrobe/CrispASR/blob/main/docs/environment-variables.md).
+**No row below `cuda13` is verified by this project** — the only hardware
+we have here is NVIDIA, so the non-CUDA paths are documented as upstream
+facts for reference, not as supported deployments of this service. The
+adapter additionally accepts only `cpu`/`cuda`/`metal`/`vulkan` for
+`CRISPASR_GPU_BACKEND` (CONFIG.md); there is no supported engine path here
+for HIP, WASM, or CANN at all.
+
+| Engine path | Upstream build/runtime status | Verified here? |
+| --- | --- | --- |
+| `crispasr-linux-x86_64-cuda13.tar.gz` (pinned) | CUDA 13; falls back to CPU when CUDA libs are absent | yes — T400, `sm_75` (spike t_7e17589e) |
+| `crispasr-linux-x86_64-cuda.tar.gz` | CUDA 12; same CPU fallback | no — NOT verified |
+| `crispasr-linux-x86_64` plain / `-cpu-legacy` / `-avx512` | CPU-only builds | no — NOT verified |
+| `crispasr-linux-x86_64-vulkan.tar.gz` | Vulkan GPU; **no** CPU fallback | no — NOT verified |
+| `crispasr-linux-x86_64-hip.tar.gz` | AMD ROCm; **no** CPU fallback | no — NOT verified |
+| Metal (`-DGGML_METAL=ON` source build) | Apple GPU; ggml prefers CUDA > Metal > SYCL > Vulkan > CPU at runtime | no — NOT verified |
+| WASM (`build-wasm.sh`) | all backends compile to WebAssembly; runs multithreaded in the browser | no — NOT verified |
+| CANN (`-DGGML_CANN=ON`, `--gpu-backend cann`) | Huawei Ascend; see the CANN caveat below | no — NOT verified |
+
+Fallback rule (per upstream install.md): the Linux `-cuda` and `-cuda13`
+tarballs use dynamic backend loading (`GGML_BACKEND_DL`) since v0.8.30 —
+if the NVIDIA driver or CUDA runtime is missing, the CUDA backend simply
+does not load and the process silently runs on CPU and exits 0. That is
+exactly the failure mode the adapter guards against by pinning
+`--gpu-backend cuda` and probing the build's registered backends before
+the first job (see the silent-CPU-fallback note in *Replication notes*
+and TROUBLESHOOTING.md). The `-vulkan` and `-hip` tarballs are statically
+linked against their respective runtimes and do **not** fall back to CPU:
+without the matching driver they fail loudly instead of quietly
+transcribing slowly. Upstream keeps those two release legs static until
+each has been A/B-tested on real AMD and Vulkan hardware.
+
+CANN is the mirror-image caveat: the manual `cann-build.yml` workflow
+compiles CLI, shared library, diff and quantizer with the official CANN
+SDK images on x86_64/910B (ACL graphs enabled) and arm64/310P (ACL graphs
+disabled), but GitHub hosted runners carry no Ascend NPU — a green run is
+compile proof, not inference or performance proof. Treat CANN as
+unvalidated upstream as well as here.
+
+To check what a given prebuilt asset actually requires before deploying
+it:
+
+```bash
+readelf -d crispasr | grep NEEDED
+```
+
+Engine environment variables follow upstream's
+`CRISPASR_<BACKEND>_<FEATURE>` convention (per-backend switches such as
+`CRISPASR_OMNIVOICE_CODEC_GPU`; process-global variables drop the backend
+segment — `docs/environment-variables.md` is the canonical list). The
+adapter's own `CRISPASR_*` names share that prefix but are this service's
+settings, documented in CONFIG.md; the adapter hands values to the engine
+as explicit CLI flags (e.g. `CRISPASR_CACHE_DIR` -> `--cache-dir`).
 
 ## Replication notes
 

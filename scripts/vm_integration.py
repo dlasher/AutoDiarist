@@ -2,7 +2,7 @@
 
 Run ON the GPU VM:
 
-    REPO=/root/nvidia-asr-adapter python3 scripts/vm_integration.py \
+    REPO=/root/autodiarist-adapter python3 scripts/vm_integration.py \
         /root/audio.wav /root/crispasr_adapter_run/segments.json
 
 with CRISPASR_BIN / GGUF_MODEL exported. Prints ONLY summary lines (counts,
@@ -17,7 +17,7 @@ import os
 import sys
 import traceback
 
-sys.path.insert(0, os.environ.get("REPO", "/root/nvidia-asr-adapter"))
+sys.path.insert(0, os.environ.get("REPO", "/root/autodiarist-adapter"))
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
 

@@ -27,7 +27,7 @@ logger = logging.getLogger("api.main")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
 logging.getLogger().setLevel(logging.INFO)
 
-JOBS_DIR = Path(os.environ.get("JOBS_DIR", "/tmp/nvidia_asr_jobs"))
+JOBS_DIR = Path(os.environ.get("JOBS_DIR", "/tmp/autodiarist_jobs"))
 MAX_UPLOAD_BYTES = int(os.environ.get("MAX_UPLOAD_BYTES", 500 * 1024 * 1024))
 JOBS_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -327,7 +327,7 @@ async def lifespan(app: FastAPI):
                 await worker_task
 
 
-app = FastAPI(title="NVIDIA ASR Service", version="1.0.0", lifespan=lifespan)
+app = FastAPI(title="AutoDiarist", version="1.0.0", lifespan=lifespan)
 
 
 class JobResponse(BaseModel):

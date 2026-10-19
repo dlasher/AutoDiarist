@@ -7,7 +7,7 @@
 | Language | en-US |
 | Processed | 2026-10-16T11:30:00-07:00 |
 | Speakers | 2 (Speaker 1 (Jane Wu); Speaker 2) |
-| Pipeline | nvidia-asr v1 (CrispASR nemotron Q4_K @v0.8.43) |
+| Pipeline | autodiarist v1 (CrispASR nemotron Q4_K @v0.8.43) |
 
 ## Speaker mapping
 

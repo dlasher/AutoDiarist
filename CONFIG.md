@@ -28,7 +28,7 @@ GPU-default values.
 
 | Variable | Default | Effect and validation |
 | --- | --- | --- |
-| `JOBS_DIR` | `/tmp/nvidia_asr_jobs` | Job-state root. Created at import time; the compose file sets `/data/jobs` on a named volume. Holds `<token>/status.json` plus the decoded/transcribed artifacts. |
+| `JOBS_DIR` | `/tmp/autodiarist_jobs` | Job-state root. Created at import time; the compose file sets `/data/jobs` on a named volume. Holds `<token>/status.json` plus the decoded/transcribed artifacts. |
 | `MAX_UPLOAD_BYTES` | `524288000` (500 MiB) | Upload cap enforced while streaming; oversize uploads get `413` and leave no job dir. Parsed `int` at request time. |
 | `MOCK_PIPELINE` | unset | Exact `1` makes the worker short-circuit decode/ASR and write a deterministic mock result; admission, limits, cancellation, and download semantics are unchanged. |
 | `SPELL_CHECK` | unset | Exact `1` enables the spell-check stage in the worker. Note the two-way mismatch documented in PIPELINE.md: the API stage requires `==1`, while `pipeline.spellcheck` on its own defaults enabled unless the value is in `{0,false,no,off}`. |

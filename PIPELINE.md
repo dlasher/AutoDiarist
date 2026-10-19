@@ -220,7 +220,7 @@ carry no provenance and are treated as resolved.
 ### Pipeline stamp
 
 The Pipeline metadata row renders the actual backend identity
-(card t_3275e056): `nvidia-asr v1 (CrispASR nemotron Q4_K @<version>)`.
+(card t_3275e056): `autodiarist v1 (CrispASR nemotron Q4_K @<version>)`.
 `<version>` is parsed from the same `crispasr --version` output the
 CUDA guard consumes — `probe_crispasr_binary` caches it in
 `_BACKEND_PROBE_CACHE` and `pipeline.transcribe.backend_identity()`
@@ -228,6 +228,6 @@ exposes the label, rendering `@unknown` only until a probe has run in
 the process (which the real path always does before rendering). A caller
 may override the label via `meta['backend_label']`. Because the probe
 never runs in mock mode, `MOCK_PIPELINE=1` renders the deterministic
-`nvidia-asr v1 (mock)`. The pre-pivot `NeMo Speech @<sha>` label and the
+`autodiarist v1 (mock)`. The pre-pivot `NeMo Speech @<sha>` label and the
 legacy meta keys `nemo_speech_sha`/`nemo_sha` are retired: the renderer
 ignores them.
