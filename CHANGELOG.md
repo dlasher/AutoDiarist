@@ -1,7 +1,8 @@
 # Changelog
 
-## Unreleased
+## 1.0.1 - 2026-10-19
 
+- Project rebrand `nvidia-asr` -> `AutoDiarist` (commit 1dc36af).
 - Renderer pipeline stamp now reports the actual backend identity
   (card t_3275e056, follow-up to the docs rewrite):
   `autodiarist v1 (CrispASR nemotron Q4_K @<version>)`, with `<version>`

@@ -43,7 +43,7 @@ capability 7.5) on which the pinned engine build's real `sm_75` kernels were
 validated during the spike; other architectures were not the release target.
 
 ```bash
-git clone <repository-url> autodiarist
+git clone https://github.com/dlasher/AutoDiarist.git autodiarist
 cd autodiarist
 cp .env.example .env
 docker compose up --build
@@ -76,7 +76,7 @@ Prerequisites: Python 3.10+ only. `ffmpeg` is required exclusively for real
 transcription runs; mock mode never touches it.
 
 ```bash
-git clone <repository-url> autodiarist
+git clone https://github.com/dlasher/AutoDiarist.git autodiarist
 cd autodiarist
 python3 -m venv .venv
 . .venv/bin/activate
