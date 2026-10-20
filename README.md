@@ -256,23 +256,46 @@ detail is upstream: CrispASR
 [docs/install.md](https://github.com/CrispStrobe/CrispASR/blob/main/docs/install.md)
 ("Prebuilt Linux tarballs") and
 [docs/environment-variables.md](https://github.com/CrispStrobe/CrispASR/blob/main/docs/environment-variables.md).
-**No row below `cuda13` is verified by this project** — the only hardware
-we have here is NVIDIA, so the non-CUDA paths are documented as upstream
-facts for reference, not as supported deployments of this service. The
+**Aside from the CPU execution path (measured below), no row under `cuda13`
+is verified by this project** — the only hardware we have here is NVIDIA, so
+the remaining non-CUDA paths are documented as upstream facts for reference,
+not as supported deployments of this service. The
 adapter additionally accepts only `cpu`/`cuda`/`metal`/`vulkan` for
 `CRISPASR_GPU_BACKEND` (CONFIG.md); there is no supported engine path here
 for HIP, WASM, or CANN at all.
 
 | Engine path | Upstream build/runtime status | Verified here? |
 | --- | --- | --- |
-| `crispasr-linux-x86_64-cuda13.tar.gz` (pinned) | CUDA 13; falls back to CPU when CUDA libs are absent | yes — T400, `sm_75` (spike t_7e17589e) |
+| `crispasr-linux-x86_64-cuda13.tar.gz` (pinned) | CUDA 13; falls back to CPU when CUDA libs are absent | yes — T400, `sm_75` (spike t_7e17589e); CPU execution of this same asset tested separately (row below, measurements after the table) |
+| CPU execution of the pinned `cuda13` asset (`libggml-cuda.so` absent → `GGML_BACKEND_DL` fallback) | tested v0.8.43 on the 60 s spike source; a pure-CPU host (no NVIDIA driver at all) is N/A on this GPU box | yes — ~1.7x slower wall than CUDA on the same 60 s input; results in kanban t_18ee2e43 (`REPORT_CPU.md`) |
 | `crispasr-linux-x86_64-cuda.tar.gz` | CUDA 12; same CPU fallback | no — NOT verified |
-| `crispasr-linux-x86_64` plain / `-cpu-legacy` / `-avx512` | CPU-only builds | no — NOT verified |
+| `crispasr-linux-x86_64` plain / `-cpu-legacy` / `-avx512` | CPU-only standalone builds; their inference path is the same CPU backend exercised in the fallback row above, but these exact assets were never downloaded on this host | no — NOT verified as separate assets |
 | `crispasr-linux-x86_64-vulkan.tar.gz` | Vulkan GPU; **no** CPU fallback | no — NOT verified |
 | `crispasr-linux-x86_64-hip.tar.gz` | AMD ROCm; **no** CPU fallback | no — NOT verified |
 | Metal (`-DGGML_METAL=ON` source build) | Apple GPU; ggml prefers CUDA > Metal > SYCL > Vulkan > CPU at runtime | no — NOT verified |
 | WASM (`build-wasm.sh`) | all backends compile to WebAssembly; runs multithreaded in the browser | no — NOT verified |
 | CANN (`-DGGML_CANN=ON`, `--gpu-backend cann`) | Huawei Ascend; see the CANN caveat below | no — NOT verified |
+
+### CPU execution — measured (v0.8.43, kanban t_18ee2e43)
+
+Protocol: the pinned `crispasr-linux-x86_64-cuda13.tar.gz` (sha256
+`fea397a3…4fdf54`, `ggml backends: cpu,cuda`) re-extracted to a clean dir on
+the T400 VM, `libggml-cuda.so` quarantined out of the extraction (the
+documented `GGML_BACKEND_DL` fallback — no CUDA runtime can load), and the
+60 s spike source (`excerpt60.wav`, sha256 `b5559cf7…afd46ce`, 1,920,078 B)
+piped via ffmpeg exactly as the GPU runs. No GPU flags were passed.
+Results on 4 vCPUs: exit 0; ASR-only wall 13.7 s median (3 repeats,
+±0.02 s; first cold-cache run ~20 s) vs 8 s on CUDA for the same input —
+**~1.7x slower wall** (engine-reported 13.67 s vs 6.16 s, ~2.2x); diarized
+wall 24.4 s vs 13 s on CUDA; peak RSS ~937 MiB ASR-only, ~1,065 MiB
+diarized. Transcript parity vs the CUDA runs on the same clip: 3/3 sections,
+identical speaker labels, 97.7% word agreement, ±400 ms segment-boundary
+drift. Guards: `nvidia-smi` showed 0 compute apps and 0 MiB used throughout;
+`audio.wav` and the spike/VRAM artifacts verified byte-identical pre/post.
+**Caveat found:** `--gpu-backend cpu` alone is *not* "no CUDA runtime
+loaded" — the plugin still dlopens and `ggml_cuda_init` still enumerates the
+GPU before compute falls to CPU; true CPU-only execution requires the runtime
+or the backend `.so` to be absent (or a CPU-only build asset).
 
 Fallback rule (per upstream install.md): the Linux `-cuda` and `-cuda13`
 tarballs use dynamic backend loading (`GGML_BACKEND_DL`) since v0.8.30 —
