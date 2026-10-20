@@ -1,5 +1,41 @@
 # Changelog
 
+## 1.0.2 - 2026-10-20 (docs final — no code changes)
+
+- CPU-only validation of the pinned `cuda13` v0.8.43 asset (card
+  t_18ee2e43, README commit 2bffe0e): with `libggml-cuda.so` quarantined —
+  the documented `GGML_BACKEND_DL` fallback — the 60 s spike source ran on
+  4 vCPUs at ~1.7x CUDA wall (ASR-only 13.7 s median vs 8 s; diarized
+  24.4 s vs 13 s; peak RSS ~1,065 MiB) with 97.7% word parity, 3/3
+  sections and identical speaker labels; the full 39-minute fixture took
+  142.9 s vs 12.3 s (~11.6x) at 71.2% parity. `nvidia-smi` showed 0
+  compute apps / 0 MiB GPU throughout; caveat documented:
+  `--gpu-backend cpu` alone still dlopens the CUDA plugin. This
+  measurement scopes the older `~11x` estimate in the guard message
+  (`pipeline/transcribe.py`): it holds at production-file lengths, not on
+  short clips.
+- Live fresh-clone replication proof (card t_99d78ff4): the public repo
+  (`github.com/dlasher/AutoDiarist`) was cloned at 88dee5d to
+  `/root/replication-test` on the T400 VM and `docker compose build` +
+  `up` succeeded from the clone alone — both `sha256sum -c` verifications
+  passed (model + engine), the backend assertion logged
+  `crispasr probe: version-ok backends=['cpu', 'cuda'] pinned=cuda`, and
+  2 E2E jobs ran on the 39-minute fixture (252/252 segments, 3 speakers,
+  wall 437 s; peak `allocated=1083 MiB / peak=1085 MiB`), zero ERROR
+  lines. Host driver 580.178.04 vs image CUDA userland 595.71.05
+  compatibility confirmed.
+- VM cleanup complete (card t_413e2b7b): ~48 GB reclaimed on the
+  validation box (`df -h` free 25 GB -> 73 GB) — homemade
+  `nvidia-asr:local` image (18.5 GB), docker build cache (25.0 GB),
+  legacy image layers/volumes (4.7 GB), spike/adapter dirs (10.1 GB),
+  host `cuda13` apt runtime (~1 GB, image-bundled now), stale job
+  artifacts (0.14 GB). All reports/patches were copied first to
+  `~/CODE/nvidia-asr-planning/archive/vm-cleanup-2026-10-20/` (sealed
+  tarball sha256 `f73eb3d4…`). Deployment survived the purge: post-cleanup
+  GPU job `745556b4-…` completed in the kept
+  `/root/replication-test` stack; `/opt/nvidia-asr` (131 MB) retained as
+  reviewer-approved fallback.
+
 ## 1.0.1 - 2026-10-19
 
 - Project rebrand `nvidia-asr` -> `AutoDiarist` (commit 1dc36af).

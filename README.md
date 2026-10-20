@@ -357,8 +357,10 @@ as explicit CLI flags (e.g. `CRISPASR_CACHE_DIR` -> `--cache-dir`).
   keyring — no CUDA toolkit, no devel headers, no `nvidia/cuda` base image.
   Their directory is exported as `CRISPASR_LIB_DIR` and prepended (with the
   binary's own directory) to the subprocess `LD_LIBRARY_PATH`.
-- Silent-CPU-fallback warning: without those libraries the crispasr CLI runs
-  on CPU (~11x slower) and exits 0 — no error surfaces. The adapter
+- Silent-CPU-fallback warning: without those libraries the crispasr CLI
+  silently runs on CPU and exits 0 — no error surfaces. Measured slowdown
+  is workload-sized: ~1.7x wall on the 60 s clip but ~11.6x on the 39-minute
+  fixture (card t_18ee2e43; see "CPU execution — measured" above). The adapter
   therefore pins `--gpu-backend cuda` and probes `crispasr --version`
   before every first job per process, asserting that the pinned backend is
   in the build's `Registered backends` list. A `cuda` build that lacks the
@@ -370,6 +372,20 @@ as explicit CLI flags (e.g. `CRISPASR_CACHE_DIR` -> `--cache-dir`).
   memory (visible in `docker logs` as `allocated=/peak=` INFO lines), and a
   peak above `VRAM_LIMIT_MIB` raises `TranscriptionOOM` rather than
   thrashing the card.
+- Final GPU-box state (post-cleanup, card t_413e2b7b, 2026-10-20): ~48 GB
+  reclaimed — `df -h` free went from 25 GB to 73 GB. Purged: the homemade
+  `nvidia-asr:local` image (18.5 GB) and leftover build bases, the docker
+  build cache (25.0 GB), legacy volumes (4.7 GB), the spike/adapter host
+  dirs (`/opt/nvidia-asr-spike`, `/root/spike-crispasr`,
+  `/root/nvidia-asr-adapter` — all reports and scripts were archived first
+  under `~/CODE/nvidia-asr-planning/archive/vm-cleanup-2026-10-20/`), the
+  host `cuda13` apt runtime libs (~1 GB; the final image bundles its own,
+  proven by a post-purge GPU job), and stale job artifacts (0.14 GB).
+  Still running: the fresh-clone deployment at `/root/replication-test`
+  (image `autodiarist:local`; volumes `replication-test_asr-cache`,
+  `replication-test_queue-state`, `crispasr-cache`), GPU driver 580.178.04.
+  A post-cleanup GPU job (`745556b4…`, 60 s clip, done < 20 s) logged
+  `crispasr probe: version-ok backends=['cpu', 'cuda'] pinned=cuda`.
 
 ## Tests
 
