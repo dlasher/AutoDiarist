@@ -35,6 +35,139 @@ GET    /v1/jobs/{token}/download -> output_result.json (default) or ?format=md
 segments end-to-end; everything else (queueing, limits, cancellation, files)
 behaves identically, which is what the API integration tests run against.
 
+## HTTP API
+
+Five endpoints, all under `/v1/jobs`. Base URL in the examples below is the
+quickstart default (`http://127.0.0.1:8000`). All error responses use the
+FastAPI envelope `{"detail": "..."}` unless noted. Every status code here is
+implemented in `api/main.py`.
+
+### POST /v1/jobs — submit a job
+
+Multipart form upload; the file field name is **`file`**. The server accepts
+the extensions `wav`, `mp3`, `m4a`, `aac`, `ogg`, `flac` (case-insensitive,
+from the uploaded filename). On success:
+
+```bash
+curl -sS -F 'file=@audio.wav;type=audio/wav' http://127.0.0.1:8000/v1/jobs
+# -> 202 {"token": "6a7f…uuid4…", "status": "queued"}
+```
+
+Admission is checked in this order, each with its own failure mode:
+
+| Code | When | Detail |
+|---|---|---|
+| 415 | extension not whitelisted (checked before the upload touches disk) | `Unsupported file type. Supported: wav, mp3, m4a, aac, ogg, flac` |
+| 413 | upload exceeds `MAX_UPLOAD_BYTES` (enforced while streaming, not after) | `File exceeds maximum size of <bytes> bytes` |
+| 503 | queue at `MAX_QUEUE_DEPTH` (count of `queued` jobs; default 50) | `Queue is full (n/50 jobs queued). Retry later.` + `Retry-After: <RETRY_AFTER_SECONDS>` header (default 30) |
+| 429 | the caller's session already has `MAX_JOBS_PER_SESSION` active jobs (default 2; see *Session identity*) | `Session limit reached: 2/2 active jobs per session (queued+processing). Wait for a job to finish or cancel one.` |
+
+Rejected uploads leave no trace on disk: the partially streamed job directory
+is deleted before the error is returned.
+
+### GET /v1/jobs/{token} — poll a job
+
+```bash
+curl -sS http://127.0.0.1:8000/v1/jobs/$TOKEN
+```
+
+The response is the job's persisted state. Common to every status: `token`,
+`status`, `seq` (FIFO position at admission), `queued_at`, `progress`,
+`message`, `filename`, plus the bookkeeping fields `session` (the hashed
+session id) and `audio_path` (server-local path) — treat those as opaque.
+`status` is one of `queued`, `processing`, `done`, `failed`, `cancelled`:
+
+- `queued` — adds `queue_position`: the job's **1-based rank among currently
+  queued jobs** against the single worker's pickup order; `queue_position: 1`
+  means next.
+- `processing` — adds `started_at`; `progress` advances through the pipeline
+  stages (0.05 claimed → 0.1 decode → 0.4+ transcribe with per-chunk
+  increments → 0.95/0.98 self-ID/render) and `message` carries the stage text
+  (e.g. `Claimed by worker`).
+- `done` — `progress: 1.0`, `message: "Transcription complete."`. The result
+  itself is fetched from the download endpoint at
+  `/v1/jobs/{token}/download` (the poll payload does not carry a URL field).
+- `failed` — `progress: 1.0` plus `error` (the exception message from the
+  worker).
+- `cancelled` — `message: "Cancelled by client while queued"` plus
+  `cancelled_at`.
+
+Errors: `404` `Job not found` (unknown token), `422` `Invalid token format`
+(token must be a canonical UUID4).
+
+### GET /v1/jobs/{token}/download — fetch results
+
+Only for `done` jobs. Default is JSON (`output_result.json` — token, status,
+filename, duration, diarized segments); `?format=md` returns the rendered
+report (`markdown_report.md`) as `text/markdown`:
+
+```bash
+curl -sS http://127.0.0.1:8000/v1/jobs/$TOKEN/download -o result.json
+# Content-Type: application/json; attachment; filename="<token>_result.json"
+curl -sS "http://127.0.0.1:8000/v1/jobs/$TOKEN/download?format=md" -o report.md
+# Content-Type: text/markdown; attachment; filename="<token>_report.md"
+```
+
+Errors: `409` `Cannot download results when status is <status>` for any job
+that is not `done`; `422` `Unknown format requested. Use format=json or
+format=md` for any other `format` value; `404` for unknown tokens (and, as a
+consistency guard, `Result file missing` / `Markdown report missing` if a
+finished job's artifact is gone from disk).
+
+### DELETE /v1/jobs/{token} — cancel a queued job
+
+```bash
+curl -sS -X DELETE http://127.0.0.1:8000/v1/jobs/$TOKEN
+# queued -> 202 {"token": "...", "status": "cancelled"}
+```
+
+Cancelling a `queued` job frees both queue depth and the session slot; the
+source audio is deleted immediately and the state file is kept so `cancelled`
+remains observable via GET. Repeat cancels are idempotent (`202`). A job that
+is `processing` gets `409` (`cancellation of running jobs is not supported
+yet` — GPU concurrency is 1 and the pipeline is mid-card in v1); `done` and
+`failed` jobs also get `409` (`Job already finished with status '<x>'.`).
+
+### Queueing and persistence
+
+The queue lives entirely on disk under `JOBS_DIR`: one directory per token
+holding `status.json` (written atomically via temp-file rename) and the
+uploaded `audio_source.wav`. Admission assigns `seq = max(existing seq) + 1`
+under a lock, so `seq` is a monotonic FIFO order — this is exactly the order
+the single in-process worker (`GPU concurrency = 1`, `QUEUE_WORKER_ENABLED=1`)
+claims jobs in, and exactly what `queue_position` reports. `queued` and
+`processing` jobs count against limits; each job's `session` id is persisted
+alongside it.
+
+**Restart behavior:** the queue is rebuilt by scanning `JOBS_DIR`, so a
+restart (crash or redeploy) does not lose queued work. A job caught
+mid-`processing` is requeued on boot with its `seq` intact (message:
+`Requeued after service restart`) and re-runs from the start — FIFO order is
+preserved across restarts.
+
+**Retention:** finished jobs (all statuses except the live pair
+`queued`/`processing`) are never swept automatically. `RETENTION_DAYS` exists
+in `.env.example` and is documented in `CONFIG.md` as *reserved for a future
+retention sweep*; no shipped code path reads it yet. Until then, clean up
+`JOBS_DIR/<token>/` directories yourself when disk matters — a cancelled
+job's `status.json` (and a done job's outputs) persist indefinitely.
+
+### Session identity
+
+`MAX_JOBS_PER_SESSION` is enforced per *session*, resolved for every request
+in this order (then hashed, sha256 → first 32 hex chars, so no raw token or
+IP is ever stored on disk):
+
+1. the value of the session header — `Authorization` by default, override
+   with `SESSION_HEADER` (e.g. `-H 'Authorization: Bearer alice'` gives
+   `alice` a stable quota across IP changes);
+2. the client IP when no such header is present (`request.client.host`);
+3. an anonymous bucket when neither is available.
+
+A slot frees when the job reaches `done`, `failed`, or `cancelled`. Behind a
+reverse proxy that replaces the peer address, all clients share one IP
+bucket — set a real session header in that deployment.
+
 ## Quickstart (GPU host, Docker)
 
 Prerequisites: Docker with the NVIDIA container toolkit and a CUDA 13-era
