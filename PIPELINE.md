@@ -52,7 +52,8 @@ before system copies.
 process (cached in-process), parses the `ggml backends : ...` line from its
 output, and raises `CrispasrError` when the pinned `CRISPASR_GPU_BACKEND`
 (default `cuda`) is not in that list. This is deliberate: the CLI **silently** drops to
-CPU (about 11x slower, no error) when `libcudart.so.13`/`libcublas.so.13` are
+CPU (~1.7x wall on short clips, ~11.6x on production-length files; card
+t_18ee2e43, no error) when `libcudart.so.13`/`libcublas.so.13` are
 missing, so a missing CUDA runtime must fail the job fast instead of spending
 minutes per job. The probe runs when the worker starts a real-mode job (via
 `_validate_runtime_config`); an assertion failure fails that job with the

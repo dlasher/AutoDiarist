@@ -11,8 +11,9 @@ crispasr build at '/opt/crispasr/crispasr' registers backends ['cpu'] but GPU ba
 **Cause:** the adapter pins `--gpu-backend cuda` and asserts, via
 `crispasr --version` (`ggml backends :` line), that the pinned backend is
 registered by the binary **before** running a job. The crispasr CLI itself
-does not fail on a missing CUDA runtime — it silently drops to CPU (~11x
-slower, exit 0). The assertion converts that silent trap into a typed,
+does not fail on a missing CUDA runtime — it silently drops to CPU (~1.7x
+wall on short clips, ~11.6x on production-length files; card t_18ee2e43, exit
+0). The assertion converts that silent trap into a typed,
 fast, per-job failure. This is working as intended.
 
 **Fix:** ensure `libcudart.so.13` and `libcublas.so.13` are present and
