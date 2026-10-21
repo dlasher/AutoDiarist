@@ -353,7 +353,12 @@ def _claim_next_queued() -> dict | None:
         job = queued[0]
         job["status"] = "processing"
         job["stage"] = "queued"
-        job["progress"] = 0.05
+        # Clamp, never reset: a job requeued by the lifespan reclaim keeps the
+        # dead attempt's progress, and AC2 forbids any observed regression
+        # across the whole job (restart included). Fresh jobs still move 0.0 ->
+        # 0.05; reclaimed jobs stay at their preserved value and the band
+        # publishes catch up via update_state()'s max(prev, prog) clamp.
+        job["progress"] = max(float(job.get("progress") or 0.0), 0.05)
         job["message"] = "Claimed by worker"
         job["started_at"] = time.time()
         _write_state(job)
