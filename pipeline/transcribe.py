@@ -17,6 +17,11 @@ VRAM discipline inherited from card t_95726260:
   GPU memory allocated during the invocation; the run logs
   ``allocated=/peak=`` lines (INFO) and ``TranscriptionOOM`` is raised when
   the peak exceeds ``VRAM_LIMIT_MIB`` (default 3584 = 3.5 GiB).
+* per-chunk progress streaming (card t_1eb108e0) — the engine prints one
+  timestamped chunk line per completed ~30 s window; the adapter consumes
+  live stdout line-by-line and publishes ``("asr", done, total)`` reports on
+  those real boundaries, so the ``transcribing`` band refines during the run
+  without timers (mapping lives in ``api/main.py::_engine_progress``).
 * the silent CPU fallback trap (missing libcudart/libcublas drops crispasr
   to CPU ~11x slower without error): the adapter pins ``--gpu-backend`` and
   probes ``crispasr --version`` for CUDA backend registration before
@@ -25,11 +30,15 @@ VRAM discipline inherited from card t_95726260:
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
+import math
 import os
+import queue
 import re
 import shutil
+import signal
 import subprocess
 import tempfile
 import threading
@@ -54,6 +63,16 @@ DEFAULT_MIN_FRAGMENT_SECONDS = 2.0
 DEFAULT_TIMEOUT_SECONDS = 1800.0
 _LANG_TAG = re.compile(r"\s*<\s*[A-Za-z]{2,3}(?:-[A-Za-z0-9]{1,8})?\s*>")
 _SPEAKER_INDEX = re.compile(r"speaker\s*(\d+)", re.IGNORECASE)
+# nemotron auto-slices audio into ~30 s windows inside the engine (spike
+# measurement); streamed chunk-line end times map onto that window grid so
+# progress advances on real engine boundaries, never timers.
+ENGINE_CHUNK_WINDOW_SECONDS = 30.0
+# Streamed diarized chunk line produced by the engine on stdout as each
+# window completes: "[HH:MM:SS.mmm --> HH:MM:SS.mmm] (speaker N) ..."
+# (format reference: spike archive spike-crispasr/run_full_stdout.log).
+_CHUNK_LINE = re.compile(
+    r"^\[\d{2}:\d{2}:\d{2}[.,]\d{1,3}\s*-->\s*"
+    r"(\d{2}:\d{2}:\d{2}[.,]\d{1,3})\]")
 # Engine version token as printed by ``crispasr --version`` (three-part
 # dotted, optional leading v/V).
 _VERSION_TOKEN = re.compile(r"v?\d+\.\d+\.\d+", re.IGNORECASE)
@@ -290,6 +309,33 @@ def _parse_hms(value: str) -> float:
     return int(hours) * 3600 + int(minutes) * 60 + float(seconds.replace(",", "."))
 
 
+def _stream_chunk_end_seconds(line: str) -> float | None:
+    """End time (seconds) of a streamed diarized chunk line, else ``None``.
+
+    Non-matching stdout (engine banners, plain-text runs) is not a work
+    boundary and is ignored by the progress stream.
+    """
+    match = _CHUNK_LINE.match(line.strip())
+    if not match:
+        return None
+    try:
+        return _parse_hms(match.group(1))
+    except ValueError:
+        return None
+
+
+def _engine_chunk_total(duration: float,
+                        window: float = ENGINE_CHUNK_WINDOW_SECONDS) -> int:
+    """Engine chunk windows for one whole-file invocation of ``duration`` s.
+
+    Returns 0 for an unknown duration (probe failure): callers must then
+    fall back to coarse reporting instead of fabricating boundaries.
+    """
+    if duration <= 0:
+        return 0
+    return max(1, math.ceil(duration / window))
+
+
 def _segment_times(item: Mapping[str, Any]) -> tuple[float, float] | None:
     offsets = item.get("offsets") or {}
     try:
@@ -480,8 +526,62 @@ def _make_vram_sampler() -> VramSampler:
 # Backend invocation
 # ---------------------------------------------------------------------------
 
-def _run_crispasr(wav_path: str, work_dir: str) -> list[dict[str, Any]]:
-    """One whole-file crispasr invocation -> parsed Segment dicts."""
+def _stdout_pump(stream, sink: queue.Queue) -> None:
+    """Read engine stdout line-by-line into ``sink``; ``None`` marks EOF."""
+    try:
+        for line in stream:
+            sink.put(line)
+    except (OSError, ValueError):
+        pass  # stream torn down on timeout kill; the deadline owns shutdown
+    finally:
+        sink.put(None)
+
+
+def _kill_process_group(proc: subprocess.Popen) -> None:
+    """Terminate the streamed engine's whole process group, TERM then KILL.
+
+    ``subprocess.run``'s timeout only signals the direct child; a streamed
+    run must also clear grandchildren that keep the stdout pipe (and the
+    GPU) alive. The engine is spawned in its own session
+    (``start_new_session=True``) so the group is exactly the invocation.
+    """
+    try:
+        pgid = os.getpgid(proc.pid)
+    except OSError:
+        return  # already reaped
+    for sig, grace in ((signal.SIGTERM, 2.0), (signal.SIGKILL, 5.0)):
+        with contextlib.suppress(OSError):
+            os.killpg(pgid, sig)
+        try:
+            proc.wait(timeout=grace)
+            return
+        except subprocess.TimeoutExpired:
+            continue
+    with contextlib.suppress(subprocess.TimeoutExpired, OSError):
+        proc.wait(timeout=5.0)
+
+
+def _stderr_tail(path: str, limit: int = 800) -> str:
+    try:
+        text = Path(path).read_text(errors="replace").strip()
+    except OSError:
+        text = ""
+    return text[-limit:] or "<no output>"
+
+
+def _run_crispasr(wav_path: str, work_dir: str,
+                  progress: Callable[[str, int, int], None] | None = None,
+                  chunk_total: int = 0) -> list[dict[str, Any]]:
+    """One whole-file crispasr invocation -> parsed Segment dicts.
+
+    Engine stdout is streamed line-by-line: each diarized chunk line is a
+    real work boundary and advances ``progress("asr", done, chunk_total)``
+    when the caller supplied a chunk total. stdout/stderr are never
+    accumulated in memory (an earlier fix banned ``capture_output`` due to
+    a pipe-buffer deadlock): stderr lands in ``work_dir`` and failure
+    paths read only its tail. ``CRISPASR_TIMEOUT_SECONDS`` keeps its wall-
+    clock semantics; on expiry the whole process group is killed.
+    """
     started = time.monotonic()
     out_base = os.path.join(work_dir, "crispasr_out")
     command = build_crispasr_command(wav_path, out_base)
@@ -489,24 +589,75 @@ def _run_crispasr(wav_path: str, work_dir: str) -> list[dict[str, Any]]:
     limit = _env_float("VRAM_LIMIT_MIB", DEFAULT_VRAM_LIMIT_MIB)
     sampler = _make_vram_sampler()
     sampler.start()
+    stderr_path = os.path.join(work_dir, "crispasr_stderr.log")
     try:
         try:
-            res = subprocess.run(
-                command, capture_output=True, text=True,
-                timeout=timeout, env=_crispasr_env(), cwd=work_dir,
-            )
-        except subprocess.TimeoutExpired as exc:
-            raise CrispasrError(f"crispasr timed out after {timeout:.0f}s: {command[:1]}") from exc
+            with open(stderr_path, "wb") as stderr_file:
+                proc = subprocess.Popen(
+                    command, stdout=subprocess.PIPE, stderr=stderr_file,
+                    text=True, bufsize=1, env=_crispasr_env(), cwd=work_dir,
+                    start_new_session=True,
+                )
         except OSError as exc:
             raise CrispasrError(f"cannot execute crispasr at {command[0]!r}: {exc}") from exc
+        deadline = started + timeout
+        done = 0
+
+        def _on_line(line: str) -> None:
+            nonlocal done
+            if progress is None or chunk_total <= 0:
+                return
+            end = _stream_chunk_end_seconds(line)
+            if end is None:
+                return
+            index = min(chunk_total, max(1, math.ceil(end / ENGINE_CHUNK_WINDOW_SECONDS)))
+            if index > done:  # monotone: interim/overlap lines never regress
+                done = index
+                progress("asr", done, chunk_total)
+
+        lines: queue.Queue = queue.Queue()
+        pump = threading.Thread(target=_stdout_pump, args=(proc.stdout, lines),
+                                daemon=True)
+        pump.start()
+        timed_out = False
+        try:
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    timed_out = True
+                    break
+                try:
+                    line = lines.get(timeout=min(remaining, 0.25))
+                except queue.Empty:
+                    continue
+                if line is None:  # stdout EOF — engine finished or closed the pipe
+                    break
+                _on_line(line)
+            if not timed_out and proc.poll() is None:
+                try:
+                    proc.wait(timeout=max(0.0, deadline - time.monotonic()))
+                except subprocess.TimeoutExpired:
+                    timed_out = True
+        finally:
+            if timed_out or proc.poll() is None:
+                _kill_process_group(proc)
+            with contextlib.suppress(OSError, ValueError):
+                if proc.stdout is not None:
+                    proc.stdout.close()
+        if timed_out:
+            raise CrispasrError(f"crispasr timed out after {timeout:.0f}s: {command[:1]}")
+        returncode = proc.wait()
     finally:
         sampler.stop()
     engine_seconds = time.monotonic() - started
-    if res.returncode != 0:
-        tail = (res.stderr or res.stdout or "").strip()
+    if returncode != 0:
         raise CrispasrError(
-            f"crispasr exited with code {res.returncode}: {tail[-800:] or '<no output>'}"
+            f"crispasr exited with code {returncode}: {_stderr_tail(stderr_path)}"
         )
+    if progress is not None and chunk_total > 0 and done < chunk_total:
+        # The engine exited cleanly: every audio window is by definition
+        # transcribed, even if the streamed lines covered fewer boundaries.
+        progress("asr", chunk_total, chunk_total)
     json_path = out_base + ".json"
     if not os.path.isfile(json_path):
         raise CrispasrError(
@@ -598,22 +749,28 @@ def transcribe_and_diarize(
     Returns Segment dicts ``{text, t0, t1, speaker}`` with monotonic times
     and ``Speaker N`` labels ordered by first appearance. The engine handles
     its own ~30 s chunking, so the whole file runs in one bounded-VRAM
-    invocation; ``duration``/``progress`` are kept for API compatibility.
+    invocation. ``duration`` (or a cheap probe) fixes the engine chunk
+    count; ``progress`` then receives real per-chunk reports
+    ``("asr", done, total)`` from the streamed engine stdout, plus the
+    final ``("diar", 1, 1)`` assembly report.
     """
     if mock or os.environ.get("MOCK_PIPELINE") == "1":
         return _mock_segments()
 
     _validate_runtime_config()
-    total_units = 2  # asr pass + diarized assembly reported by one run
-    completed = 0
+    chunk_total = 0
     if progress is not None:
-        completed += 1
-        progress("asr", completed, total_units)
+        known = duration if duration and duration > 0 else _probe_duration_quiet(audio_path)
+        chunk_total = _engine_chunk_total(known)
+        if chunk_total == 0:
+            # Duration unknown: keep the legacy coarse pass pair rather than
+            # fabricating chunk boundaries.
+            progress("asr", 1, 2)
     with tempfile.TemporaryDirectory(prefix="autodiarist-crispasr-") as work_dir:
-        segments = _run_crispasr(str(audio_path), work_dir)
+        segments = _run_crispasr(str(audio_path), work_dir,
+                                 progress=progress, chunk_total=chunk_total)
     if progress is not None:
-        completed += 1
-        progress("diar", completed, total_units)
+        progress("diar", 1, 1)
     return segments
 
 
