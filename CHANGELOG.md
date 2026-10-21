@@ -1,6 +1,6 @@
 # Changelog
 
-## 1.3.0 - Unreleased (issue #1 option (b) — card t_1a02ecbf)
+## 1.3.0 - 2026-10-21 (issue #1 option (b) — integrated by card t_e2b82e85)
 
 Follow-up to the 1.2.0 issue #1 fix: the maintainer's final ruling is
 option (b) — allow lowercase captured names after the two unambiguous
