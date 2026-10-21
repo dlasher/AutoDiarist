@@ -60,6 +60,18 @@
   TROUBLESHOOTING retention prose now describe shipped behaviour;
   `.env.example` / `docker-compose.yml` expose the three knobs.
 
+## Unreleased (docs)
+
+- Operator how-to for the unverified backends (card t_a13c1342): README
+  "Other backends" now carries per-row prerequisites, selection flags,
+  operational differences, and exact v0.8.43 asset URLs for CUDA-12,
+  Vulkan, HIP/ROCm, CPU plain/legacy/AVX512, Metal, WASM, and CANN — all
+  explicitly marked NOT verified on this project's hardware — plus the
+  upstream ggml preference-order quote vs. our `--gpu-backend` pin, the
+  `CRISPASR_BIN`/`GGUF_MODEL` asset-swap recipe (incl. container mount
+  for non-CUDA builds), and a "convert a row to verified" checklist.
+  Documentation only: no builds, no new test claims.
+
 ## 1.0.2 - 2026-10-20 (docs final — no code changes)
 
 - CPU-only validation of the pinned `cuda13` v0.8.43 asset (card
