@@ -1,20 +1,40 @@
 # Pipeline Reference
 
 Stage order inside the worker (`api/main.py process_job_background`, one job
-at a time, FIFO by `seq`):
+at a time, FIFO by `seq`). Stages are the public `stage` enum (V2, card
+t_14ac6b49); bands are the `[start, end)` slice of `[0, 1]` each stage owns:
 
 | Stage | Module | Progress band | Gate |
 | --- | --- | --- | --- |
-| decode | `pipeline.transcribe.decode_audio` | 0.1 | skipped entirely in mock mode |
-| transcribe + diarize | `pipeline.transcribe` (CrispASR adapter) | 0.4 → 0.9 | always |
-| spell check | `pipeline.spellcheck` | 0.92 | only when `SPELL_CHECK=1` (exact `1`) and not mock |
-| LLM cleanup (opt-in) | `pipeline.llm_cleanup` | 0.93 | only when the caller injects an `llm` callable into `process_job_background` (V2 seam; the HTTP path never does) |
-| speaker self-ID | `pipeline.self_identification` | 0.95 | always (advisory; also folds in cleanup-pass name evidence when present) |
-| render | `pipeline.renderer` | 0.98 | always |
+| `queued` | API queue (`seq`-ordered) | 0.00 | initial; also re-set on boot reclaim |
+| `decoding` | `pipeline.transcribe.decode_audio` | 0.05–0.30 | skipped entirely in mock mode |
+| `transcribing` | `pipeline.transcribe` (CrispASR adapter) | 0.30–0.60 | always; refined per reported ASR chunk |
+| `diarizing` | same engine call, second pass | 0.60–0.75 | always; refined per diarized-chunk boundary |
+| `spellcheck` | `pipeline.spellcheck` | 0.75–0.80 | only when `SPELL_CHECK=1` (exact `1`) and not mock |
+| `llm_cleanup` | `pipeline.llm_cleanup` | 0.80–0.85 | only when the caller injects an `llm` callable into `process_job_background` (V2 seam; the HTTP path never does) |
+| `self_identification` | `pipeline.self_identification` | 0.85–0.92 | always (advisory; also folds in cleanup-pass name evidence when present) |
+| `rendering` | `pipeline.renderer` | 0.92–1.00 | always |
+| `done` | — | 1.00 | terminal; `progress == 1.0` iff done |
 
-Progress values in `status.json` are strictly monotonic; the `asr`/`diar`
-progress callbacks map onto the 0.4–0.9 band so a poller can show real
-movement during the single whole-file engine invocation.
+Progress values in `status.json` are **monotonic non-decreasing** and
+published only at real work boundaries — never from timers. Within a band,
+engine-reported per-pass/per-chunk counts refine the value (card
+t_1eb108e0: the adapter streams the engine's stdout and maps `asr`/`diar`
+reports onto the `transcribing`/`diarizing` bands via
+`api/main.py::_ENGINE_STAGES`); a requeue-then-reclaim never rewinds
+progress (monotonicity clamp, card t_14ac6b49 review rework).
+
+Every published status is also append-logged to
+`<job_dir>/status_journal.jsonl` (card t_14ac6b49): an audit trail of
+transitions — including the boot-reclaim requeue line — that survives the
+mutable `status.json` snapshot. Retention/eviction removals are logged to
+the service log instead (`reason=age-expiry` / `reason=disk-pressure`).
+
+Finished job dirs are reclaimed by the retention sweep (`RETENTION_DAYS`,
+default 30, boot + hourly) and disk-pressure eviction
+(`DISK_MIN_FREE_MIB`/`DISK_CHECK_INTERVAL_SECONDS`) — see CONFIG.md; the
+`queued`/`processing` pair is never swept or evicted mid-flight (card
+t_5e6200fc).
 
 ## CrispASR adapter (`pipeline/transcribe.py`)
 

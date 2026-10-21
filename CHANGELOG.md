@@ -1,6 +1,38 @@
 # Changelog
 
-## Unreleased (card t_48c2efae — V2 opt-in LLM cleanup pass)
+## 1.1.0 - 2026-10-20 (V2 wave — integrated by card t_bfd9ca2e)
+
+The second feature wave, merged from per-card branches into main with all
+conflicts resolved without dropping any card's behaviour; the full offline
+suite is green on the merged tree (see below). No breaking API changes.
+
+### Stage-based progress + status journal (card t_14ac6b49)
+
+- Every status publish carries the machine-readable `stage` enum
+  (`queued` → `decoding` → `transcribing` → `diarizing` → `spellcheck` →
+  `llm_cleanup` → `self_identification` → `rendering` → `done`);
+  `progress` moves within each stage's band (README "Progress stages",
+  PIPELINE.md stage table).
+- `progress` is monotonic non-decreasing across the whole job — the
+  boot-reclaim requeue → claim path never rewinds it (review rework) —
+  and is published only at real work boundaries, never from timers;
+  `progress == 1.0` iff `status: "done"`.
+- Append-only `<job_dir>/status_journal.jsonl` records every state
+  transition (including the boot-reclaim requeue line) as an audit trail
+  beside the mutable `status.json`. Tests: `tests/api/test_stage_progress.py`.
+
+### Per-chunk engine progress (card t_1eb108e0)
+
+- The CrispASR adapter streams the engine's stdout line-by-line and maps
+  recognised `asr`/`diar` chunk boundaries onto the `transcribing`/
+  `diarizing` bands (`api/main.py::_ENGINE_STAGES`), so progress refines
+  per pass/chunk during the single whole-file invocation; unrecognised
+  output is not a work boundary. Tests: `tests/pipeline/test_engine_streaming.py`.
+- Root `conftest.py` pins suite imports to the checked-out repo root, so
+  `pytest` is green from any worktree even under a PEP-660 editable
+  install (QA rework).
+
+### Opt-in LLM cleanup pass (card t_48c2efae)
 
 - **`pipeline/llm_cleanup.py`** — opt-in, caller-injected cleanup pass over
   the transcript: fixes spelling/punctuation/capitalization only, never
@@ -40,7 +72,7 @@
   and an end-to-end rendered-report diff showing only the permitted change
   (suite: 150 passed, no network).
 
-## Unreleased (card t_5e6200fc — V2 job retention)
+### Job retention + disk-pressure eviction (card t_5e6200fc)
 
 - `RETENTION_DAYS` is now a live knob (default `7` → `30`): a retention
   sweep deletes finished job dirs (`done`/`failed`/`cancelled` whose
@@ -55,15 +87,14 @@
   oldest-mtime-first until it recovers; a `processing` job is never evicted
   and every eviction logs token + `reason=disk-pressure`. Scope is
   `JOBS_DIR` only — the mounted CrispASR cache volume is untouched.
-- Docs de-caveated: CONFIG.md gains a retention/disk-pressure table and
-  loses the "no shipped code path reads it" reserved entry; README and
+- Docs updated: CONFIG.md gains a retention/disk-pressure table and the
+  knob is no longer documented as reserved; README and
   TROUBLESHOOTING retention prose now describe shipped behaviour;
   `.env.example` / `docker-compose.yml` expose the three knobs.
 
-## Unreleased (docs)
+### Operator how-to for unverified backends (card t_a13c1342)
 
-- Operator how-to for the unverified backends (card t_a13c1342): README
-  "Other backends" now carries per-row prerequisites, selection flags,
+- README "Other backends" now carries per-row prerequisites, selection flags,
   operational differences, and exact v0.8.43 asset URLs for CUDA-12,
   Vulkan, HIP/ROCm, CPU plain/legacy/AVX512, Metal, WASM, and CANN — all
   explicitly marked NOT verified on this project's hardware — plus the
@@ -71,6 +102,19 @@
   `CRISPASR_BIN`/`GGUF_MODEL` asset-swap recipe (incl. container mount
   for non-CUDA builds), and a "convert a row to verified" checklist.
   Documentation only: no builds, no new test claims.
+
+### Restart-recovery verification (cards t_3575f1f8, t_8f56bc92)
+
+- Live restart-recovery proof on the VM (t_3575f1f8) and an independent
+  audit of that evidence (t_8f56bc92) close out the V2 wave: boot reclaim
+  and requeue of in-flight jobs were verified on live runs under the new
+  stage/journal model, not just offline tests. Verification-only cards;
+  no shipped-code changes from them.
+
+**Merged-tree verification (this release):** full offline suite
+**177 passed** (no network), covering every card's tests together —
+stage progress, per-chunk engine streaming, LLM cleanup + service seam,
+retention lifecycle, queue hardening, docker packaging.
 
 ## 1.0.2 - 2026-10-20 (docs final — no code changes)
 
