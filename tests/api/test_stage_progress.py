@@ -86,7 +86,7 @@ def _instrument(main, root, box, monkeypatch, asr_passes=2, boom=None):
 
         return SimpleNamespace(segments=segments)
 
-    def fake_self_id(segments):
+    def fake_self_id(segments, extra_evidence=None):
         _observe(main, root, box, "self_id")
         return segments
 
@@ -347,3 +347,65 @@ def test_claim_of_fresh_queued_job_still_advances(jobs_root):
     published = json.loads((jdir / "status.json").read_text())
     assert published["progress"] == 0.05
     assert published["message"] == "Claimed by worker"
+
+
+# --- rebase integration: opt-in llm_cleanup seam (t_48c2efae) publishes ---
+
+def test_optin_llm_cleanup_stage_publishes_in_order(client, jobs_root, monkeypatch):
+    """When an embedding caller injects the LLM cleanup seam, the job must
+    publish an 'llm_cleanup' stage between spellcheck and self_identification,
+    at its documented band edge, journal progress still monotonic."""
+    root, main = jobs_root
+    box = []
+    monkeypatch.setenv("MOCK_PIPELINE", "0")
+    monkeypatch.setenv("SPELL_CHECK", "1")
+    _instrument(main, root, box, monkeypatch)
+
+    from types import SimpleNamespace
+
+    def fake_cleanup(segments, llm=None, settings=None):
+        assert llm is not None, "cleanup seam must receive the injected llm"
+        return SimpleNamespace(
+            segments=segments, name_evidence=[], accepted=1, rejected=0,
+            failed=0, changed_lines=0, report_markdown="# cleanup\n",
+        )
+
+    monkeypatch.setattr(main, "run_llm_cleanup", fake_cleanup)
+
+    real_run = main.process_job_background
+
+    def run_with_llm(token, audio_path, filename):
+        real_run(token, audio_path, filename, llm=lambda prompt: "ok")
+
+    monkeypatch.setattr(main, "process_job_background", run_with_llm)
+
+    response = client.post(
+        "/v1/jobs",
+        files={"file": ("test.wav", b"RIFF....WAVEfmt ....data....", "audio/wav")},
+    )
+    assert response.status_code == 202
+    token = response.json()["token"]
+    body = _wait_final(client, token)
+    assert body["status"] == "done"
+
+    journal = _read_journal(main, token)
+    stages = [e["stage"] for e in journal if e.get("stage")]
+    assert "llm_cleanup" in stages
+    i = stages.index("llm_cleanup")
+    assert stages.index("spellcheck") < i < stages.index("self_identification")
+    progress = [e["progress"] for e in journal]
+    assert progress == sorted(progress), f"journal progress regressed: {progress}"
+    entry = next(e for e in journal if e.get("stage") == "llm_cleanup")
+    assert entry["progress"] == main.STAGE_PROGRESS["llm_cleanup"]
+    assert (root / token / "llm_cleanup_report.md").exists()
+
+
+def test_http_queue_path_never_publishes_llm_cleanup(client, jobs_root, monkeypatch):
+    """AC4 stability: the default HTTP/queue run (no injected llm) must not
+    emit the optional llm_cleanup stage — documented stage enum holds."""
+    _, main = jobs_root
+    token, body, _box = _run_pipeline(client, jobs_root, monkeypatch)
+    assert body["status"] == "done"
+    journal = _read_journal(main, token)
+    stages = {e.get("stage") for e in journal}
+    assert "llm_cleanup" not in stages
