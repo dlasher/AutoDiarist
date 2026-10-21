@@ -133,7 +133,7 @@ def _run_pipeline(client, jobs_root, monkeypatch, **kw):
 
 def test_real_run_publishes_stage_sequence_in_order(client, jobs_root, monkeypatch):
     _, main = jobs_root
-    token, body, box = _run_pipeline(client, jobs_root, monkeypatch)
+    _token, body, box = _run_pipeline(client, jobs_root, monkeypatch)
 
     stages_seen = [st["stage"] for st in box if st["stage"]]
     assert None not in stages_seen, f"stage field missing mid-run: {box}"
@@ -184,7 +184,7 @@ def test_done_progress_exactly_one(client, jobs_root, monkeypatch):
 
 def test_failed_job_reports_failing_stage(client, jobs_root, monkeypatch):
     _, main = jobs_root
-    token, body, box = _run_pipeline(client, jobs_root, monkeypatch, boom="transcribe")
+    token, body, _box = _run_pipeline(client, jobs_root, monkeypatch, boom="transcribe")
 
     assert body["status"] == "failed"
     assert body["stage"] == "transcribing"
@@ -196,7 +196,7 @@ def test_failed_job_reports_failing_stage(client, jobs_root, monkeypatch):
 
 
 def test_queued_job_exposes_queued_stage(jobs_root):
-    root, main = jobs_root
+    _root, main = jobs_root
     monkey_off = os.environ.get("QUEUE_WORKER_ENABLED")
     os.environ["QUEUE_WORKER_ENABLED"] = "0"
     try:
@@ -223,7 +223,7 @@ def test_queued_job_exposes_queued_stage(jobs_root):
 
 def test_stage_field_values_are_from_documented_enum(client, jobs_root, monkeypatch):
     _, main = jobs_root
-    token, body, box = _run_pipeline(client, jobs_root, monkeypatch)
+    _token, body, box = _run_pipeline(client, jobs_root, monkeypatch)
     documented = set(main.STAGE_ORDER)
     for st in box:
         assert st["stage"] in documented, f"undocumented stage {st['stage']!r}"
@@ -254,7 +254,7 @@ def _read_journal(main, token):
 def test_journal_records_full_stage_sequence(client, jobs_root, monkeypatch):
     """AC1 on the authoritative on-disk journal: every publish, in order."""
     _, main = jobs_root
-    token, body, _ = _run_pipeline(client, jobs_root, monkeypatch)
+    token, _body, _ = _run_pipeline(client, jobs_root, monkeypatch)
     journal = _read_journal(main, token)
     stages = [e["stage"] for e in journal if e.get("stage")]
     distinct = list(dict.fromkeys(stages))
@@ -270,7 +270,7 @@ def test_journal_records_full_stage_sequence(client, jobs_root, monkeypatch):
 
 def test_journal_failure_ends_at_failing_stage(client, jobs_root, monkeypatch):
     _, main = jobs_root
-    token, body, _ = _run_pipeline(client, jobs_root, monkeypatch, boom="transcribe")
+    token, _body, _ = _run_pipeline(client, jobs_root, monkeypatch, boom="transcribe")
     journal = _read_journal(main, token)
     assert journal[-1]["status"] == "failed"
     assert journal[-1]["stage"] == "transcribing"
