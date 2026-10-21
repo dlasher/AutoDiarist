@@ -287,3 +287,63 @@ def test_readme_documents_stage_field():
 
     for stage in main.STAGE_ORDER:
         assert stage in text, f"README does not document stage {stage!r}"
+
+
+# --- reclaim -> claim regression (review fix): claim must not rewind progress
+#
+# The lifespan reclaim (api/main.py, boot revalidation) deliberately keeps the
+# dead attempt's ``progress`` so FIFO/poll clients never see a rewind at boot.
+# The claim publish is the next write a client observes, so it must clamp to
+# the preserved value instead of resetting to 0.05 (AC2: monotonic across the
+# WHOLE job, restart included).
+
+
+def _seed_reclaimed_job(root, main, token, progress):
+    """status.json exactly as the lifespan reclaim path leaves it."""
+    jdir = root / token
+    jdir.mkdir(parents=True, exist_ok=True)
+    (jdir / "status.json").write_text(
+        json.dumps(
+            {
+                "token": token,
+                "status": "queued",
+                "stage": "queued",
+                "progress": progress,
+                "seq": 1,
+                "message": "Requeued after service restart",
+                "filename": "a.wav",
+                "audio_path": str(jdir / "audio_source.wav"),
+                "queued_at": 1.0,
+            }
+        )
+    )
+    return jdir
+
+
+def test_claim_after_reclaim_does_not_regress_progress(jobs_root):
+    root, main = jobs_root
+    jdir = _seed_reclaimed_job(root, main, "tok_reclaim", 0.45)
+
+    job = main._claim_next_queued()
+    assert job is not None and job["status"] == "processing"
+    published = json.loads((jdir / "status.json").read_text())
+    # No observed value below the preserved 0.45 within the new attempt.
+    assert published["progress"] >= 0.45, (
+        f"claim regressed progress {0.45} -> {published['progress']}"
+    )
+    assert published["message"] == "Claimed by worker"
+    # Every later band publish goes through update_state()'s max(prev, prog)
+    # clamp, so from here on monotonicity already holds; the claim write was
+    # the only rewind.
+    assert main.STAGE_ORDER.index(published["stage"]) <= main.STAGE_ORDER.index("decoding")
+
+
+def test_claim_of_fresh_queued_job_still_advances(jobs_root):
+    # Clamp must not freeze fresh jobs either: 0.0 -> 0.05 at claim.
+    root, main = jobs_root
+    jdir = _seed_reclaimed_job(root, main, "tok_fresh", 0.0)
+
+    assert main._claim_next_queued() is not None
+    published = json.loads((jdir / "status.json").read_text())
+    assert published["progress"] == 0.05
+    assert published["message"] == "Claimed by worker"
