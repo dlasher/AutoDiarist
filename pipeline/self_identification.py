@@ -45,6 +45,15 @@ _NAME = r"(?P<name>[A-Z][a-z]+(?:[ ][A-Z][a-z]+){0,2})"
 # the lead phrase case-insensitive while prose like "my name is rajiv is from"
 # can no longer match as a name.
 _NAME_STRICT = r"(?P<name>(?-i:[A-Z][a-z]+)(?:[ ](?-i:[A-Z][a-z]+)){0,2})"
+# Issue #1 option (b) (card t_1a02ecbf): real ASR often renders a spoken
+# "my name is jane wu" in lowercase. For the two UNAMBIGUOUS intro phrases
+# only ("my name is", "this is"), the name capture tolerates any case. The
+# leading "(?i:" is load-bearing: _case_strict_name_group() skips wrapping
+# such bodies (mirroring the "(?-i:" idempotence guard) and _collect_evidence
+# uses the marker to enable the lowercase name-shape guard, which keeps the
+# allowance from becoming a back door for prose. The ambiguous phrases ("I'm",
+# "I am", "<name> here") stay on _NAME_STRICT.
+_NAME_CASE_TOLERANT = r"(?P<name>(?i:[A-Za-z]+(?:[ ][A-Za-z]+){0,2}))"
 
 SOURCE_SELF_INTRO = "self_intro"
 SOURCE_HANDOFF = "handoff"
@@ -103,10 +112,12 @@ DEFAULT_NAME_BLOCKLIST: frozenset[str] = frozenset(
 DEFAULT_SELF_ID_BLOCKLIST_PATH = Path("self_id_blocklist.txt")
 
 DEFAULT_SELF_ID_PATTERNS: tuple[str, ...] = (
-    rf"\bmy[ ]+name[ ]+is[ ]+{_NAME_STRICT}\b",
+    # Option (b): rows 0 and 3 are the unambiguous phrases and take the
+    # lowercase-tolerant capture; the ambiguous phrases stay strict.
+    rf"\bmy[ ]+name[ ]+is[ ]+{_NAME_CASE_TOLERANT}\b",
     rf"\bi(?:'|’)[ ]?m[ ]+{_NAME_STRICT}\b",
     rf"\bi[ ]+am[ ]+{_NAME_STRICT}\b",
-    rf"\bthis[ ]+is[ ]+{_NAME_STRICT}\b",
+    rf"\bthis[ ]+is[ ]+{_NAME_CASE_TOLERANT}\b",
     rf"\b{_NAME_STRICT}[ ]+here\b",
 )
 DEFAULT_HANDOFF_PATTERNS: tuple[str, ...] = (
@@ -180,7 +191,12 @@ def _collect_evidence(
             weak_here_form = pattern is self_patterns[-1] and not os.environ.get(
                 "SELF_ID_PATTERNS"
             )
-            name = _candidate_name(match, weak_single_word=weak_here_form, blocklist=blocklist)
+            name = _candidate_name(
+                match,
+                weak_single_word=weak_here_form,
+                blocklist=blocklist,
+                lowercase_name="(?i:" in pattern.pattern,
+            )
             if name is not None:
                 if _has_turn_boundary(segments, index):
                     evidence.append(
@@ -412,7 +428,8 @@ def _case_strict_name_group(pattern: str) -> str:
     ``[A-Z]`` classes inside the name capture. Scoping ``(?-i:)`` over the
     group body keeps the capture case-sensitive for built-in *and*
     environment-overridden patterns. Idempotent: bodies already starting with
-    ``(?-i:`` are left untouched.
+    ``(?-i:`` (strict) or ``(?i:`` (issue #1 option (b) lowercase-tolerant)
+    are left untouched.
     """
     token = "(?P<name>"
     out: list[str] = []
@@ -448,7 +465,7 @@ def _case_strict_name_group(pattern: str) -> str:
             return pattern
         body = pattern[body_start : k - 1]
         out.append(pattern[cursor:body_start])
-        out.append(body if body.startswith("(?-i:") else f"(?-i:{body})")
+        out.append(body if body.startswith(("(?-i:", "(?i:")) else f"(?-i:{body})")
         out.append(")")
         cursor = k
 
@@ -514,7 +531,11 @@ def _trim_trailing_function_words(name: str) -> str | None:
 
 
 def _candidate_name(
-    match: re.Match[str], *, weak_single_word: bool, blocklist: frozenset[str]
+    match: re.Match[str],
+    *,
+    weak_single_word: bool,
+    blocklist: frozenset[str],
+    lowercase_name: bool = False,
 ) -> str | None:
     name = match.group("name").strip()
     if re.fullmatch(r"[A-Za-z]+(?: [A-Za-z]+){0,2}", name) is None:
@@ -533,6 +554,19 @@ def _candidate_name(
     if weak_single_word and len(name.split()) == 1 and len(name) < 4:
         LOGGER.info("self-ID ignored: weak single-word candidate %r is too short", name)
         return None
+    if lowercase_name:
+        # Issue #1 option (b) shape guard: a capture that leans on the
+        # lowercase tolerance is a name only in the given+surname two-word
+        # shape. One lowercase word is indistinguishable from prose
+        # ("my name is wrong"), three are a sentence fragment ("this is
+        # strictly about ability one"). Fully capitalized captures skip the
+        # guard -- identical result to the strict path.
+        words = name.split()
+        if any(not word[:1].isupper() for word in words) and len(words) != 2:
+            LOGGER.info(
+                "self-ID ignored: lowercase capture %r is not a two-word name", name
+            )
+            return None
     return name
 
 

@@ -1,5 +1,45 @@
 # Changelog
 
+## 1.3.0 - Unreleased (issue #1 option (b) — card t_1a02ecbf)
+
+Follow-up to the 1.2.0 issue #1 fix: the maintainer's final ruling is
+option (b) — allow lowercase captured names after the two unambiguous
+self-introduction cues — landed on top of the strict-only variant that
+shipped in 1.2.0. No breaking API changes.
+
+- **`pipeline/self_identification.py`** — two-tier capture grammar:
+  `my name is` / `this is` now take a lowercase-tolerant ASCII name capture
+  (`_NAME_CASE_TOLERANT`, scoped `(?i:...)`), while the ambiguous phrases
+  `I'm` / `I am` / `<name> here` keep the 1.2.0 strict `(?-i:...)` capture.
+  The allowance is not a back door for prose: captures run through the same
+  validation pipeline (function-word rejection with truncation retry,
+  blocklist, weak-single-word rule, ASCII-only check) plus a new name-shape
+  guard — a lowercase-dependent capture must be exactly two words
+  (given+surname), so `my name is jane wu` yields `jane wu` while
+  `this is strictly about ability one` and `my name is wrong` yield no
+  suggestion. Environment-override patterns keep the strict wrap; a `(?i:`
+  marker inside an override opts into the lowercase path explicitly.
+- **Truncation retry reaches the lowercase path**: `my name is shelley
+  festing the rest …` resolves to `shelley festing`. The
+  `non-name function words` log still fires for genuinely prose-like
+  captures (e.g. `My name is New Manager`).
+- **Known limitation**: single-word lowercase names (`my name is alice`)
+  and three-word lowercase names are not accepted — case is the only cheap
+  signal separating `my name is wrong` from a name; capitalize the ASR
+  output or extend `SELF_ID_NAME_BLOCKLIST`-style tuning for edge cases.
+- **Correction to the 1.2.0 note**: option (b) was not "retracted by the
+  card banner before merge" — 1.2.0 shipped strict-only behaviour
+  (`this is jane wu` yielded no suggestion), and this release supersedes
+  that as the maintainer's chosen design.
+- **`tests/pipeline/test_self_id_strict_name_capture.py`** — option (b)
+  acceptance rows: lowercase name after both unambiguous phrases, lowercase
+  after `I'm` / `I am` rejected, the prose back-door guard, truncation retry
+  on the lowercase path, and the function-word floor on two-word lowercase
+  captures; the grammar-shape test now asserts the two-tier split.
+  `test_self_identification.py`'s `this is jane wu` case is re-encoded from
+  the strict-only expectation back to option (b).
+- **`PIPELINE.md`** — the self-ID section documents the two-tier capture.
+
 ## 1.2.0 - 2026-10-20 (issue #1 self-ID capture fix — integrated by card t_ba40a8fd)
 
 Fixes GitHub issue dlasher/AutoDiarist#1: `suggest_speaker_names()` returned `{}`
@@ -24,9 +64,12 @@ and the issue #1 fix ship together. No breaking API changes.
 - **Maintainer decision**: the shipped design is the issue's strict variant —
   case-sensitive capture on every self-intro phrase (`my name is` / `I'm` /
   `I am` / `this is` / `<name> here`). The alternative option (b) (allowing
-  lowercase names after the unambiguous cues `my name is` / `this is`) was
-  retracted by the card banner before merge and merged no code: `this is
-  jane wu` yields no suggestion and `I'm sorry` never matches. The function-word
+  lowercase names after the unambiguous cues `my name is` / `this is`) did
+  not land here: 1.2.0 shipped strict-only behaviour, so `this is jane wu`
+  yields no suggestion and `I'm sorry` never matches. *(Corrected by 1.3.0,
+  card t_1a02ecbf: the maintainer's final ruling is option (b); see the
+  1.3.0 section — this release is accurate history, not the final design.)*
+  The function-word
   rejection path stays reachable and keeps logging `non-name function words`
   for genuinely prose-like captures.
 - **`tests/pipeline/test_self_id_strict_name_capture.py`** — issue #1

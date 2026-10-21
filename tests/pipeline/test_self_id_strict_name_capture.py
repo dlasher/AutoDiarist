@@ -1,20 +1,27 @@
-"""Regression tests for GitHub issue dlasher/AutoDiarist#1 (card t_16c871a6).
+"""Regression tests for GitHub issue dlasher/AutoDiarist#1 (cards t_16c871a6,
+t_1a02ecbf).
 
 Two capture defects in the self-introduction pass:
 
-1. Greedy ``_LOWER_NAME`` capture accepted any casing, so ordinary prose
-   matched as a name (``re.IGNORECASE`` in ``_compile`` defeated the
+1. Greedy name capture accepted any casing on every phrase, so ordinary
+   prose matched as a name (``re.IGNORECASE`` in ``_compile`` defeated the
    capitalized ``_NAME`` requirement).
 2. A single trailing function word rejected the whole match instead of
    retrying with a shorter capture, so valid names like "Shelley Festing"
    were discarded.
 
-These tests cover the acceptance criteria: lowercase captures are rejected,
-capitalized self-intros across all four phrases still match, the issue's
-prose false-positive class yields zero suggestions, function-word truncation
-yields a shorter valid name, rejection happens only at the single-word floor,
-and env-override patterns keep the documented case-insensitive lead-phrase
-guarantee with a case-sensitive name capture.
+v1.2.0 (t_16c871a6) shipped the strict-only variant. The maintainer then
+ruled option (b) (t_1a02ecbf): the two unambiguous phrases "my name is" and
+"this is" accept a lowercase name capture -- guarded by the two-word
+given+surname name-shape rule so prose cannot slip through -- while "I'm",
+"I am" and "<name> here" stay case-sensitive.
+
+These tests cover the acceptance criteria: prose-like lowercase captures are
+rejected, capitalized self-intros across all phrases still match, the
+lowercase allowance produces suggestions for the unambiguous phrases only,
+function-word truncation rescues valid names on both tiers, rejection happens
+only at the single-word floor, and env-override patterns keep the documented
+case-insensitive lead-phrase guarantee with a case-sensitive name capture.
 """
 
 from __future__ import annotations
@@ -63,7 +70,9 @@ def test_all_self_intro_phrases_capture_capitalized_names() -> None:
     }
 
 
-# --- AC: lowercase captures are rejected (the issue's false-positive class).
+# --- AC: prose-like lowercase captures stay rejected (the issue's
+# --- false-positive class). Option (b) rescues real two-word lowercase
+# --- names; the guards below keep prose out.
 
 
 def test_lowercase_self_intro_capture_is_rejected() -> None:
@@ -251,6 +260,100 @@ def test_single_letter_I_dropped_as_whole_word_function_word(monkeypatch) -> Non
 # --- AC: the default self-intro grammar itself adopts the strict capture.
 
 
-def test_default_self_intro_patterns_use_case_sensitive_capture() -> None:
-    for pattern in DEFAULT_SELF_ID_PATTERNS:
-        assert "(?-i:" in pattern, f"pattern lacks case-sensitive name capture: {pattern}"
+def test_default_self_intro_patterns_use_two_tier_capture() -> None:
+    # Issue #1 option (b) (card t_1a02ecbf): two-tier capture grammar.
+    # The unambiguous phrases ("my name is", "this is") carry the scoped
+    # (?i:...) lowercase-tolerant name capture inline; the ambiguous ones
+    # ("I'm", "I am", "<name> here") keep the strict (?-i:...) capture.
+    # Env overrides still get the strict wrap in _compile (see
+    # test_env_override_patterns_keep_name_capture_case_sensitive).
+    assert [row for row in DEFAULT_SELF_ID_PATTERNS if "(?i:" in row] == [
+        DEFAULT_SELF_ID_PATTERNS[0],
+        DEFAULT_SELF_ID_PATTERNS[3],
+    ], "only 'my name is' and 'this is' may carry the lowercase allowance"
+    assert all("(?-i:" in row for row in DEFAULT_SELF_ID_PATTERNS if "(?i:" not in row)
+
+
+# --- Option (b) (card t_1a02ecbf): the lowercase allowance for the two
+# --- unambiguous intro phrases, and the guards that keep it out of prose.
+
+
+def test_lowercase_name_after_my_name_is_is_allowed() -> None:
+    segments = [
+        segment("Welcome everyone.", speaker="g1", t0=0.0, t1=1.0),
+        segment("my name is jane wu.", speaker="g2", t0=1.1, t1=3.0),
+    ]
+
+    suggestions = suggest_speaker_names(segments)
+
+    assert suggestions["g2"]["name"] == "jane wu"
+    assert suggestions["g2"]["confidence"] == 0.7
+    assert suggestions["g2"]["action"] == "resolved"
+    assert suggestions["g2"]["evidence_snippet"] == "my name is jane wu."
+
+
+def test_lowercase_name_after_this_is_is_allowed() -> None:
+    segments = [
+        segment("Welcome everyone.", speaker="g1", t0=0.0, t1=1.0),
+        segment("Hi, this is jane wu.", speaker="g2", t0=1.1, t1=3.0),
+    ]
+
+    suggestions = suggest_speaker_names(segments)
+
+    assert suggestions["g2"]["name"] == "jane wu"
+
+
+def test_lowercase_names_after_ambiguous_phrases_stay_rejected() -> None:
+    segments = [
+        segment("Welcome everyone.", speaker="g1", t0=0.0, t1=1.0),
+        segment("I'm jane wu.", speaker="g2", t0=1.1, t1=2.0),
+        segment("Thanks.", speaker="g3", t0=2.0, t1=2.5),
+        segment("I am jane wu.", speaker="g4", t0=2.6, t1=3.0),
+        segment("Bye.", speaker="g5", t0=3.1, t1=3.5),
+    ]
+
+    suggestions = suggest_speaker_names(segments)
+
+    assert "g2" not in suggestions
+    assert "g4" not in suggestions
+
+
+def test_lowercase_allowance_is_not_a_prose_back_door() -> None:
+    segments = [
+        segment("Welcome everyone.", speaker="g1", t0=0.0, t1=1.0),
+        # Three-word all-lowercase capture: not a given+surname name shape.
+        segment("this is strictly about ability one.", speaker="g2", t0=1.1, t1=2.0),
+        segment("Thanks.", speaker="g3", t0=2.0, t1=2.5),
+        # Single all-lowercase word after an unambiguous phrase.
+        segment("my name is wrong.", speaker="g4", t0=2.6, t1=3.0),
+        segment("Bye.", speaker="g5", t0=3.1, t1=3.5),
+    ]
+
+    assert suggest_speaker_names(segments) == {}
+
+
+def test_truncation_retry_applies_on_the_lowercase_path() -> None:
+    # "My name is Shelley Festing the" (issue table row) in all-lowercase
+    # form: the function-word truncation retry must rescue the two-word name.
+    segments = [
+        segment("Welcome everyone.", speaker="g1", t0=0.0, t1=1.0),
+        segment(
+            "my name is shelley festing the rest of the agenda is short.",
+            speaker="g2",
+            t0=1.1,
+            t1=3.0,
+        ),
+    ]
+
+    suggestions = suggest_speaker_names(segments)
+
+    assert suggestions["g2"]["name"] == "shelley festing"
+
+
+def test_lowercase_capture_rejects_function_word_in_the_two_word_name() -> None:
+    segments = [
+        segment("Welcome everyone.", speaker="g1", t0=0.0, t1=1.0),
+        segment("this is all new for me today.", speaker="g2", t0=1.1, t1=3.0),
+    ]
+
+    assert suggest_speaker_names(segments) == {}

@@ -170,10 +170,14 @@ def test_all_documented_default_patterns_and_ascii_capitalization() -> None:
     assert suggestions["g5"]["name"] == "Carol Smith"
 
 
-def test_case_insensitive_lead_phrase_requires_capitalized_name_capture() -> None:
-    # Issue #1: the lead phrase stays case-insensitive, but the name capture
-    # is strict — lowercase prose like "this is jane wu." is no longer a
-    # name suggestion, while a capitalized name keeps its original casing.
+def test_case_insensitive_lead_phrase_allows_lowercase_name_for_unambiguous_phrases() -> None:
+    # Issue #1 option (b) (card t_1a02ecbf): the lead phrase stays
+    # case-insensitive, and after the unambiguous phrases ("this is",
+    # "my name is") the name capture may be lowercase — "this is jane wu."
+    # yields "jane wu" with the casing preserved — while capitalized names
+    # keep working unchanged. The ambiguous phrases ("I'm", "I am") stay
+    # case-sensitive; that expectation lives in
+    # test_lowercase_names_after_ambiguous_phrases_stay_rejected.
     segments = [
         segment("THIS IS Jane Wu.", speaker="g1", t0=0.0, t1=1.0),
         segment("Welcome.", speaker="g2", t0=1.1, t1=2.0),
@@ -186,7 +190,7 @@ def test_case_insensitive_lead_phrase_requires_capitalized_name_capture() -> Non
         segment("Welcome.", speaker="g2", t0=1.1, t1=2.0),
     ]
 
-    assert suggest_speaker_names(lowercase_capture) == {}
+    assert suggest_speaker_names(lowercase_capture)["g1"]["name"] == "jane wu"
 
 
 def test_patterns_may_be_overridden_from_environment(monkeypatch) -> None:

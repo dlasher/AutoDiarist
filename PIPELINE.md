@@ -182,11 +182,18 @@ Confidence is capped at `CONFIDENCE_CAP` (0.95). Thresholds: below
 `SELF_ID_ANNOTATE_THRESHOLD` (0.4) the suggestion is dropped entirely; at or
 above `SELF_ID_RESOLVE_THRESHOLD` (0.7) `action` is `"resolved"`, otherwise
 `"suggested"`. A plausibility validator filters phrases that look like names but are not:
-self-intro captures use a case-sensitive ASCII name grammar (issue #1 — the
-lead phrase matches case-insensitively, lowercase prose like "my name is
-rajiv is from" never captures), and trailing function words shorten the
-capture from the tail (one fewer word, down to a single-word floor) instead
-of discarding the whole match. The configurable false-positive blocklist
+self-intro captures use a two-tier ASCII name grammar (issue #1 option (b)) —
+the lead phrase matches case-insensitively on every phrase; the ambiguous
+phrases (`I'm X`, `I am X`, `X here`) require a capitalized capture, so prose
+like "I'm sorry" or "I'm counting down from three" never matches; the
+unambiguous phrases (`my name is X`, `this is X`) tolerate lowercase ASR
+output ("my name is jane wu" yields `jane wu`), but a lowercase-dependent
+capture must have the two-word given+surname shape, so "my name is wrong"
+and "this is strictly about ability one" never surface. Trailing function
+words shorten the capture from the tail (one fewer word, down to a
+single-word floor) instead of discarding the whole match, on both tiers;
+prose that trims down to a function word logs `non-name function words`.
+The configurable false-positive blocklist
 then rejects phrases that look like names but are not. Cross-label
 first-name collisions are deduplicated: only the highest-confidence label
 keeps the name.
