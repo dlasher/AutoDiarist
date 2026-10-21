@@ -1,5 +1,38 @@
 # Changelog
 
+## Unreleased — conversational-word rejection in self-ID capture (card t_ac7889e4)
+
+Live strict-tier defect found during the (b) verification (t_90e1752b):
+CrispASR case-restores mid-sentence prose, so the spoken decoy "I'm sorry"
+arrives in the diarizer output as "I'm Sorry". The capitalized capture is
+load-bearing on the strict tier (it is how "I'm Shelley Festing" must work),
+"Sorry" is 5 chars so it clears the <4-char weak-single-word guard, and it
+is not in the phrase blocklist — the live clip resolved Speaker 2 as the
+name "Sorry" (conf 0.70). Pre-existing defect, not an option (b) regression.
+
+- **`pipeline/self_identification.py`** — new conservative
+  `_CONVERSATIONAL_WORDS` set (sorry, going, coming, trying, working,
+  looking, thinking, afraid, glad, sure, done, here, there, fine, okay,
+  ready, really, currently, basically, honestly) applied as a secondary
+  filter inside `_candidate_name` — the single choke point every capture
+  tier funnels through (strict self-intro, option (b) lowercase, handoff,
+  third-party intro). A candidate is rejected when ANY word is
+  conversational: the single word ("I'm Sorry" -> `Sorry`), the surname
+  position (AC5: "Smith Sorry"), or the given-word position (the card's
+  "Sorry Smith"). The set deliberately excludes plausible surnames (May,
+  Young, Poe, Hart, Cook, Good, Small, Strange, Rich, Wise, Brown, White,
+  Green, Black), so "I'm Sarah Cook" / "I'm Mary Young" / "I'm Fred Rich"
+  keep resolving; the two-word given+surname shape guard remains the
+  primary defense. Rejections log `contains conversational word(s)`.
+- **`tests/pipeline/test_self_id_conversational_words.py`** — new
+  regression file: the live clip's verbatim decoy string and its
+  lowercase spelling resolve nothing; "I'm Going To Explain That" and
+  "This Is Going To Be Quick" (which truncate through the function-word
+  retry to `Going`) resolve nothing on both tiers; two-word captures with
+  a conversational given or surname word are rejected; "I'm Shelley
+  Festing", "I'm Jane Smith", "I'm Sarah Cook", "I'm Mary Young", "I'm
+  Fred Rich" and the lowercase-tier equivalents still resolve.
+
 ## 1.3.0 - 2026-10-21 (issue #1 option (b) — integrated by card t_e2b82e85)
 
 Follow-up to the 1.2.0 issue #1 fix: the maintainer's final ruling is

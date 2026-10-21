@@ -511,6 +511,47 @@ _NAME_FUNCTION_WORDS = frozenset(
 )
 
 
+# Card t_ac7889e4: conversational words that ASR case-restores mid-sentence,
+# so a decoy like "I'm sorry" arrives as "I'm Sorry", clears the <4-char
+# weak-single-word guard and resolves as a name on the strict tier (found
+# live on the VM in t_90e1752b: Speaker 2 -> "Sorry", conf 0.70). These
+# function-ish words routinely follow "I'm" / "I am" / "this is" in speech
+# and are indistinguishable from a capitalized name by shape alone.
+# Deliberately CONSERVATIVE: no plausible surnames (May, Young, Poe, Hart,
+# Cook, Good, Small, Strange, Rich, Wise, Brown, White, Green, Black are
+# names and must stay capturable; "there" is already covered by the
+# function-word set and is repeated here so the list reads complete).
+# Applied per WORD inside _candidate_name, the single choke point every
+# capture tier passes through (strict self-intro, option (b) lowercase,
+# handoff, third-party intro): a candidate is rejected when any word --
+# the single word, a conversational surname ("Smith Sorry") or a
+# conversational given word ("Sorry Smith") -- is in this set.
+_CONVERSATIONAL_WORDS: frozenset[str] = frozenset(
+    {
+        "afraid",
+        "basically",
+        "coming",
+        "currently",
+        "done",
+        "fine",
+        "glad",
+        "going",
+        "here",
+        "honestly",
+        "looking",
+        "okay",
+        "ready",
+        "really",
+        "sorry",
+        "sure",
+        "there",
+        "thinking",
+        "trying",
+        "working",
+    }
+)
+
+
 def _trim_trailing_function_words(name: str) -> str | None:
     """Issue #1: a greedy capture can swallow prose words ("Shelley Festing
     the"). Instead of discarding the whole match, retry with one fewer
@@ -567,6 +608,20 @@ def _candidate_name(
                 "self-ID ignored: lowercase capture %r is not a two-word name", name
             )
             return None
+    # Card t_ac7889e4: secondary filter after the shape guards -- reject any
+    # candidate containing a conversational word ("I'm Sorry" -> "Sorry",
+    # "Smith Sorry", "Sorry Smith"), applied on every tier because all
+    # captures funnel through this function.
+    conversational = [
+        word for word in name.split() if word.lower() in _CONVERSATIONAL_WORDS
+    ]
+    if conversational:
+        LOGGER.info(
+            "self-ID ignored: %r contains conversational word(s): %s",
+            name,
+            ", ".join(conversational),
+        )
+        return None
     return name
 
 
