@@ -49,6 +49,200 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
+# --- Job retention + disk-pressure eviction (card t_5e6200fc) -----------------
+# RETENTION_DAYS is no longer a dead knob: the age sweep deletes FINISHED job
+# dirs (done/failed/cancelled — AC "cancelled/failed age out too") whose
+# status.json mtime is older than RETENTION_DAYS, at boot and hourly after.
+# RETENTION_DAYS=0 disables age-based expiry. The live pair (queued,
+# processing) is never age-swept: queued jobs must survive the boot-requeue
+# window (requeue runs before the pass) and a silently-expired in-flight job
+# is exactly the failure mode the original README caveat warned about.
+# Disk pressure: when free space on the JOBS_DIR filesystem drops below
+# DISK_MIN_FREE_MIB, evict job dirs oldest-mtime-first until the watermark is
+# recovered; a 'processing' job is never evicted (AC4) and every removal logs
+# token + reason. Eviction scope is JOBS_DIR only — the mounted CrispASR
+# cache volume is out of scope for this card.
+DEFAULT_RETENTION_DAYS = 30
+RETENTION_SWEEP_INTERVAL_SECONDS = 3600  # hourly age sweep after the boot pass
+DEFAULT_DISK_MIN_FREE_MIB = 8192
+DEFAULT_DISK_CHECK_INTERVAL_SECONDS = 300
+
+_LIVE_STATUSES = frozenset({"queued", "processing"})
+_MIB = 1024 * 1024
+
+
+def _retention_days() -> int:
+    return max(0, _env_int("RETENTION_DAYS", DEFAULT_RETENTION_DAYS))
+
+
+def _disk_min_free_mib() -> int:
+    return max(0, _env_int("DISK_MIN_FREE_MIB", DEFAULT_DISK_MIN_FREE_MIB))
+
+
+def _disk_check_interval_seconds() -> int:
+    return max(1, _env_int("DISK_CHECK_INTERVAL_SECONDS", DEFAULT_DISK_CHECK_INTERVAL_SECONDS))
+
+
+def _job_status(job_dir: Path):
+    """Job status string, or None when status.json is unreadable/corrupt."""
+    try:
+        return json.loads((job_dir / "status.json").read_text(encoding="utf-8")).get("status")
+    except (OSError, ValueError):
+        return None
+
+
+def _job_mtime(job_dir: Path) -> float:
+    """Expiry clock: status.json mtime when present, else the dir mtime
+    (covers dirs torn down before the first status write landed)."""
+    try:
+        return (job_dir / "status.json").stat().st_mtime
+    except OSError:
+        return job_dir.stat().st_mtime
+
+
+def _iter_job_dirs(jobs_dir: Path) -> list[Path]:
+    try:
+        return [p for p in jobs_dir.iterdir() if p.is_dir()]
+    except OSError:
+        return []
+
+
+def _dir_size_bytes(path: Path) -> int:
+    total = 0
+    for entry in path.rglob("*"):
+        try:
+            if entry.is_file() and not entry.is_symlink():
+                total += entry.stat().st_size
+        except OSError:
+            continue
+    return total
+
+
+def _free_bytes(jobs_dir: Path) -> int:
+    return shutil.disk_usage(jobs_dir).free
+
+
+def sweep_expired_jobs(jobs_dir: Path, retention_days: int, now: float | None = None) -> list[str]:
+    """Delete finished job dirs older than retention_days (AC1).
+
+    retention_days <= 0 disables age-based expiry entirely (AC2). Every
+    removal is logged with the token and reason=age-expiry. The live pair
+    and dirs with no readable status.json are left alone; disk-pressure
+    eviction is their only reclaim path."""
+    if retention_days <= 0:
+        return []
+    cutoff = (time.time() if now is None else now) - retention_days * 86400.0
+    removed: list[str] = []
+    for job_dir in _iter_job_dirs(jobs_dir):
+        mtime = _job_mtime(job_dir)
+        if mtime >= cutoff:
+            continue
+        status = _job_status(job_dir)
+        if status is None or status in _LIVE_STATUSES:
+            continue
+        shutil.rmtree(job_dir, ignore_errors=True)
+        removed.append(job_dir.name)
+        logger.info(
+            "retention sweep: removed job token=%s status=%s age_days=%.1f reason=age-expiry",
+            job_dir.name,
+            status,
+            (time.time() - mtime) / 86400.0,
+        )
+    return removed
+
+
+def enforce_disk_pressure(jobs_dir: Path, min_free_mib: int, free_bytes_fn=None) -> list[str]:
+    """Evict job dirs oldest-mtime-first until free space >= the watermark (AC3).
+
+    min_free_mib <= 0 disables eviction before any filesystem probe. A job in
+    'processing' state is NEVER evicted (AC4); queued jobs are evictable —
+    upload admission reuses seq slots after a purge, so a dropped queued
+    dir is not a dangling queue entry. Dirs with no readable status.json are
+    skipped (garbage like .upload-* temp dirs is reclaimed by its own
+    writers; deleting half-written state under a live fd is worse than
+    staying under water for a cycle). When nothing evictable remains, the
+    pass logs a warning and exits — it must not spin against the probe."""
+    if min_free_mib <= 0:
+        return []
+    probe = free_bytes_fn or _free_bytes
+    watermark = min_free_mib * _MIB
+    evicted: list[str] = []
+    while True:
+        free = probe(jobs_dir)
+        if free >= watermark:
+            break
+        candidates = []
+        for job_dir in _iter_job_dirs(jobs_dir):
+            status = _job_status(job_dir)
+            if status is None or status == "processing":
+                continue
+            candidates.append((_job_mtime(job_dir), job_dir, status))
+        if not candidates:
+            logger.warning(
+                "disk pressure: free=%d bytes below watermark=%d MiB on %s; "
+                "no evictable job dirs remain (processing jobs are never evicted)",
+                free,
+                min_free_mib,
+                jobs_dir,
+            )
+            break
+        candidates.sort(key=lambda item: item[0])
+        _, victim, status = candidates[0]
+        freed = _dir_size_bytes(victim)
+        shutil.rmtree(victim, ignore_errors=True)
+        evicted.append(victim.name)
+        logger.warning(
+            "retention eviction: removed job token=%s status=%s freed_bytes=%d "
+            "reason=disk-pressure watermark_mib=%d",
+            victim.name,
+            status,
+            freed,
+            min_free_mib,
+        )
+    return evicted
+
+
+def _age_sweep_pass() -> list[str]:
+    return sweep_expired_jobs(JOBS_DIR, _retention_days())
+
+
+def _disk_pressure_pass() -> list[str]:
+    return enforce_disk_pressure(JOBS_DIR, _disk_min_free_mib())
+
+
+def run_retention_boot_pass() -> None:
+    """One synchronous age+disk pass at boot, before the interval loops take
+    over: sweep work that came due while the service was down runs first."""
+    removed = _age_sweep_pass()
+    evicted = _disk_pressure_pass()
+    if removed or evicted:
+        logger.info(
+            "retention boot pass: %d age-expired, %d disk-evicted", len(removed), len(evicted)
+        )
+
+
+async def _retention_loop(sleep_func=None, interval_seconds=None) -> None:
+    """Hourly age sweep (AC5). The boot pass is run separately by the
+    lifespan, so this loop sleeps first. sleep_func/interval are injectable
+    for deterministic tests."""
+    sleep_func = sleep_func or asyncio.sleep
+    if interval_seconds is None:
+        interval_seconds = RETENTION_SWEEP_INTERVAL_SECONDS
+    while True:
+        await sleep_func(interval_seconds)
+        _age_sweep_pass()
+
+
+async def _disk_pressure_loop(sleep_func=None, interval_seconds=None) -> None:
+    """Disk-pressure check every DISK_CHECK_INTERVAL_SECONDS (AC5)."""
+    sleep_func = sleep_func or asyncio.sleep
+    if interval_seconds is None:
+        interval_seconds = _disk_check_interval_seconds()
+    while True:
+        await sleep_func(interval_seconds)
+        _disk_pressure_pass()
+
+
 def _env_float(name: str, default: float) -> float:
     try:
         return float(os.environ.get(name, str(default)))
@@ -458,6 +652,23 @@ async def lifespan(app: FastAPI):
     worker_task = None
     if worker_enabled:
         worker_task = asyncio.create_task(_queue_worker_loop(), name="asr-queue-worker")
+
+    # Retention + disk-pressure wiring (card t_5e6200fc): the boot pass runs
+    # synchronously here — deliberately AFTER the boot requeue above, so
+    # reclaimed jobs are 'queued' and exempt from the age sweep — then the
+    # hourly age sweep and the DISK_CHECK_INTERVAL_SECONDS disk check take
+    # over as background tasks (AC5). One INFO line records the whole policy.
+    run_retention_boot_pass()
+    retention_task = asyncio.create_task(_retention_loop(), name="retention-sweep")
+    disk_task = asyncio.create_task(_disk_pressure_loop(), name="disk-pressure-check")
+    logger.info(
+        "retention: days=%d (0 disables age sweep), sweep interval=%ds, "
+        "disk watermark=%d MiB, disk check=%ds",
+        _retention_days(),
+        RETENTION_SWEEP_INTERVAL_SECONDS,
+        _disk_min_free_mib(),
+        _disk_check_interval_seconds(),
+    )
     try:
         yield
     finally:
@@ -465,6 +676,10 @@ async def lifespan(app: FastAPI):
             worker_task.cancel()
             with suppress(asyncio.CancelledError):
                 await worker_task
+        for loop_task in (retention_task, disk_task):
+            loop_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await loop_task
 
 
 app = FastAPI(title="AutoDiarist", version="1.0.0", lifespan=lifespan)
@@ -594,7 +809,8 @@ async def cancel_job(token: str):
     so graceful mid-chunk cancel is out of scope here. Cancelled jobs free
     both queue depth and session quota; the input audio is cleaned from disk
     immediately while status.json is kept so the 'cancelled' state remains
-    observable (status retention sweep is a separate concern).
+    observable. The V2 retention sweep (card t_5e6200fc) expires it — like
+    every finished status — after RETENTION_DAYS.
     """
     validate_token(token)
     with _queue_lock:

@@ -179,12 +179,15 @@ mid-`processing` is requeued on boot with its `seq` intact (message:
 `Requeued after service restart`) and re-runs from the start — FIFO order is
 preserved across restarts.
 
-**Retention:** finished jobs (all statuses except the live pair
-`queued`/`processing`) are never swept automatically. `RETENTION_DAYS` exists
-in `.env.example` and is documented in `CONFIG.md` as *reserved for a future
-retention sweep*; no shipped code path reads it yet. Until then, clean up
-`JOBS_DIR/<token>/` directories yourself when disk matters — a cancelled
-job's `status.json` (and a done job's outputs) persist indefinitely.
+**Retention:** `RETENTION_DAYS` (default **30**) is live. Finished jobs
+(`done`/`failed`/`cancelled`) whose `status.json` mtime is older than the
+window are deleted at service boot and hourly after that; every removal logs
+the job token and `reason=age-expiry`. The live pair `queued`/`processing` is
+never age-swept. Independently, when free space on the filesystem backing
+`JOBS_DIR` drops below `DISK_MIN_FREE_MIB` (default 8192), job dirs are
+evicted oldest-first until the watermark recovers — a `processing` job is
+never evicted — checked at boot and every `DISK_CHECK_INTERVAL_SECONDS`
+(default 300). Full table in `CONFIG.md`.
 
 ### Session identity
 

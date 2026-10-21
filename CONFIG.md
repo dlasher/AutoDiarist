@@ -39,6 +39,14 @@ GPU-default values.
 | `QUEUE_POLL_SECONDS` | `0.2` | Worker idle-poll period (float; invalid values fall back to the default). |
 | `SESSION_HEADER` | `Authorization` | Header carrying session identity for quota accounting. Missing header falls back to client IP, then to a shared `anonymous` bucket. Identities are stored as SHA-256 digests (first 32 hex chars), never raw header values. |
 
+## Job retention & disk pressure — `api/main.py`
+
+| Variable | Default | Effect |
+| --- | --- | --- |
+| `RETENTION_DAYS` | `30` | Age expiry for finished jobs. `done`/`failed`/`cancelled` dirs whose `status.json` mtime exceeds the window are deleted; the sweep runs synchronously at service boot and hourly after that, and every removal logs the token with `reason=age-expiry`. `0` disables age-based expiry entirely. The live pair `queued`/`processing` is never age-swept (requeued jobs must survive restarts). |
+| `DISK_MIN_FREE_MIB` | `8192` | Disk-pressure watermark on the filesystem backing `JOBS_DIR` (`shutil.disk_usage`). While free space is below it, job dirs are evicted oldest-mtime-first until the watermark is recovered. A `processing` job is never evicted; `queued` jobs are evictable (the next POST admission reuses their `seq` slots). `0` disables eviction. The mounted CrispASR cache volume is never touched. |
+| `DISK_CHECK_INTERVAL_SECONDS` | `300` | Interval between disk-pressure checks; the check also runs once at boot. |
+
 ## Chunking utility — `pipeline/chunking.py`
 
 Kept for the standalone utility and its tests. The shipped CrispASR backend
@@ -81,7 +89,6 @@ these no longer bound VRAM.
 
 | Name | Status |
 | --- | --- |
-| `RETENTION_DAYS` | Listed in `.env.example` (`7`) and required by `tests/test_docker_packaging.py`, but **no shipped code path reads it**. The `status.json` retention sweep is a separate concern (see the `DELETE /v1/jobs/{token}` note in TROUBLESHOOTING.md); treat it as reserved for that follow-up. |
 | `DEVICE_DTYPE` | **Removed with the NeMo pivot.** There is no engine device/dtype selector to configure: the CrispASR path chooses compute via `CRISPASR_GPU_BACKEND`, and the Q4_K GGUF quantization is fixed by the model asset. `tests/test_docker_packaging.py` asserts it is absent from `.env.example`. |
 | `PYTORCH_*`, `HF_HOME` | Torch-era knobs retired with the NeMo image; compose assertions keep them out. |
 
@@ -151,5 +158,8 @@ retention sweeper (the six `LLM_CLEANUP_*` knobs above plus later additions);
 each is documented in the tables above (a
 value read only as a comparison variable, like the `_env_*` helpers' `name`
 parameter, is not a name). Verified with zero undocumented reads;
-`RETENTION_DAYS` is the single name present in `.env.example` without a code
-reader and is flagged as reserved above.
+`RETENTION_DAYS` was long the single name present in `.env.example` without
+a code reader — since the V2 retention sweep (card t_5e6200fc) it reads live
+in `api/main.py`, together with its two new disk-pressure siblings
+(`DISK_MIN_FREE_MIB`, `DISK_CHECK_INTERVAL_SECONDS`), all documented in the
+retention table above.

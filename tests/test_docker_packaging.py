@@ -144,3 +144,18 @@ def test_dockerignore_keeps_model_weights_and_runtime_data_out_of_build_context(
     assert ".env" in dockerignore
     assert "/models" in dockerignore
     assert "/data" in dockerignore
+
+
+def test_retention_and_disk_env_defaults() -> None:
+    """V2 retention knobs (card t_5e6200fc): RETENTION_DAYS is REAL now
+    (30-day default), plus the disk-pressure pair. compose passes the same
+    defaults through so a .env-less compose run behaves identically."""
+    env_example = read(".env.example")
+    assert "RETENTION_DAYS=30" in env_example
+    assert "DISK_MIN_FREE_MIB=8192" in env_example
+    assert "DISK_CHECK_INTERVAL_SECONDS=300" in env_example
+
+    compose = read("docker-compose.yml")
+    assert "RETENTION_DAYS: ${RETENTION_DAYS:-30}" in compose
+    assert "DISK_MIN_FREE_MIB: ${DISK_MIN_FREE_MIB:-8192}" in compose
+    assert "DISK_CHECK_INTERVAL_SECONDS: ${DISK_CHECK_INTERVAL_SECONDS:-300}" in compose

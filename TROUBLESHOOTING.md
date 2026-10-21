@@ -79,10 +79,12 @@ sampling (no OOM protection).
 immediately, `status.json` kept so the `cancelled` state stays observable —
 and so a straggler worker can never resurrect it). Cancelling a `processing`
 job answers `409`: GPU concurrency is 1 and mid-chunk graceful cancel is out
-of v1 scope. There is no automatic status retention sweep yet — the
-`cancelled`/`failed`/`done` `status.json` files accumulate in `JOBS_DIR`
-(the `RETENTION_DAYS` env in `.env.example` is reserved for that sweep and
-currently read by no code; CONFIG.md).
+of v1 scope. Finished jobs — `cancelled`/`failed`/`done` — are expired
+automatically by the retention sweep (`RETENTION_DAYS`, default 30; runs at
+boot and hourly, removals logged with the token). The live pair
+`queued`/`processing` is never age-swept; under disk pressure
+(`DISK_MIN_FREE_MIB`) queued dirs can still be evicted oldest-first, but a
+`processing` job never is (CONFIG.md).
 
 ## Restart-recovery behavior
 
@@ -111,8 +113,10 @@ There is no separate quarantine path: the per-job directory under
 `JOBS_DIR` (`/data/jobs/<token>/` in the compose deployment) *is* the
 post-mortem record. A failed job keeps its `status.json` with the typed
 error text, and the worker's stage reached is visible from `progress` +
-`message`. Directories are never deleted automatically, so copy the job dir
-aside before any future retention sweep. Rejected uploads (bad extension,
+`message`. Directories age out via the retention sweep
+(`RETENTION_DAYS`, default 30) or disk-pressure eviction
+(`DISK_MIN_FREE_MIB`), so copy the job dir aside promptly if you want a
+post-mortem to survive. Rejected uploads (bad extension,
 oversize, depth, session quota) leave no directory on disk at all.
 Successful jobs additionally hold `output_result.json` and
 `markdown_report.md`; real-mode engine scratch (`crispasr_out.*`) lives only
