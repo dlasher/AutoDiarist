@@ -138,7 +138,12 @@ def test_function_words_reject_prose_like_self_intro_candidates(caplog) -> None:
     segments = [
         segment("Welcome.", speaker="g1", t0=0.0, t1=1.0),
         segment("This is a short brief.", speaker="g2", t0=1.1, t1=2.0),
-        segment("My name is new manager.", speaker="g3", t0=2.1, t1=3.0),
+        # Issue #1: the strict grammar drops lowercase prose words before
+        # the validator ever sees them, so keep a capitalized function word
+        # in the capture to exercise the non-name-function-word rejection
+        # (single-word floor: "New Manager" backs off to "New", still a
+        # function word).
+        segment("My name is New Manager.", speaker="g3", t0=2.1, t1=3.0),
     ]
 
     with caplog.at_level(logging.INFO):
@@ -165,13 +170,23 @@ def test_all_documented_default_patterns_and_ascii_capitalization() -> None:
     assert suggestions["g5"]["name"] == "Carol Smith"
 
 
-def test_case_insensitive_default_patterns_preserve_name_casing() -> None:
+def test_case_insensitive_lead_phrase_requires_capitalized_name_capture() -> None:
+    # Issue #1: the lead phrase stays case-insensitive, but the name capture
+    # is strict — lowercase prose like "this is jane wu." is no longer a
+    # name suggestion, while a capitalized name keeps its original casing.
     segments = [
+        segment("THIS IS Jane Wu.", speaker="g1", t0=0.0, t1=1.0),
+        segment("Welcome.", speaker="g2", t0=1.1, t1=2.0),
+    ]
+
+    assert suggest_speaker_names(segments)["g1"]["name"] == "Jane Wu"
+
+    lowercase_capture = [
         segment("this is jane wu.", speaker="g1", t0=0.0, t1=1.0),
         segment("Welcome.", speaker="g2", t0=1.1, t1=2.0),
     ]
 
-    assert suggest_speaker_names(segments)["g1"]["name"] == "jane wu"
+    assert suggest_speaker_names(lowercase_capture) == {}
 
 
 def test_patterns_may_be_overridden_from_environment(monkeypatch) -> None:

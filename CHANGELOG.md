@@ -1,5 +1,38 @@
 # Changelog
 
+## 1.2.0 - 2026-10-20 (issue #1 self-ID capture fix — integrated by card t_ba40a8fd)
+
+Fixes GitHub issue dlasher/AutoDiarist#1: `suggest_speaker_names()` returned `{}`
+on real webinar audio — the any-case name capture let prose match as names, and a
+single trailing function word discarded otherwise-valid whole captures. Rebased
+onto the 1.1.0 tree; both the v2 stage/journal/retention/LLM-cleanup behaviour
+and the issue #1 fix ship together. No breaking API changes.
+
+### Strict self-intro name capture + function-word truncation retry (card t_16c871a6)
+
+- **`pipeline/self_identification.py`** — self-introduction name captures
+  are now case-sensitive (`_NAME_STRICT`, scoped `(?-i:...)`) while the lead
+  phrase stays case-insensitive, so lowercase prose like
+  "my name is rajiv is from" no longer matches as a name, and every
+  `(?P<name>...)` group in `SELF_ID_PATTERNS` environment overrides is
+  auto-wrapped to keep that guarantee under `re.IGNORECASE`.
+- **Function-word truncation retry**: a captured trailing function word
+  ("My name is Shelley Festing the") now shortens the capture from the tail
+  instead of discarding the whole match; rejection only when the single-word
+  floor is itself a function word. Handoff/third-party-intro captures are
+  unchanged.
+- **Maintainer decision**: the shipped design is the issue's strict variant —
+  case-sensitive capture on every self-intro phrase (`my name is` / `I'm` /
+  `I am` / `this is` / `<name> here`). The alternative option (b) (allowing
+  lowercase names after the unambiguous cues `my name is` / `this is`) was
+  retracted by the card banner before merge and merged no code: `this is
+  jane wu` yields no suggestion and `I'm sorry` never matches. The function-word
+  rejection path stays reachable and keeps logging `non-name function words`
+  for genuinely prose-like captures.
+- **`tests/pipeline/test_self_id_strict_name_capture.py`** — issue #1
+  regressions; the two `test_self_identification.py` cases whose assertions
+  encoded the old lowercase-capture behavior were updated per the card.
+
 ## 1.1.0 - 2026-10-20 (V2 wave — integrated by card t_bfd9ca2e)
 
 The second feature wave, merged from per-card branches into main with all

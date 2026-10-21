@@ -181,10 +181,15 @@ listed in `conflicts` and cost the winner `CONFLICT_PENALTY` (0.2).
 Confidence is capped at `CONFIDENCE_CAP` (0.95). Thresholds: below
 `SELF_ID_ANNOTATE_THRESHOLD` (0.4) the suggestion is dropped entirely; at or
 above `SELF_ID_RESOLVE_THRESHOLD` (0.7) `action` is `"resolved"`, otherwise
-`"suggested"`. A plausibility validator (ASCII name grammar, function-word
-rejects) plus the configurable false-positive blocklist filters phrases that
-look like names but are not. Cross-label first-name collisions are
-deduplicated: only the highest-confidence label keeps the name.
+`"suggested"`. A plausibility validator filters phrases that look like names but are not:
+self-intro captures use a case-sensitive ASCII name grammar (issue #1 — the
+lead phrase matches case-insensitively, lowercase prose like "my name is
+rajiv is from" never captures), and trailing function words shorten the
+capture from the tail (one fewer word, down to a single-word floor) instead
+of discarding the whole match. The configurable false-positive blocklist
+then rejects phrases that look like names but are not. Cross-label
+first-name collisions are deduplicated: only the highest-confidence label
+keeps the name.
 
 The E4 LLM review pass is wired as the pure `extra_evidence` seam, not as an
 environment switch (see CONFIG.md, "v2 seams"), so model output never enters

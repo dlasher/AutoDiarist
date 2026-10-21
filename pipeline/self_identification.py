@@ -40,7 +40,11 @@ LOGGER = logging.getLogger(__name__)
 
 # The name grammar is intentionally ASCII-only as required by the v1 heuristic.
 _NAME = r"(?P<name>[A-Z][a-z]+(?:[ ][A-Z][a-z]+){0,2})"
-_LOWER_NAME = r"(?P<name>[A-Za-z]+(?: [A-Za-z]+){0,2})"
+# Issue #1: self-intro captures must stay case-sensitive even though _compile
+# applies re.IGNORECASE to the whole pattern; the scoped (?-i:...) reset keeps
+# the lead phrase case-insensitive while prose like "my name is rajiv is from"
+# can no longer match as a name.
+_NAME_STRICT = r"(?P<name>(?-i:[A-Z][a-z]+)(?:[ ](?-i:[A-Z][a-z]+)){0,2})"
 
 SOURCE_SELF_INTRO = "self_intro"
 SOURCE_HANDOFF = "handoff"
@@ -99,11 +103,11 @@ DEFAULT_NAME_BLOCKLIST: frozenset[str] = frozenset(
 DEFAULT_SELF_ID_BLOCKLIST_PATH = Path("self_id_blocklist.txt")
 
 DEFAULT_SELF_ID_PATTERNS: tuple[str, ...] = (
-    rf"\bmy[ ]+name[ ]+is[ ]+{_LOWER_NAME}\b",
-    rf"\bi(?:'|’)[ ]?m[ ]+{_LOWER_NAME}\b",
-    rf"\bi[ ]+am[ ]+{_LOWER_NAME}\b",
-    rf"\bthis[ ]+is[ ]+{_LOWER_NAME}\b",
-    rf"\b{_NAME}[ ]+here\b",
+    rf"\bmy[ ]+name[ ]+is[ ]+{_NAME_STRICT}\b",
+    rf"\bi(?:'|’)[ ]?m[ ]+{_NAME_STRICT}\b",
+    rf"\bi[ ]+am[ ]+{_NAME_STRICT}\b",
+    rf"\bthis[ ]+is[ ]+{_NAME_STRICT}\b",
+    rf"\b{_NAME_STRICT}[ ]+here\b",
 )
 DEFAULT_HANDOFF_PATTERNS: tuple[str, ...] = (
     (
@@ -377,7 +381,9 @@ def _patterns_from_environment() -> (
     tuple[tuple[re.Pattern[str], ...], tuple[re.Pattern[str], ...], tuple[re.Pattern[str], ...]]
 ):
     return (
-        _compile(_configured_patterns("SELF_ID_PATTERNS", DEFAULT_SELF_ID_PATTERNS)),
+        _compile(
+            _configured_patterns("SELF_ID_PATTERNS", DEFAULT_SELF_ID_PATTERNS), strict_name=True
+        ),
         _compile(_configured_patterns("SELF_ID_HANDOFF_PATTERNS", DEFAULT_HANDOFF_PATTERNS)),
         _compile(_configured_patterns("SELF_ID_INTRO_PATTERNS", DEFAULT_THIRD_PARTY_INTRO_PATTERNS)),
     )
@@ -398,9 +404,62 @@ def _configured_patterns(name: str, defaults: Sequence[str]) -> tuple[str, ...]:
     return patterns
 
 
-def _compile(patterns: Sequence[str]) -> tuple[re.Pattern[str], ...]:
+def _case_strict_name_group(pattern: str) -> str:
+    """Wrap every ``(?P<name>...)`` group body in ``(?-i:...)``.
+
+    ``_compile`` applies ``re.IGNORECASE`` to the whole pattern so ASR casing
+    quirks don't defeat the lead phrase (issue #1 docs), but that also folds
+    ``[A-Z]`` classes inside the name capture. Scoping ``(?-i:)`` over the
+    group body keeps the capture case-sensitive for built-in *and*
+    environment-overridden patterns. Idempotent: bodies already starting with
+    ``(?-i:`` are left untouched.
+    """
+    token = "(?P<name>"
+    out: list[str] = []
+    cursor = 0
+    while True:
+        start = pattern.find(token, cursor)
+        if start == -1:
+            out.append(pattern[cursor:])
+            return "".join(out)
+        body_start = start + len(token)
+        depth = 1
+        k = body_start
+        try:
+            while depth:
+                char = pattern[k]
+                if char == "\\":
+                    k += 2
+                    continue
+                if char == "[":
+                    k += 1
+                    if pattern[k] == "]":  # ']' is literal as the first class char
+                        k += 1
+                    k = pattern.index("]", k) + 1
+                    continue
+                if char == "(":
+                    depth += 1
+                elif char == ")":
+                    depth -= 1
+                k += 1
+        except (IndexError, ValueError):
+            # Unbalanced group or unterminated class: re.compile raises the
+            # real error downstream, so don't rewrite this pattern.
+            return pattern
+        body = pattern[body_start : k - 1]
+        out.append(pattern[cursor:body_start])
+        out.append(body if body.startswith("(?-i:") else f"(?-i:{body})")
+        out.append(")")
+        cursor = k
+
+
+def _compile(
+    patterns: Sequence[str], *, strict_name: bool = False
+) -> tuple[re.Pattern[str], ...]:
     compiled: list[re.Pattern[str]] = []
     for pattern in patterns:
+        if strict_name:
+            pattern = _case_strict_name_group(pattern)
         expression = re.compile(pattern, re.IGNORECASE | re.ASCII)
         if "name" not in expression.groupindex:
             raise ValueError("each self-identification pattern must define a named 'name' capture group")
@@ -435,6 +494,25 @@ _NAME_FUNCTION_WORDS = frozenset(
 )
 
 
+def _trim_trailing_function_words(name: str) -> str | None:
+    """Issue #1: a greedy capture can swallow prose words ("Shelley Festing
+    the"). Instead of discarding the whole match, retry with one fewer
+    trailing word until the remainder is clean or a single word remains;
+    reject only when that shortest form is still a function word."""
+    words = name.split()
+    while len(words) > 1 and any(word.lower() in _NAME_FUNCTION_WORDS for word in words):
+        words.pop()
+    if any(word.lower() in _NAME_FUNCTION_WORDS for word in words):
+        LOGGER.info("self-ID ignored: %r contains non-name function words", name)
+        return None
+    trimmed = " ".join(words)
+    if trimmed != name:
+        LOGGER.info(
+            "self-ID candidate %r truncated to %r (trailing function words)", name, trimmed
+        )
+    return trimmed
+
+
 def _candidate_name(
     match: re.Match[str], *, weak_single_word: bool, blocklist: frozenset[str]
 ) -> str | None:
@@ -442,9 +520,8 @@ def _candidate_name(
     if re.fullmatch(r"[A-Za-z]+(?: [A-Za-z]+){0,2}", name) is None:
         LOGGER.info("self-ID ignored: name is not plain ASCII words: %r", name)
         return None
-    words = name.split()
-    if any(word.lower() in _NAME_FUNCTION_WORDS for word in words):
-        LOGGER.info("self-ID ignored: %r contains non-name function words", name)
+    name = _trim_trailing_function_words(name)
+    if name is None:
         return None
     lowered = name.lower()
     if any(
@@ -453,7 +530,7 @@ def _candidate_name(
     ):
         LOGGER.info("self-ID ignored: %r is a blocked false-positive phrase", name)
         return None
-    if weak_single_word and len(words) == 1 and len(words[0]) < 4:
+    if weak_single_word and len(name.split()) == 1 and len(name) < 4:
         LOGGER.info("self-ID ignored: weak single-word candidate %r is too short", name)
         return None
     return name

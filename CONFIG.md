@@ -71,7 +71,7 @@ these no longer bound VRAM.
 | --- | --- | --- |
 | `SELF_ID_RESOLVE_THRESHOLD` | `0.7` | Confidence at or above which the renderer may use the name directly in the transcript body. Also read by `pipeline/renderer.py` as its own fallback gate. |
 | `SELF_ID_ANNOTATE_THRESHOLD` | `0.4` | Confidence at or above which a suggestion is reported as `suggested` (evidence section only). |
-| `SELF_ID_PATTERNS` | built-ins | Pipe-delimited regex overrides for the self-introduction evidence patterns. |
+| `SELF_ID_PATTERNS` | built-ins | Pipe-delimited regex overrides for the self-introduction evidence patterns. Compiled with `re.IGNORECASE` for the lead phrase; every `(?P<name>...)` capture group is auto-wrapped in a case-sensitive scope (`(?-i:...)`, issue #1), so name grammars written as `[A-Z][a-z]+` keep rejecting lowercase prose. |
 | `SELF_ID_HANDOFF_PATTERNS` | built-ins | Pipe-delimited overrides for floor-handoff patterns (attributed to the *next different speaker*). |
 | `SELF_ID_INTRO_PATTERNS` | built-ins | Pipe-delimited overrides for third-party-introduction patterns. |
 | `SELF_ID_BLOCKLIST_PATH` | `self_id_blocklist.txt` | Optional line-per-phrase false-positive blocklist file; missing files warn and are ignored, `#` starts a comment. |
