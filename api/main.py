@@ -16,6 +16,7 @@ from pydantic import BaseModel, ConfigDict
 
 from pipeline.transcribe import decode_audio, transcribe_and_diarize
 from pipeline.spellcheck import spell_check_segments
+from pipeline.llm_cleanup import CleanupSettings, run_llm_cleanup
 from pipeline.self_identification import suggest_speaker_names
 from pipeline.renderer import render_markdown
 
@@ -165,7 +166,16 @@ def _chunk_progress(update_state):
     return on_progress
 
 
-def process_job_background(token: str, audio_path: str, filename: str):
+def process_job_background(token: str, audio_path: str, filename: str,
+                           llm=None, cleanup_settings: "CleanupSettings | None" = None):
+    """Run one job end to end.
+
+    ``llm`` is the opt-in LLM cleanup seam (card t_48c2efae): a caller-
+    injected ``prompt -> response`` callable. The HTTP/queue path never
+    passes it and reads no env toggle that would hardwire a network call —
+    the cleanup pass is off unless an embedding caller injects a client,
+    mirroring the ``SELF_ID_LLM``/``extra_evidence`` seam discipline.
+    """
     job_dir = JOBS_DIR / token
     state_file = job_dir / "status.json"
 
@@ -219,8 +229,29 @@ def process_job_background(token: str, audio_path: str, filename: str):
             update_state("processing", 0.92, "Spell-checking transcript...")
             segments = spell_check_segments(segments).segments
 
+        cleanup_evidence: list = []
+        cleanup_summary = ""
+        if llm is not None:
+            update_state("processing", 0.93, "Running opt-in LLM cleanup pass...")
+            cleanup = run_llm_cleanup(
+                segments, llm=llm,
+                settings=cleanup_settings or CleanupSettings.from_env(),
+            )
+            segments = cleanup.segments
+            cleanup_evidence = cleanup.name_evidence
+            cleanup_summary = (
+                f"chunks accepted: {cleanup.accepted} | rejected: {cleanup.rejected} "
+                f"(failed: {cleanup.failed}) | permitted line edits: "
+                f"{cleanup.changed_lines} | name evidence: "
+                f"{len(cleanup.name_evidence)}"
+            )
+            (job_dir / "llm_cleanup_report.md").write_text(
+                cleanup.report_markdown, encoding="utf-8"
+            )
+            logger.info("llm_cleanup: %s", cleanup_summary)
+
         update_state("processing", 0.95, "Suggesting speaker identities...")
-        suggestions = suggest_speaker_names(segments)
+        suggestions = suggest_speaker_names(segments, extra_evidence=cleanup_evidence)
 
         update_state("processing", 0.98, "Rendering markdown report...")
         meta = {
@@ -228,6 +259,7 @@ def process_job_background(token: str, audio_path: str, filename: str):
             "source": filename,
             "duration_seconds": duration,
             "suggestions": suggestions,
+            "cleanup_summary": cleanup_summary,
         }
         md_text = render_markdown(segments, meta)
 

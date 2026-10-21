@@ -1,5 +1,45 @@
 # Changelog
 
+## Unreleased (card t_48c2efae — V2 opt-in LLM cleanup pass)
+
+- **`pipeline/llm_cleanup.py`** — opt-in, caller-injected cleanup pass over
+  the transcript: fixes spelling/punctuation/capitalization only, never
+  source content. Chunks whole speaker-turn lines to a character budget
+  (oversized turns get their own chunk, never split) and carries a
+  read-only seam overlap into each subsequent prompt so chunk boundaries
+  contain the previous seam's text, not just indices.
+- **Mandatory verification guard**: each chunk response must preserve the
+  exact line count, order, `N|` numbering, and byte-identical
+  `Speaker N [t0-t1] —` prefixes; token-level checks allow only
+  case/punctuation normalization and Damerau-Levenshtein near-misses
+  (spelling fixes) — any wording change rejects the whole chunk and the
+  original text is kept. Temperature is pinned to `0.0` by assertion.
+- **`pipeline/llm_preface.md`** — versioned AGENT rules preface
+  (`PREFACE VERSION: 1`) stating exactly what may and may not change.
+- **Per-chunk accept/reject diff report**: counts plus before/after for
+  every permitted edit and rejection reasons; through the service seam it
+  lands in `llm_cleanup_report.md` and the rendered report gains a
+  `## LLM transcript cleanup` summary section (`meta['cleanup_summary']`).
+- **Service seam (AC4)**: `process_job_background(..., llm=...,
+  cleanup_settings=...)` — the HTTP/queue path never injects a client; the
+  module performs no network I/O; no env toggle hardwires a call
+  (`SELF_ID_LLM`/`extra_evidence` precedent). `CleanupSettings.from_env()`
+  documents budget knobs only (`LLM_CLEANUP_CHUNK_CHARS`,
+  `LLM_CLEANUP_OVERLAP_LINES`, `LLM_CLEANUP_TIMEOUT_S`,
+  `LLM_CLEANUP_MAX_RETRIES`, `LLM_CLEANUP_MODEL`,
+  `LLM_CLEANUP_REVIEW_NAMES`).
+- **Optional speaker-name review** (default off): quoted verbatim evidence
+  lines are harvested only from ACCEPTED chunks and returned as
+  `Evidence`-shaped mappings for the existing
+  `suggest_speaker_names(..., extra_evidence=[...])` seam.
+- **Tests**: 25 new offline tests (`tests/pipeline/test_llm_cleanup.py`,
+  `tests/api/test_llm_cleanup_seam.py`) covering turn-aware chunking,
+  seam-overlap prompts, preface rules, spelling-accept/wording-reject,
+  label/timestamp immutability, line-count/order enforcement,
+  retries/timeout, temperature assertion, evidence→`extra_evidence` flow,
+  and an end-to-end rendered-report diff showing only the permitted change
+  (suite: 150 passed, no network).
+
 ## 1.0.2 - 2026-10-20 (docs final — no code changes)
 
 - CPU-only validation of the pinned `cuda13` v0.8.43 asset (card

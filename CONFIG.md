@@ -99,6 +99,40 @@ these no longer bound VRAM.
   Keeping this a caller-supplied seam avoids the API context ever holding
   model output; a future LLM pass must be wired by the service owner, not
   toggled by env.
+- **LLM transcript cleanup pass (V2, default off; card t_48c2efae).** The
+  cleanup client is injected as a `prompt -> response` callable —
+  `pipeline.llm_cleanup.run_llm_cleanup(segments, llm=..., settings=...)`;
+  the service seam is the keyword parameter
+  `api.main.process_job_background(..., llm=..., cleanup_settings=...)`,
+  which the HTTP/queue path never passes. No env toggle hardwires a
+  network call; the module ships no HTTP client and the service reads no
+  model output. When enabled by an embedding caller, the pass rewrites
+  only spelling/punctuation/capitalization inside chunked, preface-guarded
+  prompts (`pipeline/llm_preface.md`, "PREFACE VERSION: 1") and mechanically
+  verifies every response (exact line count/order/numbers, byte-identical
+  speaker-label+timestamp prefixes, token-level spelling-only edits). A
+  chunk that violates any invariant is REJECTED and the original text is
+  kept; a per-chunk accept/reject diff report is written to
+  `llm_cleanup_report.md` in the job dir and summarized in the rendered
+  report. Optional speaker-name evidence (`LLM_CLEANUP_REVIEW_NAMES=1`)
+  is returned only for accepted chunks and folded into the
+  `extra_evidence` seam above. Settings live in the
+  `CleanupSettings` dataclass; environment knobs (read only when a caller
+  has injected a client):
+
+  | Name | Default | Meaning |
+  | --- | --- | --- |
+  | `LLM_CLEANUP_CHUNK_CHARS` | `6000` | Authoritative transcript characters per LLM chunk |
+  | `LLM_CLEANUP_OVERLAP_LINES` | `1` | Read-only seam lines carried into the next chunk's prompt |
+  | `LLM_CLEANUP_TIMEOUT_S` | `60.0` | Per-attempt wall-clock timeout for the injected callable |
+  | `LLM_CLEANUP_MAX_RETRIES` | `2` | Extra attempts after a client failure (failed chunk → rejected, original kept) |
+  | `LLM_CLEANUP_MODEL` | `` (empty) | Opaque model/endpoint description; report header only, never used to connect |
+  | `LLM_CLEANUP_REVIEW_NAMES` | off | Exact `1` enables the optional speaker-name review section |
+
+  Generation temperature is **not configurable**: `CleanupSettings` asserts
+  `temperature == 0.0` and raises otherwise — there is deliberately no
+  environment variable for it, and the guard is documented with that
+  assertion so a future editor cannot loosen it silently.
 - E3a/E3b (slide/panelist-strip OCR), E5 (cross-reference inference), and
   hard label remapping of transcript segments are also v2 hooks,
   intentionally unimplemented (audio-only scope, advisory contract).
@@ -112,7 +146,9 @@ grep -rhoE '(environ\.get\(|environ\[|_env_(str|int|float)\(|_configured_pattern
     api pipeline | grep -oE '[A-Z_]{3,}' | sort -u
 ```
 
-Yields 33 names at authoring time; each is documented in the tables above (a
+Yields 33 names at original authoring time, 42 as of the V2 cleanup pass and
+retention sweeper (the six `LLM_CLEANUP_*` knobs above plus later additions);
+each is documented in the tables above (a
 value read only as a comparison variable, like the `_env_*` helpers' `name`
 parameter, is not a name). Verified with zero undocumented reads;
 `RETENTION_DAYS` is the single name present in `.env.example` without a code

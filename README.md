@@ -400,11 +400,30 @@ prerequisites, GGUF hash verification, and that the torch-era knobs stay
 removed. `scripts/vm_integration.py` is the on-VM acceptance harness for the
 real CrispASR path.
 
+## Opt-in LLM cleanup pass (V2, default off)
+
+A caller-injected spelling/punctuation/formatting cleanup pass exists as a
+pure seam (`pipeline/llm_cleanup.py`): `process_job_background(..., llm=...)`
+takes a `prompt -> response` callable supplied by the embedding caller. The
+HTTP path never passes it and no environment toggle hardwires a network
+call — same discipline as the `SELF_ID_LLM` / `extra_evidence` seam. The
+transcript is chunked on speaker-turn boundaries with a seam overlap, sent
+under a versioned rules preface (`pipeline/llm_preface.md`), and every
+response is mechanically verified: exact line count/order, byte-identical
+speaker labels and timestamps, spelling-only token edits. Any violation
+rejects the chunk and keeps the original text; a per-chunk accept/reject
+diff report (`llm_cleanup_report.md`) accompanies the job output. Optional
+speaker-name evidence flows back through the existing `extra_evidence`
+seam. Settings (`CleanupSettings`): chunk budget, overlap, timeout,
+retries, opaque model description — with generation temperature pinned to
+`0` by assertion. See PIPELINE.md § Opt-in LLM cleanup pass and CONFIG.md
+§ v2 seams.
+
 ## Documentation map
 
 | File | Covers |
 | --- | --- |
 | `CONFIG.md` | Every environment variable, defaults, validation, retired knobs |
-| `PIPELINE.md` | CrispASR adapter, segment mapping, self-ID, render contract |
+| `PIPELINE.md` | CrispASR adapter, segment mapping, self-ID, opt-in LLM cleanup pass, render contract |
 | `TROUBLESHOOTING.md` | Backend assertion, queue limits, failure post-mortems, restart behavior |
 | `CHANGELOG.md` | Release history and QA traceability |

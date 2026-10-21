@@ -8,7 +8,8 @@ at a time, FIFO by `seq`):
 | decode | `pipeline.transcribe.decode_audio` | 0.1 | skipped entirely in mock mode |
 | transcribe + diarize | `pipeline.transcribe` (CrispASR adapter) | 0.4 → 0.9 | always |
 | spell check | `pipeline.spellcheck` | 0.92 | only when `SPELL_CHECK=1` (exact `1`) and not mock |
-| speaker self-ID | `pipeline.self_identification` | 0.95 | always (advisory) |
+| LLM cleanup (opt-in) | `pipeline.llm_cleanup` | 0.93 | only when the caller injects an `llm` callable into `process_job_background` (V2 seam; the HTTP path never does) |
+| speaker self-ID | `pipeline.self_identification` | 0.95 | always (advisory; also folds in cleanup-pass name evidence when present) |
 | render | `pipeline.renderer` | 0.98 | always |
 
 Progress values in `status.json` are strictly monotonic; the `asr`/`diar`
@@ -168,6 +169,54 @@ deduplicated: only the highest-confidence label keeps the name.
 The E4 LLM review pass is wired as the pure `extra_evidence` seam, not as an
 environment switch (see CONFIG.md, "v2 seams"), so model output never enters
 the service's request context implicitly.
+
+## Opt-in LLM cleanup pass (`pipeline/llm_cleanup.py`, V2)
+
+Rewrites **only spelling, punctuation, and capitalization** across the
+transcript, under a mandatory mechanical guard. Interface discipline is the
+same as the `extra_evidence` seam above: the model client is a
+caller-injected `prompt -> response` callable
+(`run_llm_cleanup(segments, llm=...)`), the module contains no HTTP client,
+and no environment toggle hardwires a network call — the pass is off unless
+an embedding caller injects a client.
+
+- **Chunking** (`plan_cleanup_chunks`): whole speaker-turn lines are packed
+  to a character budget; a single oversized turn gets its own chunk instead
+  of being split. Every chunk after the first carries the previous chunk's
+  trailing lines as a read-only seam context, so the boundary text is in
+  the prompt (not a bare chunk index) and thoughts are never severed.
+- **Preface** (`pipeline/llm_preface.md`, `PREFACE VERSION: 1`): the AGENT
+  rules block prepended to every prompt — permitted changes (spelling,
+  punctuation, capitalization/formatting) and absolute prohibitions
+  (wording, merges/splits, invented content, names/identifiers, speaker
+  labels, timestamps, summarization), plus the same-lines/same-order output
+  contract so a diff shows only permitted edits.
+- **Verification** (mandatory safety net, `verify_chunk_response`): the
+  response must have the exact line count, order, and `N|` numbering; the
+  `Speaker N [t0-t1] —` prefix must be byte-identical; and each token may
+  only change by case/punctuation normalization or a Damerau-Levenshtein
+  near-miss (`spelling_similarity_threshold`, default 0.6) — any other
+  token difference is a wording change and rejects the whole chunk.
+  Rejected/failed chunks keep the original text verbatim.
+- **Report**: `CleanupResult.report_markdown` is a per-chunk
+  accept/reject/fail diff report (counts, per-changed-line before/after,
+  rejection reasons). Through the service seam it is written to
+  `llm_cleanup_report.md` in the job dir and summarized via
+  `meta["cleanup_summary"]` into a `## LLM transcript cleanup` section of
+  the rendered report.
+- **Name review (optional, `LLM_CLEANUP_REVIEW_NAMES=1`)**: the prompt
+  invites `Label | Full Name | quoted sentence` evidence after an
+  `--- NAME EVIDENCE ---` marker (advisory only; transcript lines and their
+  labels/timestamps stay immutable). Entries survive only from ACCEPTED
+  chunks and are returned as `Evidence`-shaped mappings
+  (`source: "llm_cleanup"`) for the existing
+  `suggest_speaker_names(..., extra_evidence=[...])` seam — callers supply
+  the weight, as with any injected evidence.
+- **Settings**: `CleanupSettings` (frozen dataclass) — chunk budget, seam
+  overlap, per-attempt timeout, retries, model/endpoint description string.
+  Generation `temperature` is pinned to `0.0` by assertion (no env
+  override exists), because the verification guard assumes a deterministic
+  pass.
 
 ## Render contract (`pipeline/renderer.py`)
 

@@ -68,6 +68,11 @@ def render_markdown(segments: Sequence[Any], meta: Mapping[str, Any]) -> str:
     lines.extend(_transcript_lines(normalized, speaker_numbers, resolved))
     if _speaker_identification_section_enabled():
         lines.extend(_speaker_identification_lines(speaker_numbers, suggestions, resolved))
+    cleanup_summary = meta.get("cleanup_summary") or ""
+    if cleanup_summary:
+        if not isinstance(cleanup_summary, str):
+            raise TypeError("meta['cleanup_summary'] must be a string when provided")
+        lines.extend(["## LLM transcript cleanup", "", cleanup_summary.strip(), ""])
     lines.extend(
         [
             "## Appendix — Raw Diarizer Segments",
