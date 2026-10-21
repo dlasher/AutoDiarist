@@ -19,6 +19,8 @@ guarantee with a case-sensitive name capture.
 
 from __future__ import annotations
 
+import logging
+
 from pipeline.chunking import Segment
 from pipeline.self_identification import (
     DEFAULT_SELF_ID_PATTERNS,
@@ -199,6 +201,51 @@ def test_compile_wraps_custom_name_capture_case_strictly() -> None:
     assert match.group("name") == "Diana"
 
     assert pattern.search("call me diana") is None
+
+
+# --- AC: the issue's table rows verbatim. Trailing single-letter "I" must
+# --- keep the suggestion AND must not log a function-word rejection (the
+# --- strict grammar never captures "I"; the whole-word back-off via
+# --- _NAME_FUNCTION_WORDS covers loose custom classes).
+
+
+def test_issue_table_trailing_I_keeps_suggestion_and_logs_nothing(caplog) -> None:
+    segments = [
+        segment("Welcome everyone.", speaker="g1", t0=0.0, t1=1.0),
+        segment("I'm Susanne Bakerwitz I", speaker="g2", t0=1.1, t1=3.0),
+    ]
+
+    with caplog.at_level(logging.INFO):
+        suggestions = suggest_speaker_names(segments)
+
+    assert suggestions["g2"]["name"] == "Susanne Bakerwitz"
+    assert "non-name function words" not in caplog.text
+
+
+def test_issue_table_contraction_prose_lines_yield_no_suggestions() -> None:
+    for text in ("I'm counting down from three", "I'm sorry"):
+        segments = [
+            segment("Welcome everyone.", speaker="g1", t0=0.0, t1=1.0),
+            segment(text, speaker="g2", t0=1.1, t1=3.0),
+        ]
+        assert suggest_speaker_names(segments) == {}, text
+
+
+def test_single_letter_I_dropped_as_whole_word_function_word(monkeypatch) -> None:
+    # Loose custom class CAN capture the one-letter "I"; the back-off must
+    # drop it on whole-word equality ("I".lower() == "i"), not on a
+    # one-letter [A-Za-z] class shape check.
+    monkeypatch.setenv(
+        "SELF_ID_PATTERNS", r"call me (?P<name>[A-Za-z]+(?: [A-Za-z]+){0,2})"
+    )
+    segments = [
+        segment("Welcome everyone.", speaker="g1", t0=0.0, t1=1.0),
+        segment("Please call me Susanne Bakerwitz I", speaker="g2", t0=1.1, t1=3.0),
+    ]
+
+    suggestions = suggest_speaker_names(segments)
+
+    assert suggestions["g2"]["name"] == "Susanne Bakerwitz"
 
 
 # --- AC: the default self-intro grammar itself adopts the strict capture.
