@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased — conversational-word rejection in self-ID capture (card t_ac7889e4)
+## [1.3.1] - 2026-10-21 — conversational-word rejection in self-ID capture (card t_ac7889e4)
 
 Live strict-tier defect found during the (b) verification (t_90e1752b):
 CrispASR case-restores mid-sentence prose, so the spoken decoy "I'm sorry"
