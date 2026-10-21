@@ -1,5 +1,25 @@
 # Changelog
 
+## Unreleased (card t_5e6200fc — V2 job retention)
+
+- `RETENTION_DAYS` is now a live knob (default `7` → `30`): a retention
+  sweep deletes finished job dirs (`done`/`failed`/`cancelled` whose
+  `status.json` mtime exceeds the window) synchronously at service boot and
+  hourly after that; every removal logs the token with `reason=age-expiry`.
+  `RETENTION_DAYS=0` disables age-based expiry. The live pair
+  `queued`/`processing` is never age-swept (boot requeue must not be
+  starved by an expired backlog; an in-flight job must never vanish).
+- New disk-pressure eviction: `DISK_MIN_FREE_MIB` (default 8192) +
+  `DISK_CHECK_INTERVAL_SECONDS` (default 300). While free space on the
+  `JOBS_DIR` filesystem sits below the watermark, job dirs are evicted
+  oldest-mtime-first until it recovers; a `processing` job is never evicted
+  and every eviction logs token + `reason=disk-pressure`. Scope is
+  `JOBS_DIR` only — the mounted CrispASR cache volume is untouched.
+- Docs de-caveated: CONFIG.md gains a retention/disk-pressure table and
+  loses the "no shipped code path reads it" reserved entry; README and
+  TROUBLESHOOTING retention prose now describe shipped behaviour;
+  `.env.example` / `docker-compose.yml` expose the three knobs.
+
 ## 1.0.2 - 2026-10-20 (docs final — no code changes)
 
 - CPU-only validation of the pinned `cuda13` v0.8.43 asset (card
