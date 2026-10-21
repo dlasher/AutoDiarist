@@ -15,6 +15,7 @@ client
   v
 FastAPI + persistent FIFO job queue on disk
   JOBS_DIR/<token>/status.json   atomic writes, monotonic `seq` = FIFO order
+  JOBS_DIR/<token>/status_journal.jsonl   append-only publish history (stage audit)
   JOBS_DIR/<token>/audio_source.<ext>
   |
   | single in-process worker (GPU concurrency = 1), QUEUE_WORKER_ENABLED=1
@@ -23,10 +24,12 @@ worker stages per job (api/main.py process_job_background):
   decode (ffmpeg -> 16 kHz mono WAV; skipped in mock mode)
   transcribe + diarize (pipeline.transcribe -> crispasr subprocess, whole file)
   spell check          (pipeline.spellcheck, only when SPELL_CHECK=1)
+  llm cleanup          (pipeline.llm_cleanup, opt-in: only when an embedding
+                        caller injects llm= — never from the HTTP/queue path)
   speaker self-ID      (pipeline.self_identification, weighted evidence)
   render               (pipeline.renderer -> markdown_report.md)
   v
-GET    /v1/jobs/{token}          -> status (+ queue_position while queued)
+GET    /v1/jobs/{token}          -> status (+ queue_position while queued; stage + monotonic progress)
 DELETE /v1/jobs/{token}          -> cancel a queued job (409 while processing)
 GET    /v1/jobs/{token}/download -> output_result.json (default) or ?format=md
 ```
@@ -72,25 +75,56 @@ curl -sS http://127.0.0.1:8000/v1/jobs/$TOKEN
 ```
 
 The response is the job's persisted state. Common to every status: `token`,
-`status`, `seq` (FIFO position at admission), `queued_at`, `progress`,
-`message`, `filename`, plus the bookkeeping fields `session` (the hashed
-session id) and `audio_path` (server-local path) — treat those as opaque.
+`status`, `stage` (see *Progress stages* below), `seq` (FIFO position at
+admission), `queued_at`, `progress`, `message`, `filename`, plus the
+bookkeeping fields `session` (the hashed session id) and `audio_path`
+(server-local path) — treat those as opaque.
 `status` is one of `queued`, `processing`, `done`, `failed`, `cancelled`:
 
 - `queued` — adds `queue_position`: the job's **1-based rank among currently
   queued jobs** against the single worker's pickup order; `queue_position: 1`
   means next.
-- `processing` — adds `started_at`; `progress` advances through the pipeline
-  stages (0.05 claimed → 0.1 decode → 0.4+ transcribe with per-chunk
-  increments → 0.95/0.98 self-ID/render) and `message` carries the stage text
-  (e.g. `Claimed by worker`).
-- `done` — `progress: 1.0`, `message: "Transcription complete."`. The result
-  itself is fetched from the download endpoint at
+- `processing` — adds `started_at`; `stage` moves through the pipeline in
+  order while `progress` advances monotonically and `message` carries the
+  stage text (e.g. `Claimed by worker`, `Transcribing pass 2/4`).
+- `done` — `stage: "done"`, `progress: 1.0`, `message: "Transcription complete."`.
+  The result itself is fetched from the download endpoint at
   `/v1/jobs/{token}/download` (the poll payload does not carry a URL field).
-- `failed` — `progress: 1.0` plus `error` (the exception message from the
-  worker).
+- `failed` — `stage` stays at the boundary where the work broke, `progress`
+  holds its monotonic value **below 1.0** (a failure never looks done), plus
+  `error` (the exception message from the worker).
 - `cancelled` — `message: "Cancelled by client while queued"` plus
-  `cancelled_at`.
+  `cancelled_at`; `stage`/`progress` freeze at their last published values.
+
+#### Progress stages
+
+`stage` is the machine-readable pipeline position — a stable enum, in order
+of first appearance:
+
+| Stage | Meaning | Progress band |
+|-------|---------|---------------|
+| `queued` | waiting in the FIFO queue (briefly also when a worker claims the job before decode starts) | 0.00 |
+| `decoding` | audio decode / resample to 16 kHz | 0.05 |
+| `transcribing` | ASR passes; engine-reported pass/chunk counts refine within the band (e.g. `Transcribing pass 2/4`) | 0.30–0.60 |
+| `diarizing` | diarized assembly, likewise refined per reported boundary | 0.60–0.75 |
+| `spellcheck` | optional; only runs when `SPELL_CHECK=1` | 0.75–0.80 |
+| `llm_cleanup` | optional; only published when an embedding caller injects the LLM cleanup seam (`llm=`) — the HTTP/queue path never emits it | 0.80–0.85 |
+| `self_identification` | speaker-name suggestions | 0.85–0.92 |
+| `rendering` | Markdown report + result write-out | 0.92–1.00 |
+| `done` | terminal success, `progress == 1.0` | 1.00 |
+
+`progress` semantics: float in `[0, 1]`, **monotonic non-decreasing** across
+the whole job, published only at real work boundaries (stage entries and the
+engine's per-pass/per-chunk reports) — never from timers. It reaches exactly
+**1.0 when and only when `status: "done"`**. Values are ordinal markers of
+pipeline position, not percentage-accurate time estimates: a flat stretch
+means one long boundary (e.g. a GPU pass), not a stuck job.
+
+A fast stage tail (e.g. spellcheck→done in under a poll interval) can be
+missed by a polling client — watch
+`JOBS_DIR/<token>/status_journal.jsonl` instead: an append-only record of
+every publish (`at`, `status`, `stage`, `progress`, `message`), so the full
+ordered stage sequence is always auditable after the run.
 
 Errors: `404` `Job not found` (unknown token), `422` `Invalid token format`
 (token must be a canonical UUID4).

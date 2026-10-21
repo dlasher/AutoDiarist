@@ -57,6 +57,52 @@ def _env_float(name: str, default: float) -> float:
 
 
 # ---------------------------------------------------------------------------
+# Pipeline stages & progress model (card t_14ac6b49).
+#
+# Every status.json carries a machine-readable ``stage`` — one of
+# STAGE_ORDER below — plus a ``progress`` float in [0, 1]. Each stage owns
+# the progress band [its value, the next stage's value): publishing a stage
+# starts at its band's lower edge, and fine-grained within-band fractions
+# (engine pass/chunk counts) interpolate inside it. Progress is enforced
+# monotonic non-decreasing in update_state(), equals exactly 1.0 at ``done``,
+# and a failed job keeps the last monotonic value (never 1.0) while ``stage``
+# marks where it broke. Values are ordinal markers of real work boundaries,
+# not time estimates.
+# ---------------------------------------------------------------------------
+
+STAGE_PROGRESS = {
+    "queued": 0.00,
+    "decoding": 0.05,
+    "transcribing": 0.30,
+    "diarizing": 0.60,
+    "spellcheck": 0.75,
+    # llm_cleanup is published only on opt-in runs (an injected ``llm``
+    # seam, card t_48c2efae); HTTP/queue runs skip the stage entirely.
+    "llm_cleanup": 0.80,
+    "self_identification": 0.85,
+    "rendering": 0.92,
+    "done": 1.00,
+}
+STAGE_ORDER = list(STAGE_PROGRESS)
+
+# Engine progress callbacks use terse pass names; map them to public stages.
+_ENGINE_STAGES = {"asr": "transcribing", "diar": "diarizing"}
+
+
+def _stage_band(stage: str) -> tuple[float, float]:
+    idx = STAGE_ORDER.index(stage)
+    start = STAGE_PROGRESS[stage]
+    end = STAGE_PROGRESS[STAGE_ORDER[idx + 1]] if idx + 1 < len(STAGE_ORDER) else 1.0
+    return start, end
+
+
+def _stage_progress(stage: str, fraction: float = 0.0) -> float:
+    """Interpolate progress inside ``stage``'s band at ``fraction`` done."""
+    start, end = _stage_band(stage)
+    return round(start + max(0.0, min(1.0, fraction)) * (end - start), 4)
+
+
+# ---------------------------------------------------------------------------
 # Persistent FIFO job queue.
 #
 # The queue lives entirely on disk: each job dir holds a status.json carrying
@@ -91,6 +137,27 @@ def _read_state(token: str) -> dict | None:
         return None
 
 
+def _journal_append(job_dir: Path, st_data: dict) -> None:
+    """Append-only lifecycle journal.
+
+    Transient stage publishes are overwritten on status.json within
+    milliseconds, so "stage transitions appear in order" must remain
+    auditable after the fact (card t_14ac6b49; QA/post-mortem evidence).
+    Journaling never fails a job.
+    """
+    try:
+        with open(job_dir / "status_journal.jsonl", "a", encoding="utf-8") as jfh:
+            jfh.write(json.dumps({
+                "at": round(time.time(), 4),
+                "status": st_data.get("status"),
+                "stage": st_data.get("stage"),
+                "progress": st_data.get("progress"),
+                "message": st_data.get("message"),
+            }) + "\n")
+    except OSError:
+        logger.warning("journal append failed for %s", st_data.get("token", "?"))
+
+
 def _write_state(state: dict) -> None:
     """Atomic state write; callers hold _queue_lock on transition paths."""
     token = state["token"]
@@ -99,6 +166,7 @@ def _write_state(state: dict) -> None:
     tmp = job_dir / "status.json.tmp"
     tmp.write_text(json.dumps(state))
     os.replace(tmp, job_dir / "status.json")
+    _journal_append(job_dir, state)
 
 
 def _iter_states() -> list[dict]:
@@ -148,20 +216,21 @@ def _probe_duration(path: str) -> float:
         return 0.0
 
 
-def _chunk_progress(update_state):
-    """Surface per-chunk pipeline progress in the 0.4..0.9 stage band.
+def _engine_progress(update_state):
+    """Map the engine's pass/chunk counts onto public stage bands.
 
-    Values are strictly monotonic: every accepted transition must exceed the
-    last, so status.json observers can count real progress.
+    Each report (stage name, pass done, pass total) is a real work boundary:
+    ASR passes interpolate inside the ``transcribing`` band, diarized
+    assembly inside ``diarizing``. No timers — a chunked engine that reports
+    per-chunk boundaries refines within the band for free.
     """
-    last = {"value": 0.4}
 
     def on_progress(stage: str, done: int, total: int) -> None:
-        fraction = min(1.0, max(0.0, done / max(1, total)))
-        value = round(0.4 + 0.5 * fraction, 4)
-        if value > last["value"]:
-            last["value"] = value
-            update_state("processing", value, f"{stage} pass {done}/{total}")
+        public = _ENGINE_STAGES.get(
+            stage, stage if stage in STAGE_PROGRESS else "transcribing")
+        done = min(int(done), max(1, int(total)))
+        update_state("processing", _stage_progress(public, done / max(1, total)),
+                     f"{public.capitalize()} pass {done}/{total}", stage=public)
 
     return on_progress
 
@@ -179,7 +248,7 @@ def process_job_background(token: str, audio_path: str, filename: str,
     job_dir = JOBS_DIR / token
     state_file = job_dir / "status.json"
 
-    def update_state(st, prog, msg="", err=""):
+    def update_state(st, prog=None, msg="", err="", stage=None):
         with _queue_lock:
             if state_file.exists():
                 try:
@@ -190,7 +259,24 @@ def process_job_background(token: str, audio_path: str, filename: str,
                 if st_data.get("status") in ("cancelled",):
                     return
                 st_data["status"] = st
-                st_data["progress"] = prog
+                prev = float(st_data.get("progress") or 0.0)
+                if stage is not None:
+                    st_data["stage"] = stage
+                if st == "failed":
+                    # Stage stays where the work broke; progress keeps its
+                    # monotonic position but 1.0 is reserved for done, so a
+                    # failure never looks success-ish.
+                    failing = stage or st_data.get("stage") or "unknown"
+                    st_data["stage"] = failing
+                    floor = STAGE_PROGRESS.get(failing, prev)
+                    target = max(prev, floor, prev if prog is None else prog)
+                    st_data["progress"] = round(min(target, 0.9999), 4)
+                    if not msg:
+                        msg = f"Failed during {failing}: {err}"
+                elif prog is not None:
+                    # Monotonic non-decreasing across the whole job (card
+                    # t_14ac6b49 AC2): a stage publish never rewinds.
+                    st_data["progress"] = round(max(prev, prog), 4)
                 if msg:
                     st_data["message"] = msg
                 if err:
@@ -198,10 +284,12 @@ def process_job_background(token: str, audio_path: str, filename: str,
                 tmp = job_dir / "status.json.tmp"
                 tmp.write_text(json.dumps(st_data))
                 os.replace(tmp, state_file)
+                _journal_append(job_dir, st_data)
 
     try:
         mock = os.environ.get("MOCK_PIPELINE") == "1"
-        update_state("processing", 0.1, "Decoding audio...")
+        update_state("processing", STAGE_PROGRESS["decoding"], "Decoding audio...",
+                     stage="decoding")
         if mock:
             # Mock mode never reads the input bytes; skip ffmpeg so synthetic
             # test payloads (and GPU-free CI runs) short-circuit cleanly.
@@ -212,27 +300,38 @@ def process_job_background(token: str, audio_path: str, filename: str,
             decode_audio(audio_path, wav_path)
             duration = _probe_duration(wav_path)
 
-        update_state("processing", 0.4, "Running transcription & diarization...")
+        update_state("processing", _stage_progress("transcribing"), "Transcribing speech...",
+                     stage="transcribing")
         segments = transcribe_and_diarize(
             wav_path,
             mock=mock,
             duration=duration or None,
-            progress=_chunk_progress(update_state),
+            progress=_engine_progress(update_state),
         )
 
         if not segments:
-            update_state("failed", 1.0, err="Empty transcript result.")
+            update_state("failed", err="Empty transcript result.",
+                         msg="Failed during transcribing: empty transcript result.",
+                         stage="transcribing")
             return
+
+        # The engine call returning is the diarization completion boundary
+        # (its progress callback fired per pass/chunk inside the bands).
+        update_state("processing", _stage_progress("diarizing", 1.0),
+                     "Diarized assembly complete", stage="diarizing")
 
         suggestions: dict = {}
         if os.environ.get("SPELL_CHECK") == "1" and not mock:
-            update_state("processing", 0.92, "Spell-checking transcript...")
+            update_state("processing", STAGE_PROGRESS["spellcheck"],
+                         "Spell-checking transcript...", stage="spellcheck")
             segments = spell_check_segments(segments).segments
 
         cleanup_evidence: list = []
         cleanup_summary = ""
         if llm is not None:
-            update_state("processing", 0.93, "Running opt-in LLM cleanup pass...")
+            update_state("processing", STAGE_PROGRESS["llm_cleanup"],
+                         "Running opt-in LLM cleanup pass...",
+                         stage="llm_cleanup")
             cleanup = run_llm_cleanup(
                 segments, llm=llm,
                 settings=cleanup_settings or CleanupSettings.from_env(),
@@ -250,10 +349,12 @@ def process_job_background(token: str, audio_path: str, filename: str,
             )
             logger.info("llm_cleanup: %s", cleanup_summary)
 
-        update_state("processing", 0.95, "Suggesting speaker identities...")
+        update_state("processing", STAGE_PROGRESS["self_identification"],
+                     "Suggesting speaker identities...", stage="self_identification")
         suggestions = suggest_speaker_names(segments, extra_evidence=cleanup_evidence)
 
-        update_state("processing", 0.98, "Rendering markdown report...")
+        update_state("processing", STAGE_PROGRESS["rendering"],
+                     "Rendering markdown report...", stage="rendering")
         meta = {
             "filename": filename,
             "source": filename,
@@ -273,11 +374,11 @@ def process_job_background(token: str, audio_path: str, filename: str,
             "segments": segments
         }
         (job_dir / "output_result.json").write_text(json.dumps(result_data))
-        update_state("done", 1.0, "Transcription complete.")
+        update_state("done", 1.0, "Transcription complete.", stage="done")
 
     except Exception as exc:
         logger.exception("Background job failed for token %s", token)
-        update_state("failed", 1.0, err=str(exc))
+        update_state("failed", err=str(exc))
 
 
 def _claim_next_queued() -> dict | None:
@@ -288,6 +389,7 @@ def _claim_next_queued() -> dict | None:
             return None
         job = queued[0]
         job["status"] = "processing"
+        job["stage"] = "queued"
         job["progress"] = 0.05
         job["message"] = "Claimed by worker"
         job["started_at"] = time.time()
@@ -339,6 +441,7 @@ async def lifespan(app: FastAPI):
         for st in _iter_states():
             if st.get("status") == "processing":
                 st["status"] = "queued"
+                st["stage"] = "queued"
                 st["message"] = "Requeued after service restart"
                 _write_state(st)
                 reclaimed += 1
@@ -443,6 +546,7 @@ async def create_job(request: Request, file: UploadFile = File(...)):
             "seq": seq,
             "progress": 0.0,
             "message": "Queued",
+            "stage": "queued",
             "filename": name,
             "audio_path": str(audio_path),
         }
@@ -462,6 +566,10 @@ async def get_job_status(token: str):
     state = _read_state(token)
     if state is None:
         raise HTTPException(status_code=404, detail="Job not found")
+    if "stage" not in state:
+        # Pre-stage job dirs (persisted before this API version): mirror the
+        # coarse status so the field is never absent from a response.
+        state["stage"] = state.get("status", "unknown")
     if state.get("status") == "queued":
         # queue_position is the 1-based FIFO rank among currently queued jobs:
         # exactly the worker's pickup order (both keyed on `seq`).
