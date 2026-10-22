@@ -1,5 +1,29 @@
 # Changelog
 
+## [Unreleased] — V1.5 admission: accept-and-queue, no per-session rejection (card t_82bfbc15)
+
+- **POST /v1/jobs now accepts and queues instead of rejecting.** A session
+  may hold any number of active jobs; every submission that fits under
+  `MAX_QUEUE_DEPTH` answers `202` with the `token`, the `session` id and
+  the `queue_position` (1-based FIFO rank at admission — the same rank
+  `GET /v1/jobs/{token}` reports while `queued`). The per-session `429`
+  ("Session limit reached") response path is removed; the service no
+  longer emits `429` anywhere.
+- **`503` is the only rejection path** (queue genuinely full): `Retry-After`
+  header as before, and the detail now names both the depth and the
+  Retry-After value — `Queue is full (n/limit jobs queued). Retry after Xs.`
+- **`MAX_JOBS_PER_SESSION` is deprecated but accepted**: existing `.env`
+  files keep loading; when set, startup logs
+  `config: MAX_JOBS_PER_SESSION=... is DEPRECATED and IGNORED` and the
+  value is dropped from the boot config summary. No job is rejected on its
+  basis.
+- Docs updated: README HTTP API admission table + examples, CONFIG.md
+  queue/admission rows, TROUBLESHOOTING.md queue failures & restart
+  semantics, `.env.example` no longer ships the deprecated knob.
+- `tests/api/test_admission_202.py` (AC1-AC6); the retired-quota cases in
+  `test_queue_hardening.py` / `test_session_issue.py` were rewritten to the
+  accept-and-queue contract.
+
 ## [Unreleased] — V1.5 server-issued session identity (card t_920fb7dc)
 
 Quotas and per-job attribution become per-*person* rather than per-IP:

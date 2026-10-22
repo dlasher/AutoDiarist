@@ -68,9 +68,9 @@ sampling (no OOM protection).
 
 | HTTP | Meaning | Action |
 | --- | --- | --- |
-| `503` + `Retry-After` on POST | Queue at/above `MAX_QUEUE_DEPTH` (default 50) queued jobs. | Retry after the header delay. |
-| `429` + `Retry-After` on POST | This **session** already has `MAX_JOBS_PER_SESSION` (default 2) active jobs. | Wait or `DELETE` a queued job. |
-| Many clients sharing one quota bucket | Session identity falls back to client IP, then to a shared `anonymous` bucket, when neither the `SESSION_HEADER` (default `X-Session`) nor the server-issued `autodiarist_session` cookie is present. | Let the issued cookie flow (browser default; `curl -b jar`), send a per-client `X-Session` value, or set `SESSION_HEADER` to a header you already control (e.g. `Authorization`). |
+| `503` + `Retry-After` on POST | Queue at/above `MAX_QUEUE_DEPTH` (default 50) queued jobs — the **only** admission rejection since V1.5 (card t_82bfbc15): the detail names both the depth and the Retry-After value. | Retry after the header delay; raise `MAX_QUEUE_DEPTH` if the load is real. A second job from the same session is no longer rejected (the old `429` session quota is gone). |
+| Startup log: `MAX_JOBS_PER_SESSION=... is DEPRECATED and IGNORED` | The variable is still accepted so old `.env` files load, but it has no effect (card t_82bfbc15). | Delete the line from your env. Admission is queue-depth only. |
+| Many clients sharing one identity bucket | Session identity falls back to client IP, then to a shared `anonymous` bucket, when neither the `SESSION_HEADER` (default `X-Session`) nor the server-issued `autodiarist_session` cookie is present. Bucketing no longer gates admission (V1.5) but still groups jobs per person for listing and scheduling. | Let the issued cookie flow (browser default; `curl -b jar`), send a per-client `X-Session` value, or set `SESSION_HEADER` to a header you already control (e.g. `Authorization`). |
 | Jobs accepted but never start | `QUEUE_WORKER_ENABLED=0` ops valve, or the worker died (`worker crashed processing` in logs). | Flip the valve back to `1`; check job-specific errors. |
 
 ## Cancelling and deleting jobs
@@ -97,9 +97,9 @@ The queue is fully on disk (`JOBS_DIR/<token>/status.json` + monotonic
   **requeued on boot** with their `seq` intact (message: `Requeued after
   service restart`) and are reprocessed from the top — transcription is not
   checkpointed.
-- Admission limits (`MAX_QUEUE_DEPTH`, `MAX_JOBS_PER_SESSION`) are
-  revalidated from persisted state, so a restart cannot smuggle extra
-  concurrency.
+- Admission depth (`MAX_QUEUE_DEPTH`) is revalidated from persisted state on
+  every POST, so a restart cannot smuggle extra concurrency.
+  `MAX_JOBS_PER_SESSION` is deprecated and ignored (V1.5, card t_82bfbc15).
 - A restart mid-upload never admits a job: `status.json` is written only
   after the full body is received, and the queue scan ignores directories
   without one (a partially written `audio_source.*` may linger as inert
@@ -117,7 +117,7 @@ error text, and the worker's stage reached is visible from `progress` +
 (`RETENTION_DAYS`, default 30) or disk-pressure eviction
 (`DISK_MIN_FREE_MIB`), so copy the job dir aside promptly if you want a
 post-mortem to survive. Rejected uploads (bad extension,
-oversize, depth, session quota) leave no directory on disk at all.
+oversize, queue depth) leave no directory on disk at all.
 Successful jobs additionally hold `output_result.json` and
 `markdown_report.md`; real-mode engine scratch (`crispasr_out.*`) lives only
 in an ephemeral temp dir and is gone after the run.

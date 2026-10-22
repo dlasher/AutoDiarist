@@ -53,7 +53,7 @@ from the uploaded filename). On success:
 
 ```bash
 curl -sS -F 'file=@audio.wav;type=audio/wav' http://127.0.0.1:8000/v1/jobs
-# -> 202 {"token": "6a7f…uuid4…", "status": "queued"}
+# -> 202 {"token": "6a7f…uuid4…", "status": "queued", "session": "9f2c…uuid4hex…", "queue_position": 1}
 ```
 
 Admission is checked in this order, each with its own failure mode:
@@ -62,8 +62,12 @@ Admission is checked in this order, each with its own failure mode:
 |---|---|---|
 | 415 | extension not whitelisted (checked before the upload touches disk) | `Unsupported file type. Supported: wav, mp3, m4a, aac, ogg, flac` |
 | 413 | upload exceeds `MAX_UPLOAD_BYTES` (enforced while streaming, not after) | `File exceeds maximum size of <bytes> bytes` |
-| 503 | queue at `MAX_QUEUE_DEPTH` (count of `queued` jobs; default 50) | `Queue is full (n/50 jobs queued). Retry later.` + `Retry-After: <RETRY_AFTER_SECONDS>` header (default 30) |
-| 429 | the caller's session already has `MAX_JOBS_PER_SESSION` active jobs (default 2; see *Session identity*) | `Session limit reached: 2/2 active jobs per session (queued+processing). Wait for a job to finish or cancel one.` |
+| 503 | queue at `MAX_QUEUE_DEPTH` (count of `queued` jobs; default 50) — **the only rejection path** (V1.5): a second job from the same session is queued, never turned away | `Queue is full (n/50 jobs queued). Retry after 30s.` + `Retry-After: <RETRY_AFTER_SECONDS>` header (default 30); the detail names both the depth and the Retry-After value |
+
+A request that passes these checks is always accepted with `202` and
+queued: the body carries the `token`, the `session` id and the
+`queue_position` (1-based FIFO rank at admission). `MAX_JOBS_PER_SESSION`
+is deprecated — if set, the service warns at boot and ignores it.
 
 Rejected uploads leave no trace on disk: the partially streamed job directory
 is deleted before the error is returned.
@@ -77,7 +81,7 @@ curl -sS http://127.0.0.1:8000/v1/jobs/$TOKEN
 The response is the job's persisted state. Common to every status: `token`,
 `status`, `stage` (see *Progress stages* below), `seq` (FIFO position at
 admission), `queued_at`, `progress`, `message`, `filename`, plus the
-bookkeeping fields `session` (hashed quota identity), `session_ident`
+bookkeeping fields `session` (hashed session identity), `session_ident`
 (hashed session id, see *Session identity*) and `audio_path` (server-local
 path) — treat those as opaque.
 `status` is one of `queued`, `processing`, `done`, `failed`, `cancelled`:
@@ -204,7 +208,7 @@ so no raw id, token or IP is ever stored on disk):
 1. the value of the session header — `X-Session` by default, override with
    `SESSION_HEADER` (e.g. `-H 'X-Session: alice'`; with
    `SESSION_HEADER=Authorization`, `-H 'Authorization: Bearer ***'`
-   works as before and gives `alice` a stable quota across IP changes);
+   works as before and gives `alice` a stable identity across IP changes);
 2. the server-issued `autodiarist_session` cookie (name overridable via
    `SESSION_COOKIE_NAME`; a browser sends it back automatically, a curl
    client can with `-c jar -b jar`);
@@ -212,7 +216,8 @@ so no raw id, token or IP is ever stored on disk):
 4. an anonymous bucket when neither is available.
 
 Each accepted job persists two digests in its state: `session` (the identity
-above, which `MAX_JOBS_PER_SESSION` quotas) and the dedicated `session_ident`
+above; since V1.5 it no longer gates admission — `MAX_JOBS_PER_SESSION` is
+deprecated and ignored) and the dedicated `session_ident`
 key (the hash of the session id itself — including the one issued on the very
 first contact — so the scheduler and job listing can group by person rather
 than by IP).

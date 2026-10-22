@@ -35,9 +35,12 @@ JOBS_DIR.mkdir(parents=True, exist_ok=True)
 # Queue-hardening limits (card t_daebf369). Read at request/boot time (not
 # import time) so a deployment can tune them via env without code changes.
 DEFAULT_MAX_QUEUE_DEPTH = 50
-DEFAULT_MAX_JOBS_PER_SESSION = 2
 DEFAULT_RETRY_AFTER_SECONDS = 30
 DEFAULT_QUEUE_POLL_SECONDS = 0.2
+# MAX_JOBS_PER_SESSION is DEPRECATED as of V1.5 (card t_82bfbc15): a session
+# may hold any number of active jobs; the env var is still accepted so
+# existing .env files load unchanged, but validate_config() warns that it is
+# ignored and admission is queue-depth only.
 # Which header names the session identity; default X-Session. "Authorization"
 # stays honored when explicitly configured via SESSION_HEADER.
 SESSION_HEADER_DEFAULT = "X-Session"
@@ -682,23 +685,26 @@ def validate_config() -> str:
 
     Surfaces every session/queue/retention knob the service reads —
     SESSION_HEADER and SESSION_COOKIE_NAME (HTTP-token validated, invalid
-    values warn and fall back to the documented defaults), MAX_JOBS_PER_SESSION,
-    MAX_QUEUE_DEPTH, RETENTION_DAYS — so misconfiguration is visible in
-    `docker logs` instead of silently degrading behavior. Invalid integers
-    keep the established _env_int fallback; a non-positive quota/depth is
-    called out and pinned to the default.
+    values warn and fall back to the documented defaults), MAX_QUEUE_DEPTH
+    and RETENTION_DAYS — so misconfiguration is visible in `docker logs`
+    instead of silently degrading behavior. Invalid integers keep the
+    established _env_int fallback; a non-positive depth is called out and
+    pinned to the default. MAX_JOBS_PER_SESSION is accepted but IGNORED
+    (deprecated with the per-session rejection path, card t_82bfbc15): if
+    it is set, startup logs a warning saying so — no job is ever rejected
+    on its basis.
     """
     header = _session_header_name()
     cookie = _session_cookie_name()
     depth = _env_int("MAX_QUEUE_DEPTH", DEFAULT_MAX_QUEUE_DEPTH)
-    per_session = _env_int("MAX_JOBS_PER_SESSION", DEFAULT_MAX_JOBS_PER_SESSION)
     days = _retention_days()
-    if per_session < 1:
+    if "MAX_JOBS_PER_SESSION" in os.environ:
         logger.warning(
-            "config: MAX_JOBS_PER_SESSION=%d would admit no jobs; using %d",
-            per_session, DEFAULT_MAX_JOBS_PER_SESSION,
+            "config: MAX_JOBS_PER_SESSION=%r is DEPRECATED and IGNORED — "
+            "sessions may hold multiple active jobs; the only admission "
+            "rejection is queue depth (503). Remove it from your env.",
+            os.environ["MAX_JOBS_PER_SESSION"],
         )
-        per_session = DEFAULT_MAX_JOBS_PER_SESSION
     if depth < 1:
         logger.warning(
             "config: MAX_QUEUE_DEPTH=%d would reject every submission; using %d",
@@ -707,8 +713,7 @@ def validate_config() -> str:
         depth = DEFAULT_MAX_QUEUE_DEPTH
     summary = (
         f"config: session header={header} cookie={cookie} "
-        f"max_jobs_per_session={per_session} max_queue_depth={depth} "
-        f"retention_days={days}"
+        f"max_queue_depth={depth} retention_days={days}"
     )
     logger.info(summary)
     return summary
@@ -774,6 +779,9 @@ class JobResponse(BaseModel):
     token: str
     status: str
     session: str = ""
+    # 1-based FIFO rank at admission (V1.5, card t_82bfbc15): the client
+    # learns its queue position from the 202 itself, without a first poll.
+    queue_position: int | None = None
 
 
 class JobStatus(BaseModel):
@@ -813,35 +821,29 @@ async def create_job(request: Request, response: Response, file: UploadFile = Fi
         shutil.rmtree(job_dir, ignore_errors=True)
         raise
 
-    # 3. Admission control under the queue lock: depth first (system-level
-    #    backpressure, AC1), then the per-session quota (AC2). Rejected
-    #    uploads leave no enqueued trace on disk.
+    # 3. Admission control under the queue lock: queue depth is the single
+    #    system-level backpressure gate (AC1, card t_daebf369). Since V1.5
+    #    (card t_82bfbc15) the per-session quota rejection is gone: every
+    #    submission that fits under the depth is accepted with 202 and
+    #    queued behind the others. Rejected uploads leave no trace on disk.
     session, session_id, session_source = _resolve_session(request)
     depth_limit = _env_int("MAX_QUEUE_DEPTH", DEFAULT_MAX_QUEUE_DEPTH)
-    session_limit = _env_int("MAX_JOBS_PER_SESSION", DEFAULT_MAX_JOBS_PER_SESSION)
     retry_after = str(_env_int("RETRY_AFTER_SECONDS", DEFAULT_RETRY_AFTER_SECONDS))
     with _queue_lock:
         states = _iter_states()
         queued = [s for s in states if s.get("status") == "queued"]
         if len(queued) >= depth_limit:
             shutil.rmtree(job_dir, ignore_errors=True)
+            # Detail names both the queue depth and the Retry-After value
+            # (card t_82bfbc15 scope 5) so a client can back off from the
+            # response body alone.
             raise HTTPException(
                 status_code=503,
-                detail=f"Queue is full ({len(queued)}/{depth_limit} jobs queued). Retry later.",
-                headers={"Retry-After": retry_after},
-            )
-        active = [
-            s for s in states
-            if s.get("status") in ("queued", "processing") and s.get("session") == session
-        ]
-        if len(active) >= session_limit:
-            shutil.rmtree(job_dir, ignore_errors=True)
-            raise HTTPException(
-                status_code=429,
                 detail=(
-                    f"Session limit reached: {len(active)}/{session_limit} active jobs "
-                    "per session (queued+processing). Wait for a job to finish or cancel one."
+                    f"Queue is full ({len(queued)}/{depth_limit} jobs queued). "
+                    f"Retry after {retry_after}s."
                 ),
+                headers={"Retry-After": retry_after},
             )
         seq = max((s.get("seq", 0) for s in states), default=0) + 1
         state = {
@@ -862,6 +864,11 @@ async def create_job(request: Request, response: Response, file: UploadFile = Fi
             "audio_path": str(audio_path),
         }
         _write_state(state)
+        # FIFO rank at admission (1-based): every already-queued job holds a
+        # smaller seq (the new seq is max+1), so this job sits at
+        # len(queued)+1 — the same rank GET /v1/jobs/{token} reports for a
+        # queued job (see get_job_status).
+        queue_position = len(queued) + 1
 
     # Wake the worker if it's idle-waiting.
     wake = getattr(app.state, "wake", None)
@@ -879,7 +886,12 @@ async def create_job(request: Request, response: Response, file: UploadFile = Fi
         samesite="lax",
         path="/",
     )
-    return JobResponse(token=token, status="queued", session=session_id)
+    return JobResponse(
+        token=token,
+        status="queued",
+        session=session_id,
+        queue_position=queue_position,
+    )
 
 
 @app.get("/v1/jobs/{token}")

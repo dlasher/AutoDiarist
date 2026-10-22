@@ -207,10 +207,10 @@ def test_ac5_raw_session_id_never_lands_in_job_files(tmp_path, monkeypatch):
                 assert sid not in blob, f"raw session id leaked into {path}"
 
 
-# --- AC6: two sessions distinguishable, quota per-person ------------------- #
+# --- AC6: two sessions distinguishable; no per-session rejection ----------- #
 
 
-def test_ac6_two_sessions_distinguishable_and_quota_independent(tmp_path, monkeypatch):
+def test_ac6_two_sessions_distinguishable_no_quota_rejection(tmp_path, monkeypatch):
     root = _setup(tmp_path, monkeypatch, per_session=1)
     with TestClient(main.app) as c1, TestClient(main.app) as c2:
         r1 = _post(c1, headers={"X-Session": "user-a"})
@@ -219,28 +219,39 @@ def test_ac6_two_sessions_distinguishable_and_quota_independent(tmp_path, monkey
         s1, s2 = _state(root, r1.json()["token"]), _state(root, r2.json()["token"])
         assert s1["session"] != s2["session"]
         assert s1["session_ident"] != s2["session_ident"]
-        # Quota is per session, not per IP: user-a's second job is rejected
-        # while user-b sits in its own bucket.
+        # V1.5 admission change (card t_82bfbc15): user-a's second job is
+        # ACCEPTED (queued), not rejected — and it lands in user-a's bucket.
         r3 = _post(c1, headers={"X-Session": "user-a"})
-        assert r3.status_code == 429
+        assert r3.status_code == 202
+        assert _state(root, r3.json()["token"])["session"] == s1["session"]
 
 
 # --- AC8: config validation covers every session/queue knob ---------------- #
 
 
-def test_ac8_boot_config_report_covers_all_knobs(tmp_path, monkeypatch):
+def test_ac8_boot_config_report_covers_all_knobs(tmp_path, monkeypatch, caplog):
     _setup(tmp_path, monkeypatch)
     monkeypatch.setenv("SESSION_HEADER", "X-Test-Session")
     monkeypatch.setenv("SESSION_COOKIE_NAME", "test_session")
     monkeypatch.setenv("MAX_JOBS_PER_SESSION", "3")
     monkeypatch.setenv("MAX_QUEUE_DEPTH", "7")
     monkeypatch.setenv("RETENTION_DAYS", "14")
-    summary = main.validate_config()
+    with caplog.at_level(logging.WARNING, logger="api.main"):
+        summary = main.validate_config()
     assert "header=X-Test-Session" in summary
     assert "cookie=test_session" in summary
-    assert "max_jobs_per_session=3" in summary
     assert "max_queue_depth=7" in summary
     assert "retention_days=14" in summary
+    # MAX_JOBS_PER_SESSION is deprecated (card t_82bfbc15): it never appears
+    # in the live summary; setting it warns at startup that it is ignored.
+    assert "max_jobs_per_session" not in summary.lower()
+    ignores = [
+        r.getMessage()
+        for r in caplog.records
+        if "MAX_JOBS_PER_SESSION" in r.getMessage()
+        and r.levelno >= logging.WARNING
+    ]
+    assert ignores and "IGNORED" in ignores[0]
 
 
 def test_ac8_invalid_names_warn_and_fall_back(tmp_path, monkeypatch, caplog):
