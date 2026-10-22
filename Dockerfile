@@ -26,16 +26,38 @@ RUN python -m pip install --no-cache-dir --upgrade pip \
 # --- runtime ----------------------------------------------------------------
 FROM ubuntu:24.04 AS runtime
 
+# ONE Dockerfile, two hardware targets (packaging card t_f82ad22a): the
+# GPU_BACKEND build ARG (cuda | vulkan) selects ONLY the host-runtime apt
+# layer and the CrispASR engine release asset. The app layer — python
+# wheels, ffmpeg, the canonical Nemotron Q4_K GGUF, the sherpa diarization
+# stack, the entrypoint, the non-root `app` user — is one source of truth
+# shared byte-for-byte by both images and cannot diverge between backends.
+# Compose files pin the choice (the user never edits a tracked file):
+#   docker-compose.yml       GPU_BACKEND=cuda   NVIDIA path — CUDA-13 apt
+#                            libs + deploy.resources nvidia reservation,
+#                            exactly the behavior shipped since t_423d1ee4
+#   docker-compose.amd.yml   GPU_BACKEND=vulkan ubuntu:24.04 + libvulkan1 +
+#                            mesa-vulkan-drivers (Mesa RADV = hardware
+#                            Vulkan on amdgpu, no ROCm needed); /dev/dri +
+#                            /dev/kfd passed as devices; the entrypoint
+#                            auto-selects the AMD Vulkan ICD.
+ARG GPU_BACKEND=cuda
+
 # Env contract consumed by pipeline/transcribe.py (adapter t_4d5f7d08):
 #   CRISPASR_BIN            engine CLI baked at /opt/crispasr
 #   GGUF_MODEL              canonical Q4_K GGUF baked at /opt/models;
 #                           set empty to fall back to engine auto-download
 #                           into CRISPASR_CACHE_DIR
 #   CRISPASR_LIB_DIR        apt CUDA-13 lib dir, prepended to the subprocess
-#                           LD_LIBRARY_PATH by _crispasr_env()
-#   CRISPASR_GPU_BACKEND    pinned to cuda so a missing runtime FAILS the
-#                           --version probe instead of silently CPU-falling
-#                           back (~11x slower; spike first-run trap)
+#                           LD_LIBRARY_PATH by _crispasr_env(); on the
+#                           vulkan image docker-compose.amd.yml overrides it
+#                           to "" (the Vulkan loader resolves normally)
+#   CRISPASR_GPU_BACKEND    defaults to the GPU_BACKEND build ARG so the
+#                           image is self-describing; the compose file for
+#                           each hardware pins the literal (cuda|vulkan) so
+#                           a missing runtime FAILS the --version probe
+#                           instead of silently CPU-falling back
+#                           (~11x slower; spike first-run trap)
 #   DIAR_METHOD             sherpa default since card t_5a287979 (foxnose's
 #                           BIC counter collapses 5-speaker panels to one
 #                           label; sherpa = external sherpa-onnx subprocess
@@ -65,7 +87,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
     GGUF_MODEL=/opt/models/nemotron-3.5-asr-streaming-0.6b-q4_k.gguf \
     CRISPASR_CACHE_DIR=/var/cache/crispasr \
     CRISPASR_LIB_DIR=/usr/local/cuda-13.0/targets/x86_64-linux/lib \
-    CRISPASR_GPU_BACKEND=cuda \
+    CRISPASR_GPU_BACKEND=${GPU_BACKEND} \
     DIAR_METHOD=sherpa \
     SHERPA_SEGMENT_MODEL=/opt/models/sherpa-onnx-reverb-diarization-v1.onnx \
     SHERPA_EMBEDDING_MODEL=/opt/models/3dspeaker_speech_eres2net_base_sv_zh-cn_3dspeaker_16k.onnx \
@@ -74,19 +96,33 @@ ENV DEBIAN_FRONTEND=noninteractive \
     VRAM_LIMIT_MIB=3584 \
     CRISPASR_TIMEOUT_SECONDS=1800
 
-# CUDA-13 runtime libraries. The crispasr tarball deliberately does NOT
-# bundle libcudart.so.13 / libcublas.so.13; without them the CLI runs on CPU
-# without an error. Install exactly the two packages the spike pinned
-# (cuda-cudart-13-0, libcublas-13-0) from the NVIDIA ubuntu2404 repo
-# keyring — no toolkit, no devel headers, no nvidia/cuda base image.
+# Host GPU runtime, selected by the GPU_BACKEND build ARG — the ONLY
+# apt difference between the two images.
+#   cuda: the crispasr tarball deliberately does NOT bundle libcudart.so.13
+#     / libcublas.so.13; without them the CLI runs on CPU without an error.
+#     Install exactly the two packages the spike pinned (cuda-cudart-13-0,
+#     libcublas-13-0) from the NVIDIA ubuntu2404 repo keyring — no toolkit,
+#     no devel headers, no nvidia/cuda base image.
+#   vulkan: libvulkan1 (loader) + mesa-vulkan-drivers (RADV = hardware
+#     Vulkan on amdgpu). No ROCm stack needed — the proven AMD bring-up on
+#     10.4.10.55 uses exactly this pairing (amd-bringup.sh v3, ollama's
+#     working shape on that host).
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates curl gnupg \
-    && curl -fsSL -o /tmp/cuda-keyring.deb \
-       https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb \
-    && dpkg -i /tmp/cuda-keyring.deb \
-    && rm /tmp/cuda-keyring.deb \
-    && apt-get update \
-    && apt-get install -y --no-install-recommends cuda-cudart-13-0 libcublas-13-0 \
+    && case "$GPU_BACKEND" in \
+         cuda) \
+           curl -fsSL -o /tmp/cuda-keyring.deb \
+             https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb \
+           && dpkg -i /tmp/cuda-keyring.deb \
+           && rm /tmp/cuda-keyring.deb \
+           && apt-get update \
+           && apt-get install -y --no-install-recommends cuda-cudart-13-0 libcublas-13-0 ;; \
+         vulkan) \
+           apt-get install -y --no-install-recommends libvulkan1 mesa-vulkan-drivers ;; \
+         *) \
+           echo "FATAL: GPU_BACKEND must be 'cuda' or 'vulkan', got '$GPU_BACKEND'" >&2; \
+           exit 1 ;; \
+       esac \
     && rm -rf /var/lib/apt/lists/*
 
 # ffmpeg decodes uploads to 16 kHz mono before the engine sees them
@@ -101,12 +137,26 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/* \
     && useradd --create-home --uid 10001 --shell /usr/sbin/nologin app
 
-# crispasr v0.8.43 CUDA prebuilt. The sha256 is the GitHub release asset
-# digest (spike AC1); the archive wraps everything in one top-level
-# directory crispasr-linux-x86_64-cuda13/, hence --strip-components=1.
-RUN curl -fsSL -o /tmp/crispasr.tar.gz \
-       https://github.com/CrispStrobe/CrispASR/releases/download/v0.8.43/crispasr-linux-x86_64-cuda13.tar.gz \
-    && echo "fea397a3d7eb13741e3c65027fb1f51d0b362f9098257fbfe2d0e97e6c4fdf54  /tmp/crispasr.tar.gz" | sha256sum -c - \
+# crispasr v0.8.43 prebuilt — per-backend release asset, sha256-pinned.
+# The cuda13 digest is the spike AC1 asset digest; the vulkan digest was
+# independently sha-digested for card t_f82ad22a (AC2) against the
+# v0.8.43 GitHub release asset. Both archives wrap everything in one
+# top-level directory (crispasr-linux-x86_64-<backend>/), hence
+# --strip-components=1. A digest mismatch fails the build loudly.
+RUN set -eux; \
+    case "$GPU_BACKEND" in \
+        cuda) \
+            url=https://github.com/CrispStrobe/CrispASR/releases/download/v0.8.43/crispasr-linux-x86_64-cuda13.tar.gz; \
+            digest=fea397a3d7eb13741e3c65027fb1f51d0b362f9098257fbfe2d0e97e6c4fdf54 ;; \
+        vulkan) \
+            url=https://github.com/CrispStrobe/CrispASR/releases/download/v0.8.43/crispasr-linux-x86_64-vulkan.tar.gz; \
+            digest=d5c676e023df6fac61971dcef06fb7cce22ff3de95367f8e01efb8743c11ca46 ;; \
+        *) \
+            echo "FATAL: GPU_BACKEND must be 'cuda' or 'vulkan', got '$GPU_BACKEND'" >&2; \
+            exit 1 ;; \
+    esac; \
+    curl -fsSL -o /tmp/crispasr.tar.gz "$url" \
+    && echo "$digest  /tmp/crispasr.tar.gz" | sha256sum -c - \
     && mkdir -p /opt/crispasr \
     && tar -xzf /tmp/crispasr.tar.gz -C /opt/crispasr --strip-components=1 \
     && rm /tmp/crispasr.tar.gz
@@ -124,10 +174,11 @@ RUN mkdir -p /opt/models \
 # BACKEND-INDEPENDENT ON PURPOSE: sherpa-onnx runs clustering on CPU
 # (onnxruntime provider=cpu), so the CUDA and Vulkan images built from this
 # Dockerfile carry the SAME model files and the SAME DIAR_METHOD default
-# (AC5). There is no GPU_BACKEND build ARG in this Dockerfile yet -- card
-# t_f82ad22a (packaging) will introduce one for the ENGINE tarball; these
-# layers must not come to depend on that arg, so they reference no CUDA
-# asset at all.
+# (AC5/AC4, cards t_5a287979 + t_f82ad22a): the GPU_BACKEND build ARG
+# exists (engine tarball + runtime-libs layers only). These layers
+# deliberately do NOT reference that arg, so the CUDA and Vulkan images
+# are provably identical from here down -- same CLI, same libs, same
+# models, same wrapper.
 #
 # (1) sherpa-onnx CLI + shared libs. The crispasr engine shells out to
 #     sherpa-onnx-offline-speaker-diarization for --diarize-method
@@ -197,6 +248,14 @@ WORKDIR /app
 COPY api ./api
 COPY pipeline ./pipeline
 
+# Container entrypoint (card t_f82ad22a): auto-selects the AMD Vulkan ICD
+# (radeon|amdgpu glob under /usr/share/vulkan/icd.d — selecting ALL jsons
+# there made the engine die at init with vulkan:11 on the proven bring-up;
+# no-op on the CUDA image) and execs uvicorn exactly as the previous inline
+# CMD did.
+COPY scripts/docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+RUN chmod 0755 /usr/local/bin/docker-entrypoint.sh
+
 USER app
 EXPOSE 8000
-CMD ["sh", "-c", "exec uvicorn api.main:app --host 0.0.0.0 --port \"${PORT:-8000}\""]
+ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]

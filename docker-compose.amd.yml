@@ -1,0 +1,105 @@
+# =============================================================================
+# AutoDiarist — AMD/Vulkan host (RX 6600 class; amdgpu + Mesa RADV —
+# hardware Vulkan through the open driver, no ROCm stack needed).
+# For an NVIDIA CUDA GPU use docker-compose.yml instead — same repo, same
+# Dockerfile, other file.
+#
+# ONE COMMAND, ZERO EDITS (packaging card t_f82ad22a):
+#     git clone https://github.com/dlasher/AutoDiarist.git autodiarist
+#     cd autodiarist
+#     docker compose -f docker-compose.amd.yml up --build
+#
+# The SHAPE of this file is proven live on the AMD host 10.4.10.55 by
+# ~/CODE/HERMES-PATTERNS/amd-bringup.sh v3 (ollama's working configuration
+# on that box): base ubuntu:24.04 + libvulkan1 + mesa-vulkan-drivers, the
+# crispasr vulkan asset, /dev/dri + /dev/kfd passed directly, and the
+# container reaching the GPU as uid 10001 through HOST-SIDE ACLs — no
+# group_add, no privileged, no ROCm docker runtime (none exists on the
+# host), and no docker device_requests reservation (compose cannot
+# interpolate a device list from .env anyway).
+#
+# DEVICE ACCESS — PRIMARY PATH (zero edits, run once on the host):
+#     sudo setfacl -m u:10001:rw /dev/dri/renderD128
+#     sudo setfacl -m u:10001:rw /dev/kfd
+#     # grant the card nodes too (which ones exist varies per host):
+#     for n in /dev/dri/card*; do sudo setfacl -m u:10001:rw "$n"; done
+#   The container runs as the image's `app` user (uid/gid 10001) on BOTH
+#   hardware targets; granting uid 10001 directly removes all gid
+#   discovery from the critical path, so this file never needs a per-host
+#   value. The gids on these nodes are HOST-SPECIFIC and MUST NEVER be
+#   hardcoded into any tracked file (they differ by driver stack and
+#   kernel, and which group owns card0 vs renderD128 varies too — the
+#   ACL path sidesteps the whole question by granting the uid directly).
+#   udev recreates the nodes on reboot, so re-apply after a reboot (or
+#   run scripts/vulkan-host-setup.sh, which also installs a udev rule
+#   making the grant permanent).
+#
+#   FALLBACK (no setfacl binary on the host): bash
+#   scripts/vulkan-host-setup.sh says so out loud and grants node mode
+#   0666 on the same nodes instead — the compose file itself stays
+#   static and .env-free either way (group_add is NOT interpolable from
+#   .env by compose, which is why host gids can never live in this file).
+# =============================================================================
+services:
+  autodiarist:
+    build:
+      context: .
+      args:
+        # One Dockerfile, two hardware targets — this file pins the Vulkan
+        # path: libvulkan1 + mesa-vulkan-drivers + the sha-pinned
+        # crispasr-linux-x86_64-vulkan asset. The app layer (wheels,
+        # ffmpeg, GGUF, sherpa stack, entrypoint, app user) is shared
+        # verbatim with the CUDA image — no forked Dockerfile.amd, so
+        # DIAR_METHOD=sherpa and the baked ONNX models cannot regress.
+        GPU_BACKEND: vulkan
+    image: autodiarist:local-amd
+    ports:
+      - "${HOST_PORT:-8000}:8000"
+    # Direct device nodes, exactly the proven ollama/amd-bringup shape.
+    devices:
+      - /dev/dri
+      - /dev/kfd
+    environment:
+      JOBS_DIR: /data/jobs
+      MOCK_PIPELINE: ${MOCK_PIPELINE:-0}
+      CRISPASR_BIN: ${CRISPASR_BIN:-/opt/crispasr/crispasr}
+      GGUF_MODEL: ${GGUF_MODEL:-/opt/models/nemotron-3.5-asr-streaming-0.6b-q4_k.gguf}
+      # Empty on the Vulkan path: there is no CUDA lib dir to prepend, and
+      # the vulkan engine asset is statically linked against the Mesa RADV
+      # driver — it resolves libvulkan.so.1 through the normal loader.
+      CRISPASR_LIB_DIR: ""
+      # PINNED LITERAL — never an env default that could silently fall
+      # back to CPU (same rule as the cuda compose; the --version probe
+      # fails fast if the vulkan backend is not registered).
+      CRISPASR_GPU_BACKEND: vulkan
+      # Diarization: identical to the CUDA path (card t_5a287979). The
+      # sherpa-onnx CLI + both ONNX models are baked into the image;
+      # foxnose's global pass collapses panel recordings (5 -> 1 speaker)
+      # and must NOT come back as a default on any backend.
+      DIAR_METHOD: sherpa
+      SHERPA_SEGMENT_MODEL: ${SHERPA_SEGMENT_MODEL:-/opt/models/sherpa-onnx-reverb-diarization-v1.onnx}
+      SHERPA_EMBEDDING_MODEL: ${SHERPA_EMBEDDING_MODEL:-/opt/models/3dspeaker_speech_eres2net_base_sv_zh-cn_3dspeaker_16k.onnx}
+      SHERPA_BIN: ${SHERPA_BIN:-/opt/sherpa/sherpa-diarization-wrapper}
+      SHERPA_CLUSTER_THRESHOLD: ${SHERPA_CLUSTER_THRESHOLD:-0.40}
+      # 7 GiB ceiling: mirrors the proven amd-bringup VRAM pin on the 8 GB
+      # RX 6600 (the CUDA file pins 3584 for the 4 GB T400 — per-host by
+      # design, both are conservative ceilings, not hardware discovery).
+      VRAM_LIMIT_MIB: 7168
+      CRISPASR_TIMEOUT_SECONDS: 1800
+      # Retention + disk-pressure (card t_5e6200fc): EXACTLY the names
+      # api/main.py reads (a compose key the API does not read silently
+      # falls back to the API default — planner review, card t_f82ad22a;
+      # tests/test_docker_packaging.py now cross-checks every compose env
+      # key against the source). Defaults match api/main.py; the watermark
+      # must fit the volume backing /data/jobs.
+      RETENTION_DAYS: ${RETENTION_DAYS:-30}
+      DISK_MIN_FREE_MIB: ${DISK_MIN_FREE_MIB:-8192}
+      DISK_CHECK_INTERVAL_SECONDS: ${DISK_CHECK_INTERVAL_SECONDS:-300}
+    restart: unless-stopped
+    volumes:
+      - jobs-data:/data/jobs
+      - crispasr-cache:/var/cache/crispasr
+
+volumes:
+  jobs-data:
+  crispasr-cache:
