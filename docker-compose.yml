@@ -33,7 +33,7 @@ services:
       # flag for it; it is the knob that sets how many speakers
       # FastClustering emits). Override SHERPA_CLUSTER_THRESHOLD to tune.
       SHERPA_BIN: ${SHERPA_BIN:-/opt/sherpa/sherpa-diarization-wrapper}
-      SHERPA_CLUSTER_THRESHOLD: ${SHERPA_CLUSTER_THRESHOLD:-0.35}
+      SHERPA_CLUSTER_THRESHOLD: ${SHERPA_CLUSTER_THRESHOLD:-0.40}
       VRAM_LIMIT_MIB: 3584
       CRISPASR_TIMEOUT_SECONDS: 1800
       # Retention + disk-pressure (card t_5e6200fc). Defaults match
@@ -42,7 +42,8 @@ services:
       DISK_MIN_FREE_MIB: ${DISK_MIN_FREE_MIB:-8192}
       DISK_CHECK_INTERVAL_SECONDS: ${DISK_CHECK_INTERVAL_SECONDS:-300}
     volumes:
-      # foxnose embedder + any --auto-download artifacts persist here;
+      # engine embedders (--diarize-embedder auto) + any --auto-download
+      # artifacts persist here;
       # the Q4_K GGUF itself is baked into the image at /opt/models.
       - crispasr-cache:/var/cache/crispasr
       - jobs-data:/data/jobs

@@ -12,10 +12,22 @@
 # threshold by wrapping the real binary. Keep the flag name exactly in
 # sync with the upstream CLI (k2-fsa/sherpa-onnx,
 # csrc/sherpa-onnx-offline-speaker-diarization.cc).
+#
+# NV-host calibration (reverb-diarization-v1 segmentation + eres2net_base
+# embedding, full crispasr engine contract, 2026-10-22):
+#   0.35 -> panel 5 speakers (matches the reference count), 1-speaker
+#           promo file 3 labels
+#   0.40 -> panel 3, promo 2 (no worse than the retired foxnose default)
+#   0.45 -> panel collapses to 1
+# 0.40 ships as the default: it meets the card's >=3 bar while keeping
+# single-speaker output closest to truth. SHERPA_CLUSTER_THRESHOLD is a
+# runtime knob -- LOWER it (toward 0.35) to resolve more speakers on
+# panels, RAISE it (toward 0.45) to merge aggressively on narrated
+# uploads; no rebuild needed.
 set -eu
 
 SHERPA_REAL="${SHERPA_REAL:-/opt/sherpa/bin/sherpa-onnx-offline-speaker-diarization}"
-SHERPA_CLUSTER_THRESHOLD="${SHERPA_CLUSTER_THRESHOLD:-0.35}"
+SHERPA_CLUSTER_THRESHOLD="${SHERPA_CLUSTER_THRESHOLD:-0.40}"
 SHERPA_LD_LIBRARY_PATH="${SHERPA_LD_LIBRARY_PATH:-/opt/sherpa/lib}"
 
 LD_LIBRARY_PATH="${SHERPA_LD_LIBRARY_PATH}${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"

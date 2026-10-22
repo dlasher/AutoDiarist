@@ -63,12 +63,16 @@ DIAR_METHOD_DEFAULT = "sherpa"
 # without them the engine emits segments with no speaker labels (silent
 # degradation, rejected at startup since t_5a287979).
 SHERPA_MODEL_METHODS = frozenset({"sherpa", "ecapa"})
-# Canonical model artifact names as printed by the engine's own help text
-# ("sherpa-pyannote-segmentation-3.0.onnx", "3dspeaker_speech_eres2net_base
-# _sv_zh-cn_3dspeaker_16k.onnx", "Download them from
-# https://github.com/k2-fsa/sherpa-onnx"). The Dockerfile pins matching
-# release assets; see README "Diarization models".
-SHERPA_SEGMENT_NAME = "sherpa-pyannote-segmentation-3.0.onnx"
+# Canonical model artifacts baked at /opt/models by the Dockerfile (all
+# three URLs are k2-fsa/sherpa-onnx GitHub release assets -- never guess
+# them; the embedding filename is also the one the engine's own help text
+# prints, "Download them from https://github.com/k2-fsa/sherpa-onnx").
+# The SEGMENTATION model is reverb-diarization-v1, not the plain
+# pyannote-segmentation-3-0: on NV-host A/Bs over the card fixtures it
+# halves the single-speaker over-split (BestPractice 7 -> 3 labels at
+# thr 0.35) while keeping the panel file at 5 speakers -- the reverb-
+# robust training matches conference/panel audio.
+SHERPA_SEGMENT_NAME = "sherpa-onnx-reverb-diarization-v1.onnx"
 SHERPA_EMBEDDING_NAME = "3dspeaker_speech_eres2net_base_sv_zh-cn_3dspeaker_16k.onnx"
 SHERPA_MODELS_DIR = "/opt/models"
 GPU_BACKENDS = {"cpu", "cuda", "metal", "vulkan"}

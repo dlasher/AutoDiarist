@@ -46,7 +46,7 @@ def _stub_sherpa_models(tmp_path: Path, monkeypatch) -> None:
     (t_5a287979 AC4) demands the two ONNX models on disk. Fake-engine
     tests stub them exactly like the GGUF stub above."""
     for env, fname in (
-        ("SHERPA_SEGMENT_MODEL", "sherpa-pyannote-segmentation-3.0.onnx"),
+        ("SHERPA_SEGMENT_MODEL", "sherpa-onnx-reverb-diarization-v1.onnx"),
         ("SHERPA_EMBEDDING_MODEL", "3dspeaker_speech_eres2net_base_sv_zh-cn_3dspeaker_16k.onnx"),
     ):
         stub = tmp_path / fname

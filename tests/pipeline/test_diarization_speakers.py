@@ -51,11 +51,12 @@ CONFIG_ENVS = (
     "SHERPA_SEGMENT_MODEL", "SHERPA_EMBEDDING_MODEL", "SHERPA_BIN",
 )
 
-# Canonical model artifacts (names as referenced by the engine's own help
-# text: strings /opt/crispasr/crispasr -> "sherpa-pyannote-segmentation-3.0
-# .onnx" and "3dspeaker_speech_eres2net_base_sv_zh-cn_3dspeaker_16k.onnx",
-# "Download them from https://github.com/k2-fsa/sherpa-onnx").
-SHERPA_SEGMENT_NAME = "sherpa-pyannote-segmentation-3.0.onnx"
+# Canonical model artifacts (k2-fsa/sherpa-onnx GitHub release assets;
+# the Dockerfile pins them by sha256 -- see README "Diarization models").
+# The segmentation model is reverb-trained: on NV-host A/Bs it halves the
+# single-speaker over-split vs plain pyannote-segmentation-3-0 while the
+# panel file keeps 5 speakers at thr 0.35.
+SHERPA_SEGMENT_NAME = "sherpa-onnx-reverb-diarization-v1.onnx"
 SHERPA_EMBEDDING_NAME = "3dspeaker_speech_eres2net_base_sv_zh-cn_3dspeaker_16k.onnx"
 
 
@@ -115,6 +116,20 @@ def test_sherpa_with_models_present_accepts(tmp_path, monkeypatch):
     monkeypatch.setenv("SHERPA_SEGMENT_MODEL", _touch(tmp_path / SHERPA_SEGMENT_NAME))
     monkeypatch.setenv("SHERPA_EMBEDDING_MODEL", _touch(tmp_path / SHERPA_EMBEDDING_NAME))
     tr._validate_runtime_config()  # no raise
+
+
+def test_sherpa_rejects_non_executable_sherpa_bin(tmp_path, monkeypatch):
+    """AC4 refusal, second half: SHERPA_BIN pointing at a non-executable
+    file is a miswired wrapper -- fail at startup, not per job."""
+    _stub_gguf_and_backend(monkeypatch, tmp_path)
+    monkeypatch.setenv("DIAR_METHOD", "sherpa")
+    monkeypatch.setenv("SHERPA_SEGMENT_MODEL", _touch(tmp_path / SHERPA_SEGMENT_NAME))
+    monkeypatch.setenv("SHERPA_EMBEDDING_MODEL", _touch(tmp_path / SHERPA_EMBEDDING_NAME))
+    dead = tmp_path / "sherpa-diarization-wrapper"
+    dead.write_text("#!/bin/sh\nexit 0\n")  # NOT chmod +x
+    monkeypatch.setenv("SHERPA_BIN", str(dead))
+    with pytest.raises(tr.CrispasrConfigError, match="SHERPA_BIN"):
+        tr._validate_runtime_config()
 
 
 # ---------------------------------------------------------------------------
