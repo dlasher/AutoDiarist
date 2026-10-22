@@ -437,6 +437,57 @@ real runs need 16 kHz-capable content (any standard WAV is accepted —
 ffmpeg -f lavfi -i sine=frequency=440:duration=5 -ac 1 -ar 16000 audio.wav
 ```
 
+## Smoke test (OPTIONAL — not part of activation)
+
+`scripts/smoke-test.sh` is an OPTIONAL, user-invoked probe that validates a
+running AutoDiarist deployment is alive and its API round-trip works end to
+end. It is NOT a container-activation step — activation stays exactly
+`docker compose up` (+ the compose file for your hardware) — and no
+Dockerfile, compose file, entrypoint, or healthcheck references it; a fresh
+clone never runs it. It is also NOT a transcription-quality or WER test:
+**ALIVENESS AND PLUMBING ONLY — transcription quality is not measured.**
+
+```bash
+./scripts/smoke-test.sh                              # default http://127.0.0.1:8000
+./scripts/smoke-test.sh --endpoint http://<host>:8000 --timeout 1800
+./scripts/smoke-test.sh --audio my.wav               # optional user-supplied file
+```
+
+Five PASS/FAIL checks; exit 0 only when all five pass, non-zero exits name
+the failed check, and every curl command used is printed verbatim so a
+reviewer can reproduce from a laptop with no host access:
+
+| Check | Verifies |
+| --- | --- |
+| (a) | `GET /docs` returns 200 (service is up) |
+| (b) | `POST /v1/jobs` fixture upload returns 202 + token |
+| (c) | the job reaches terminal status `done` within `--timeout` (bounded polling; last observed status/stage/progress is reported on expiry; a `failed` job fails here) |
+| (d) | `GET /v1/jobs/{token}/download?format=md` is non-empty markdown with a `Duration` metadata row and a `## Transcript` section |
+| (e) | `GET /v1/jobs/{token}/download?format=json` is valid JSON with `status: done` and a non-empty `segments` array (observed speaker count is printed as INFO — informational, never a gate) |
+
+Fixture lifecycle — no audio is committed and none is required from you:
+the primary fixture is pyannote's published `marklex1min.wav`, a real 79 s
+two-speaker conversation, downloaded at runtime into a `mktemp -d` temp dir
+and uploaded **as published** (never pre-converted — if the pipeline cannot
+decode 44.1 kHz stereo, the smoke test surfaces that as a genuine finding).
+If the download fails (offline, blocked) — or the server answers 200 with a
+body that is not a real WAV — the script discards any downloaded bytes and
+falls back to the generated 5 s 16 kHz mono tone from *Test fixture* above,
+stating truthfully which case occurred and which fixture was used. The temp
+dir — and the wav inside it — is removed
+on exit, including on failure, Ctrl-C, or SIGTERM; nothing is cached in any
+user-visible location and nothing touches `/data/jobs` or any mounted
+volume. `--audio FILE` skips the lifecycle and uses your file as-is.
+
+Requirements: `curl` + `python3` only (ffmpeg is needed solely on the
+tone-fallback path; if ffmpeg is missing **and** no usable download exists —
+fetch failed or the 200 body was not a real WAV — the script stops with a
+clear actionable error, never a silent pass or skip).
+The script runs zero docker commands and creates exactly one short job per
+invocation, so it is safe to run against the production deploy. Coverage:
+`tests/scripts/test_smoke_test.py` exercises it against a stdlib HTTP stub —
+no container, GPU, or internet needed.
+
 ## Language
 
 `en-US` is fixed for v1 (SPEC 08, "Languages" section): the adapter always
@@ -791,7 +842,10 @@ against `MOCK_PIPELINE=1`, no GPU required. The Docker packaging tests
 (`tests/test_docker_packaging.py`) assert the backend pins, runtime-library
 prerequisites, GGUF hash verification, and that the torch-era knobs stay
 removed. `scripts/vm_integration.py` is the on-VM acceptance harness for the
-real CrispASR path.
+real CrispASR path. The optional smoke-test script's own tests
+(`tests/scripts/`) drive `scripts/smoke-test.sh` against a local stub HTTP
+server — they touch neither docker, the GPU, nor the internet, and running
+the script itself is never part of activation or the test-suite bootstrap.
 
 ## Opt-in LLM cleanup pass (V2, default off)
 
