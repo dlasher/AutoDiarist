@@ -1,6 +1,34 @@
 # Changelog
 
-## [Unreleased] — V1.5 session-scoped job listing: GET /v1/jobs (card t_f97d12a8)
+## [1.5.0] - 2026-10-21 — V1.5 wave: multi-user behaviour on one service (integrated by card t_f41ad4f2)
+
+One deployment shared by several people at once: every user gets a
+server-issued session id, every submission is accepted and queued instead
+of rejected per session, the queue drains fairly across sessions, each
+user can list their own jobs, and every queued job carries an honest wait
+estimate. No pipeline/diarization changes in this release — the behaviour
+delta lives in `api/main.py`. The card sections below (newest first, as
+stacked on the release branch) are preserved verbatim from the branches.
+
+**Config changes in this release (new/changed env vars):**
+
+| Variable | Change | Card |
+|---|---|---|
+| `SESSION_HEADER` | session header default changed to `X-Session` (explicit config still honored; `Authorization` works only when configured) | t_920fb7dc |
+| `SESSION_COOKIE_NAME` | new, default `autodiarist_session` — server-issued session cookie | t_920fb7dc |
+| `MAX_JOBS_PER_SESSION` | deprecated: still read from `.env`, ignored at runtime with a boot warning; the per-session 429 rejection path is gone — `MAX_QUEUE_DEPTH` is the only admission rejection (503) | t_82bfbc15 |
+| `MAX_PROCESSING_PER_SESSION` | new, default `1`, scheduler-enforced per-session GPU cap | t_4b40acfd |
+| `PROCESSING_SECONDS_PER_AUDIO_SECOND` | new, default `0.185` (measured on this T400 rig; hardware-specific; `0` disables ETA fields) | t_b3ae9366 |
+| `AUDIO_DURATION_FALLBACK_SECONDS` | new, default `300`, substituted in the ETA prefix sum only for unprobeable jobs queued ahead | t_b3ae9366 |
+
+`queue_position` semantics also changed (an API field, not config): rank
+in fair execution order, no longer arrival order — see the t_4b40acfd
+section. New API surface: `GET /v1/jobs` session listing (t_f97d12a8),
+`duration_seconds` / `estimated_wait_seconds` / `estimated_completion_at`
+on the 202, every poll and queued listing entries (t_b3ae9366), and the
+`session` field + session cookie on `POST` responses (t_920fb7dc).
+
+### V1.5 session-scoped job listing: GET /v1/jobs (card t_f97d12a8)
 
 Building on session identity (card t_920fb7dc) and accept-and-queue admission
 (card t_82bfbc15): a client can now answer "what did I submit?" — the
@@ -30,7 +58,7 @@ its own tokens first.
 - Tests: 9 new acceptance tests (`tests/api/test_jobs_listing.py`); full
   suite 254 green. README documents the endpoint; CONFIG.md unchanged.
 
-## [Unreleased] — V1.5 honest wait estimate: duration probe + queue-aware ETA (card t_b3ae9366)
+### V1.5 honest wait estimate: duration probe + queue-aware ETA (card t_b3ae9366)
 
 Building on fair-share scheduling (card t_4b40acfd): a queued client can now
 decide *wait or cancel* from an honest number instead of a bare position.
@@ -80,7 +108,7 @@ the 202/poll/listing HTTP surfaces (listing entries agree with the poll
 endpoint by construction). Full suite green: 284 passed (stacked on
 card t_f97d12a8's listing branch).
 
-## [Unreleased] — V1.5 fair-share scheduling: round-robin per session + processing cap (card t_4b40acfd)
+### V1.5 fair-share scheduling: round-robin per session + processing cap (card t_4b40acfd)
 
 Building on accept-and-queue admission (card t_82bfbc15): the shared GPU is
 now allocated fairly across sessions, so a session that submits many jobs
@@ -127,7 +155,7 @@ can no longer starve one that submits a single job.
   restart preserving fairness with no starvation, corrupt-pointer recovery,
   boot requeue, cancelled-job order removal.
 
-## [Unreleased] — V1.5 admission: accept-and-queue, no per-session rejection (card t_82bfbc15)
+### V1.5 admission: accept-and-queue, no per-session rejection (card t_82bfbc15)
 
 - **POST /v1/jobs now accepts and queues instead of rejecting.** A session
   may hold any number of active jobs; every submission that fits under
@@ -151,7 +179,7 @@ can no longer starve one that submits a single job.
   `test_queue_hardening.py` / `test_session_issue.py` were rewritten to the
   accept-and-queue contract.
 
-## [Unreleased] — V1.5 server-issued session identity (card t_920fb7dc)
+### V1.5 server-issued session identity (card t_920fb7dc)
 
 Quotas and per-job attribution become per-*person* rather than per-IP:
 the server now mints a random high-entropy session id (uuid4 hex) on
