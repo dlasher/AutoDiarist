@@ -70,7 +70,7 @@ sampling (no OOM protection).
 | --- | --- | --- |
 | `503` + `Retry-After` on POST | Queue at/above `MAX_QUEUE_DEPTH` (default 50) queued jobs. | Retry after the header delay. |
 | `429` + `Retry-After` on POST | This **session** already has `MAX_JOBS_PER_SESSION` (default 2) active jobs. | Wait or `DELETE` a queued job. |
-| Many clients sharing one quota bucket | Session identity falls back to client IP, then to a shared `anonymous` bucket, when the `SESSION_HEADER` (default `Authorization`) is absent. | Send a per-client bearer token or set `SESSION_HEADER`. |
+| Many clients sharing one quota bucket | Session identity falls back to client IP, then to a shared `anonymous` bucket, when neither the `SESSION_HEADER` (default `X-Session`) nor the server-issued `autodiarist_session` cookie is present. | Let the issued cookie flow (browser default; `curl -b jar`), send a per-client `X-Session` value, or set `SESSION_HEADER` to a header you already control (e.g. `Authorization`). |
 | Jobs accepted but never start | `QUEUE_WORKER_ENABLED=0` ops valve, or the worker died (`worker crashed processing` in logs). | Flip the valve back to `1`; check job-specific errors. |
 
 ## Cancelling and deleting jobs

@@ -77,8 +77,9 @@ curl -sS http://127.0.0.1:8000/v1/jobs/$TOKEN
 The response is the job's persisted state. Common to every status: `token`,
 `status`, `stage` (see *Progress stages* below), `seq` (FIFO position at
 admission), `queued_at`, `progress`, `message`, `filename`, plus the
-bookkeeping fields `session` (the hashed session id) and `audio_path`
-(server-local path) — treat those as opaque.
+bookkeeping fields `session` (hashed quota identity), `session_ident`
+(hashed session id, see *Session identity*) and `audio_path` (server-local
+path) — treat those as opaque.
 `status` is one of `queued`, `processing`, `done`, `failed`, `cancelled`:
 
 - `queued` — adds `queue_position`: the job's **1-based rank among currently
@@ -191,19 +192,34 @@ never evicted — checked at boot and every `DISK_CHECK_INTERVAL_SECONDS`
 
 ### Session identity
 
-`MAX_JOBS_PER_SESSION` is enforced per *session*, resolved for every request
-in this order (then hashed, sha256 → first 32 hex chars, so no raw token or
-IP is ever stored on disk):
+Every client is tracked as a *session*. On first contact the server issues a
+random high-entropy session id (uuid4 hex) and returns it **both** as the
+`autodiarist_session` cookie (HttpOnly, SameSite=Lax) **and** as the `session`
+field of the `POST /v1/jobs` body — so raw API clients can capture the id
+without a cookie jar and send it back themselves. The server keeps no session
+table: the id lives on the client, and identity is always derived from what
+the client presents, in this order (then hashed, sha256 → first 32 hex chars,
+so no raw id, token or IP is ever stored on disk):
 
-1. the value of the session header — `Authorization` by default, override
-   with `SESSION_HEADER` (e.g. `-H 'Authorization: Bearer alice'` gives
-   `alice` a stable quota across IP changes);
-2. the client IP when no such header is present (`request.client.host`);
-3. an anonymous bucket when neither is available.
+1. the value of the session header — `X-Session` by default, override with
+   `SESSION_HEADER` (e.g. `-H 'X-Session: alice'`; with
+   `SESSION_HEADER=Authorization`, `-H 'Authorization: Bearer ***'`
+   works as before and gives `alice` a stable quota across IP changes);
+2. the server-issued `autodiarist_session` cookie (a browser sends it back
+   automatically; a curl client can with `-c jar -b jar`);
+3. the client IP when neither header nor cookie is present (`request.client.host`);
+4. an anonymous bucket when neither is available.
+
+Each accepted job persists two digests in its state: `session` (the identity
+above, which `MAX_JOBS_PER_SESSION` quotas) and the dedicated `session_ident`
+key (the hash of the session id itself — including the one issued on the very
+first contact — so the scheduler and job listing can group by person rather
+than by IP).
 
 A slot frees when the job reaches `done`, `failed`, or `cancelled`. Behind a
 reverse proxy that replaces the peer address, all clients share one IP
-bucket — set a real session header in that deployment.
+bucket until a cookie or session header flows — set a real `SESSION_HEADER`
+or trust the issued cookie in that deployment.
 
 ## Quickstart (GPU host, Docker)
 

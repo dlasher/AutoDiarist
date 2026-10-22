@@ -34,7 +34,9 @@ def _setup(tmp_path, monkeypatch, worker="0", depth=None, per_session=None, poll
 
 
 def _post(client, session=None, name="a.wav"):
-    headers = {"Authorization": f"Bearer {session}"} if session else None
+    # V1.5 (card t_920fb7dc): the session identity header defaults to
+    # X-Session. Authorization is only honored when SESSION_HEADER names it.
+    headers = {"X-Session": session} if session else None
     return client.post(
         "/v1/jobs",
         files={"file": (name, AUDIO, "audio/wav")},

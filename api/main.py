@@ -10,7 +10,7 @@ import logging
 import threading
 from contextlib import asynccontextmanager, suppress
 from pathlib import Path
-from fastapi import FastAPI, Request, UploadFile, File, HTTPException, status
+from fastapi import FastAPI, Request, Response, UploadFile, File, HTTPException, status
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, ConfigDict
 
@@ -38,8 +38,12 @@ DEFAULT_MAX_QUEUE_DEPTH = 50
 DEFAULT_MAX_JOBS_PER_SESSION = 2
 DEFAULT_RETRY_AFTER_SECONDS = 30
 DEFAULT_QUEUE_POLL_SECONDS = 0.2
-# Which header names the session identity; default Authorization (bearer token).
-SESSION_HEADER_DEFAULT = "Authorization"
+# Which header names the session identity; default X-Session. "Authorization"
+# stays honored when explicitly configured via SESSION_HEADER.
+SESSION_HEADER_DEFAULT = "X-Session"
+# Server-issued session id cookie (V1.5, card t_920fb7dc). The value is also
+# returned in the POST body so API clients without a cookie jar can reuse it.
+SESSION_COOKIE_NAME = "autodiarist_session"
 
 
 def _env_int(name: str, default: int) -> int:
@@ -384,20 +388,45 @@ def _queued_states(states: list[dict] | None = None) -> list[dict]:
     )
 
 
-def _session_id(request: Request) -> str:
-    """Bearer/session header if present, else client IP, else anonymous.
+def _hash_ident(raw: str) -> str:
+    """Domain-separated SHA-256 digest (first 32 hex chars).
 
-    Hashed so secrets/PII (tokens, IPs) never land in job state on disk.
+    Raw session tokens, cookies and IPs are hashed exactly as in V1.0 so
+    no secret or PII ever lands in job state on disk.
     """
-    header = os.environ.get("SESSION_HEADER", SESSION_HEADER_DEFAULT)
+    return hashlib.sha256(raw.encode()).hexdigest()[:32]
+
+
+def _new_session_id() -> str:
+    """Fresh high-entropy session id (uuid4 hex, ~122 bits of entropy)."""
+    return uuid.uuid4().hex
+
+
+def _session_header_name() -> str:
+    return os.environ.get("SESSION_HEADER", SESSION_HEADER_DEFAULT)
+
+
+def _resolve_session(request: Request) -> tuple[str, str, str]:
+    """(identity hash, session id, source) for the V1.5 precedence chain.
+
+    Highest first: explicit SESSION_HEADER header (default "X-Session"),
+    server-issued session cookie, client IP, "anonymous". The session id is
+    the presented header/cookie value, or a freshly issued one when the
+    client had neither (the caller returns it via Set-Cookie + response body,
+    and it is hashed under the dedicated `session_ident` job-state key).
+    Stateless: the server stores no session table; only hashes are persisted.
+    """
+    header = _session_header_name()
     value = request.headers.get(header)
     if value and value.strip():
-        raw = f"header:{header}:{value.strip()}"
-    elif request.client and request.client.host:
-        raw = f"ip:{request.client.host}"
-    else:
-        raw = "anonymous"
-    return hashlib.sha256(raw.encode()).hexdigest()[:32]
+        return _hash_ident(f"header:{header}:{value.strip()}"), value.strip(), "header"
+    cookie = request.cookies.get(SESSION_COOKIE_NAME)
+    if cookie and cookie.strip():
+        return _hash_ident(f"cookie:{cookie.strip()}"), cookie.strip(), "cookie"
+    session = _new_session_id()
+    if request.client and request.client.host:
+        return _hash_ident(f"ip:{request.client.host}"), session, "ip"
+    return _hash_ident("anonymous"), session, "anonymous"
 
 
 def _probe_duration(path: str) -> float:
@@ -688,6 +717,7 @@ app = FastAPI(title="AutoDiarist", version="1.0.0", lifespan=lifespan)
 class JobResponse(BaseModel):
     token: str
     status: str
+    session: str = ""
 
 
 class JobStatus(BaseModel):
@@ -697,7 +727,7 @@ class JobStatus(BaseModel):
 
 
 @app.post("/v1/jobs", response_model=JobResponse, status_code=status.HTTP_202_ACCEPTED)
-async def create_job(request: Request, file: UploadFile = File(...)):
+async def create_job(request: Request, response: Response, file: UploadFile = File(...)):
     token = str(uuid.uuid4())
     job_dir = JOBS_DIR / token
 
@@ -730,7 +760,7 @@ async def create_job(request: Request, file: UploadFile = File(...)):
     # 3. Admission control under the queue lock: depth first (system-level
     #    backpressure, AC1), then the per-session quota (AC2). Rejected
     #    uploads leave no enqueued trace on disk.
-    session = _session_id(request)
+    session, session_id, session_source = _resolve_session(request)
     depth_limit = _env_int("MAX_QUEUE_DEPTH", DEFAULT_MAX_QUEUE_DEPTH)
     session_limit = _env_int("MAX_JOBS_PER_SESSION", DEFAULT_MAX_JOBS_PER_SESSION)
     retry_after = str(_env_int("RETRY_AFTER_SECONDS", DEFAULT_RETRY_AFTER_SECONDS))
@@ -762,6 +792,11 @@ async def create_job(request: Request, file: UploadFile = File(...)):
             "token": token,
             "status": "queued",
             "session": session,
+            # Dedicated session key (V1.5): hash of the session id the client
+            # presents (or that was just issued to it) so the scheduler and
+            # job listing can group per person. Raw id never hits disk.
+            "session_ident": _hash_ident(f"session:{session_id}"),
+            "session_source": session_source,
             "queued_at": time.time(),
             "seq": seq,
             "progress": 0.0,
@@ -777,7 +812,18 @@ async def create_job(request: Request, file: UploadFile = File(...)):
     if wake is not None:
         wake.set()
 
-    return JobResponse(token=token, status="queued")
+    # Session identity issuance (V1.5): the cookie lets browsers stay in one
+    # bucket without any client setup; the body field lets raw-HTTP clients
+    # reuse the id without a cookie jar. Stateless server: the value comes
+    # from the client (header/cookie) or is freshly minted here.
+    response.set_cookie(
+        key=SESSION_COOKIE_NAME,
+        value=session_id,
+        httponly=True,
+        samesite="lax",
+        path="/",
+    )
+    return JobResponse(token=token, status="queued", session=session_id)
 
 
 @app.get("/v1/jobs/{token}")

@@ -1,5 +1,34 @@
 # Changelog
 
+## [Unreleased] — V1.5 server-issued session identity (card t_920fb7dc)
+
+Quotas and per-job attribution become per-*person* rather than per-IP:
+the server now mints a random high-entropy session id (uuid4 hex) on
+first contact and returns it BOTH as the `autodiarist_session` cookie
+(HttpOnly, SameSite=Lax) AND as the `session` field of the
+`POST /v1/jobs` body, so API clients without a cookie jar can capture
+and reuse it. The server stays stateless — no session table; identity
+is derived purely from what the client presents.
+
+- **`api/main.py`** — `_session_id` replaced by `_resolve_session`, a
+  precedence chain: `SESSION_HEADER` header (default now **`X-Session`**;
+  `Authorization` remains honored when configured explicitly) > server-issued
+  cookie > client IP > `anonymous`. Every accepted job persists the identity
+  digest under `session` (unchanged domain-separated SHA-256, first 32 hex —
+  raw ids/cookies/IPs never hit disk) plus the dedicated `session_ident` key
+  (hash of the session id itself, including the first-contact issuance) so
+  the scheduler and job listing can group by person; `session_source` records
+  which branch resolved (`header`/`cookie`/`ip`/`anonymous`).
+- **`tests/api/test_session_issue.py`** — new: AC1-AC7 coverage — issuance
+  in Set-Cookie + body, entropy/uniqueness, cookie-reuse stability,
+  header-beats-cookie precedence, configured `Authorization`, IP/anonymous
+  fallback, raw-value leak check, two-session distinguishability with
+  per-session quota, and statelessness (no files but job dirs; identity
+  never remembered server-side).
+- **Docs** — README *Session identity* rewritten for the issuance/reuse
+  flow, `CONFIG.md` `SESSION_HEADER` default and chain, TROUBLESHOOTING
+  shared-bucket row.
+
 ## [1.3.1] - 2026-10-21 — conversational-word rejection in self-ID capture (card t_ac7889e4)
 
 Live strict-tier defect found during the (b) verification (t_90e1752b):
