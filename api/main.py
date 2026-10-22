@@ -48,6 +48,14 @@ SESSION_HEADER_DEFAULT = "X-Session"
 # returned in the POST body so API clients without a cookie jar can reuse it.
 # Name is overridable via SESSION_COOKIE_NAME for proxies that reserve it.
 SESSION_COOKIE_NAME_DEFAULT = "autodiarist_session"
+# Fair-share scheduling (V1.5, card t_4b40acfd): the worker claims the next
+# job round-robin across sessions (each session keeps FIFO order among its own
+# jobs), and a session may hold at most MAX_PROCESSING_PER_SESSION in-flight
+# jobs — enforced by the scheduler itself, not by the single-worker accident.
+# The round-robin pointer persists to JOBS_DIR/<SCHEDULER_STATE_NAME> so
+# fairness survives a restart.
+DEFAULT_MAX_PROCESSING_PER_SESSION = 1
+SCHEDULER_STATE_NAME = "_scheduler.json"
 # HTTP token charset (RFC 7230) — header/cookie names must match it.
 _HEADER_TOKEN_RE = re.compile(r"[!#$%&'*+\-.^_`|~0-9A-Za-z]+")
 
@@ -76,6 +84,33 @@ def _env_int(name: str, default: int) -> int:
         return int(os.environ.get(name, str(default)))
     except ValueError:
         return default
+
+
+def _max_processing_per_session() -> int:
+    """Cap on concurrently-PROCESSING jobs per session (card t_4b40acfd).
+
+    Read at every claim so a deployment can tune it via env. Values < 1 or
+    unparseable input warn and clamp to the default: a zero cap would freeze
+    the queue entirely, exactly the MAX_QUEUE_DEPTH=0 footgun.
+    """
+    raw = (os.environ.get("MAX_PROCESSING_PER_SESSION") or "").strip()
+    if not raw:
+        return DEFAULT_MAX_PROCESSING_PER_SESSION
+    try:
+        value = int(raw)
+    except ValueError:
+        logger.warning(
+            "config: MAX_PROCESSING_PER_SESSION=%r is not an integer; using %d",
+            raw, DEFAULT_MAX_PROCESSING_PER_SESSION,
+        )
+        return DEFAULT_MAX_PROCESSING_PER_SESSION
+    if value < 1:
+        logger.warning(
+            "config: MAX_PROCESSING_PER_SESSION=%d would freeze the queue; clamped to %d",
+            value, DEFAULT_MAX_PROCESSING_PER_SESSION,
+        )
+        return DEFAULT_MAX_PROCESSING_PER_SESSION
+    return value
 
 
 # --- Job retention + disk-pressure eviction (card t_5e6200fc) -----------------
@@ -413,6 +448,115 @@ def _queued_states(states: list[dict] | None = None) -> list[dict]:
     )
 
 
+# --- Fair-share scheduling (card t_4b40acfd) ----------------------------------
+# Per-session FIFO sub-queues served round-robin. The pointer (which session
+# was served when) persists under JOBS_DIR so a restart continues the same
+# round instead of letting a big submitter re-jump the line.
+
+def _scheduler_state_path() -> Path:
+    return JOBS_DIR / SCHEDULER_STATE_NAME
+
+
+def _load_scheduler_state() -> dict:
+    """Read the round-robin pointer; a fresh process derives fairness from
+    this file alone (claim_next never trusts an in-memory copy).
+
+    Missing file or malformed JSON heals to a fresh state with a warning:
+    the worst case is one round of tie-break-by-arrival, never a crash."""
+    fresh = {"serve_counter": 0, "last_served": {}}
+    path = _scheduler_state_path()
+    if not path.exists():
+        return fresh
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        logger.warning(
+            "scheduler state: unreadable %s (%s) — resetting round-robin pointer",
+            path, exc,
+        )
+        return fresh
+    if not isinstance(raw, dict):
+        logger.warning("scheduler state: malformed %s — resetting round-robin pointer", path)
+        return fresh
+    try:
+        counter = max(0, int(raw.get("serve_counter", 0)))
+        last = {str(k): int(v) for k, v in (raw.get("last_served") or {}).items()}
+    except (TypeError, ValueError):
+        logger.warning("scheduler state: malformed %s — resetting round-robin pointer", path)
+        return fresh
+    return {"serve_counter": counter, "last_served": last}
+
+
+def _save_scheduler_state(sched: dict) -> None:
+    path = _scheduler_state_path()
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(json.dumps(sched), encoding="utf-8")
+    tmp.replace(path)
+
+
+def _session_key(state: dict) -> str:
+    """Grouping key for the per-session sub-queue: the dedicated hashed
+    session_ident (V1.5) with graceful fallbacks for legacy states."""
+    return str(state.get("session_ident") or state.get("session") or "_anonymous")
+
+
+def _queued_groups(states: list[dict]) -> dict[str, list[dict]]:
+    groups: dict[str, list[dict]] = {}
+    for st in _queued_states(states):
+        groups.setdefault(_session_key(st), []).append(st)
+    return groups
+
+
+def _rr_pick(groups: dict[str, list[dict]], served: dict[str, int]) -> str:
+    """Round-robin turn: the session served longest ago wins (never-served
+    sessions count as served at 0, so new arrivals cannot starve behind an
+    established submitter); ties break by earliest FIFO head seq, then the
+    session key for full determinism."""
+    return min(groups, key=lambda k: (served.get(k, 0), groups[k][0].get("seq", float("inf")), k))
+
+
+def _fair_queued_order(states: list[dict], sched: dict) -> list[str]:
+    """Pure simulation of the fair pickup order over the queued jobs — the
+    sequence _claim_next_queued() would produce if nothing new arrived and no
+    cap blocked a session (see README: queue_position is a rank in THIS
+    order). Does not mutate inputs or the scheduler file."""
+    groups = _queued_groups(states)
+    served = dict(sched["last_served"])
+    counter = sched["serve_counter"]
+    order: list[str] = []
+    while groups:
+        key = _rr_pick(groups, served)
+        st = groups[key].pop(0)
+        if not groups[key]:
+            del groups[key]
+        order.append(str(st.get("token", "")))
+        counter += 1
+        served[key] = counter
+    return order
+
+
+def _select_next_queued(
+    states: list[dict], sched: dict, cap: int
+) -> tuple[dict | None, dict]:
+    """Pick the next claimable job: round-robin across sessions, FIFO inside
+    a session, sessions at the processing cap skipped. Returns (job, new
+    scheduler state); (None, sched) when nothing may be claimed."""
+    inflight: dict[str, int] = {}
+    for st in states:
+        if st.get("status") == "processing":
+            key = _session_key(st)
+            inflight[key] = inflight.get(key, 0) + 1
+    groups = _queued_groups(states)
+    eligible = {k: g for k, g in groups.items() if inflight.get(k, 0) < cap}
+    if not eligible:
+        return None, sched
+    key = _rr_pick(eligible, sched["last_served"])
+    chosen = eligible[key][0]
+    counter = sched["serve_counter"] + 1
+    return chosen, {"serve_counter": counter,
+                    "last_served": {**sched["last_served"], key: counter}}
+
+
 def _hash_ident(raw: str) -> str:
     """Domain-separated SHA-256 digest (first 32 hex chars).
 
@@ -626,12 +770,20 @@ def process_job_background(token: str, audio_path: str, filename: str,
 
 
 def _claim_next_queued() -> dict | None:
-    """Atomically pick the FIFO head and mark it processing (concurrency=1)."""
+    """Atomically pick the fair-share next job and mark it processing.
+
+    V1.5 (card t_4b40acfd): selection is round-robin across sessions (FIFO
+    within a session) and honours MAX_PROCESSING_PER_SESSION — a session that
+    already holds the cap in flight is skipped even when its jobs sit at the
+    global FIFO head. The pointer is persisted to disk per claim, so the
+    service does not lose its place on restart.
+    """
+    cap = _max_processing_per_session()
     with _queue_lock:
-        queued = _queued_states()
-        if not queued:
+        job, sched = _select_next_queued(_iter_states(), _load_scheduler_state(), cap)
+        if job is None:
             return None
-        job = queued[0]
+        _save_scheduler_state(sched)
         job["status"] = "processing"
         job["stage"] = "queued"
         # Clamp, never reset: a job requeued by the lifespan reclaim keeps the
@@ -640,14 +792,21 @@ def _claim_next_queued() -> dict | None:
         # 0.05; reclaimed jobs stay at their preserved value and the band
         # publishes catch up via update_state()'s max(prev, prog) clamp.
         job["progress"] = max(float(job.get("progress") or 0.0), 0.05)
+        # Fair-scheduled pickup: the admission-order rank is no longer
+        # meaningful once the job leaves the queue (AC6, card t_4b40acfd).
+        job["queue_position"] = None
         job["message"] = "Claimed by worker"
         job["started_at"] = time.time()
         _write_state(job)
+        logger.info(
+            "queue: claimed job token=%s session=%s serve_counter=%d cap=%d",
+            job.get("token"), _session_key(job), sched["serve_counter"], cap,
+        )
         return job
 
 
 async def _queue_worker_loop() -> None:
-    """Single-GPU worker: one job at a time, FIFO by seq.
+    """Single-GPU worker: one job at a time, fair round-robin across sessions.
 
     The pipeline is CPU/GPU-bound synchronous code, so it runs in the default
     executor and the event loop stays responsive for admissions and polls.
@@ -713,7 +872,8 @@ def validate_config() -> str:
         depth = DEFAULT_MAX_QUEUE_DEPTH
     summary = (
         f"config: session header={header} cookie={cookie} "
-        f"max_queue_depth={depth} retention_days={days}"
+        f"max_queue_depth={depth} max_processing_per_session="
+        f"{_max_processing_per_session()} retention_days={days}"
     )
     logger.info(summary)
     return summary
@@ -779,8 +939,9 @@ class JobResponse(BaseModel):
     token: str
     status: str
     session: str = ""
-    # 1-based FIFO rank at admission (V1.5, card t_82bfbc15): the client
-    # learns its queue position from the 202 itself, without a first poll.
+    # 1-based rank at admission in the FAIR-SCHEDULED execution order
+    # (V1.5, cards t_82bfbc15 + t_4b40acfd): the client learns its queue
+    # position from the 202 itself, without a first poll.
     queue_position: int | None = None
 
 
@@ -864,11 +1025,16 @@ async def create_job(request: Request, response: Response, file: UploadFile = Fi
             "audio_path": str(audio_path),
         }
         _write_state(state)
-        # FIFO rank at admission (1-based): every already-queued job holds a
-        # smaller seq (the new seq is max+1), so this job sits at
-        # len(queued)+1 — the same rank GET /v1/jobs/{token} reports for a
-        # queued job (see get_job_status).
-        queue_position = len(queued) + 1
+        # Fair-schedule rank at admission (1-based, card t_4b40acfd): the
+        # position in the round-robin execution order the worker will
+        # actually follow — NOT raw arrival order. A queued job that
+        # arrived first can therefore report a position behind a later
+        # arrival from a different session (semantic change from FIFO;
+        # within one session the order stays FIFO by seq). Same rank GET
+        # /v1/jobs/{token} recomputes for a queued job.
+        queue_position = _fair_queued_order(
+            queued + [state], _load_scheduler_state()
+        ).index(token) + 1
 
     # Wake the worker if it's idle-waiting.
     wake = getattr(app.state, "wake", None)
@@ -905,13 +1071,17 @@ async def get_job_status(token: str):
         # coarse status so the field is never absent from a response.
         state["stage"] = state.get("status", "unknown")
     if state.get("status") == "queued":
-        # queue_position is the 1-based FIFO rank among currently queued jobs:
-        # exactly the worker's pickup order (both keyed on `seq`).
+        # queue_position is the 1-based rank in the FAIR-SCHEDULED execution
+        # order the worker actually follows (card t_4b40acfd): per-session
+        # FIFO sub-queues served round-robin — NOT raw admission order, so a
+        # job can report a rank behind a later arrival from a different
+        # session. Recomputed from the current queue + persisted pointer, so
+        # it only moves downward as work ahead completes or leaves the queue
+        # (a cancelled job drops out of the simulation; positions behind it
+        # compress). Assumes no new arrivals — same caveat FIFO had.
         with _queue_lock:
-            rank = 1 + sum(
-                1 for s in _queued_states() if s.get("seq", 0) < state.get("seq", 0)
-            )
-        state["queue_position"] = rank
+            order = _fair_queued_order(_iter_states(), _load_scheduler_state())
+        state["queue_position"] = order.index(token) + 1 if token in order else None
     return JobStatus(**state)
 
 

@@ -1,5 +1,52 @@
 # Changelog
 
+## [Unreleased] — V1.5 fair-share scheduling: round-robin per session + processing cap (card t_4b40acfd)
+
+Building on accept-and-queue admission (card t_82bfbc15): the shared GPU is
+now allocated fairly across sessions, so a session that submits many jobs
+can no longer starve one that submits a single job.
+
+- **Round-robin claim order.** The worker picks the next job from the
+  session whose turn is longest overdue (FIFO by `seq` inside each
+  session). The pointer — a global `serve_counter` plus per-session
+  `last_served` stamps — persists to `JOBS_DIR/_scheduler.json` and is
+  re-read on every claim, so a restarted service continues the same
+  fairness round instead of letting an established submitter re-jump the
+  line. A missing or corrupt pointer heals to a fresh round with a warning
+  (worst case: one round ordered by arrival); service start never fails on
+  it.
+- **`MAX_PROCESSING_PER_SESSION` (default `1`)** caps how many jobs of one
+  session may be `processing` concurrently. The cap is enforced by the
+  scheduler at claim time — a session at the cap is skipped even when its
+  queued jobs sit at the head of its sub-queue — so it holds under a future
+  multi-worker scale-up, not by accident of the single worker. Values `< 1`
+  or unparseable log a warning and clamp to `1` (a zero cap would freeze
+  the queue).
+- **`queue_position` semantic change (explicit):** the field is now the
+  rank in the fair-scheduled **execution order**, not raw admission order.
+  A job can therefore report a position behind a later arrival from a
+  session that has waited longer, and — unlike under FIFO — a new arrival
+  from a never-served session can jump ahead, so a queued job's reported
+  position can rise as well as fall. Within-session FIFO is guaranteed:
+  jobs of one session never overtake each other. `POST` 202 and `GET`
+  polling share one deterministic simulation of the worker's real pickup
+  order.
+- **Preserved guarantees:** monotonic `seq` (now documented as the arrival
+  ticket it always was), FIFO-within-session, on-disk persistence across
+  restart, boot requeue of orphaned `processing` jobs with `seq` intact,
+  and never two `processing` jobs for one session — now a scheduler
+  invariant, not a worker-count accident.
+- Out of scope by maintainer decision: duration/size-aware priority and
+  preemption of a running job; fairness applies at selection only.
+- Docs updated: README (architecture block, admission + GET schemas with
+  the semantic-change note, new *Fair-share scheduling* section), CONFIG.md
+  knob table, TROUBLESHOOTING.md restart & endpoint gotchas, PIPELINE.md
+  worker note, `.env.example`.
+- `tests/api/test_fair_share.py` (AC1-AC6, 14 cases, no GPU): fairness
+  ordering, cap enforcement independent of worker count, position ranks,
+  restart preserving fairness with no starvation, corrupt-pointer recovery,
+  boot requeue, cancelled-job order removal.
+
 ## [Unreleased] — V1.5 admission: accept-and-queue, no per-session rejection (card t_82bfbc15)
 
 - **POST /v1/jobs now accepts and queues instead of rejecting.** A session

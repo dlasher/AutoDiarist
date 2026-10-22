@@ -92,7 +92,10 @@ The queue is fully on disk (`JOBS_DIR/<token>/status.json` + monotonic
 `seq`), so:
 
 - Jobs that were `queued` stay `queued` across restarts; the first job of a
-  fresh process sees the same FIFO order.
+  fresh process sees the same per-session FIFO order, and the round-robin
+  pointer reloads from `JOBS_DIR/_scheduler.json`, so fair-share scheduling
+  resumes in the same round — a session that was just served does not get
+  the next claim ahead of one that has never been served.
 - Jobs caught mid-flight in `processing` at crash/restart time are
   **requeued on boot** with their `seq` intact (message: `Requeued after
   service restart`) and are reprocessed from the top — transcription is not
@@ -155,8 +158,11 @@ segment counts, timings. Inspect actual transcript text with local tools
   (`Cannot download results when status is …`). `format=md` gives
   `markdown_report.md`; the default (no `format`) gives
   `output_result.json`; any other value answers `422`.
-- `queue_position` is only present in status while `queued` (1-based FIFO
-  rank — exactly the worker pickup order, both keyed on `seq`).
+- `queue_position` is only present in status while `queued` (1-based rank in
+  the **fair-scheduled execution order**, card t_4b40acfd — sessions served
+  round-robin, FIFO within a session; it is NOT raw admission order and a
+  job's reported rank can change as the pointer advances and new sessions
+  arrive).
 - Progress `0.05`/`0.1` claims/decode values are monotonic bands, not time
   estimates; a stuck `processing` job with `progress` 0.4 is most likely
   inside the engine until `CRISPASR_TIMEOUT_SECONDS` fires.
