@@ -51,7 +51,26 @@ ASR_BACKEND = "nemotron"
 # SPEC 08 fixes en-US; the crispasr CLI accepts the region qualifier.
 ASR_TARGET_LANG = "en-US"
 DIAR_METHODS = {"foxnose", "ecapa", "sherpa", "sortformer", "none"}
-DIAR_METHOD_DEFAULT = "foxnose"
+# sherpa (external sherpa-onnx subprocess: segmentation + embedding +
+# clustering) is the default since card t_5a287979: the foxnose global pass
+# with its default BIC speaker counter collapses panel recordings
+# (5 speakers -> 1, "cosine_similarity_single_speaker" veto) on hard audio;
+# the engine's own --help routes reliable multi-speaker diarization to
+# sherpa/ecapa. foxnose remains selectable (it is faster and was fine on
+# well-separated audio).
+DIAR_METHOD_DEFAULT = "sherpa"
+# Methods that shell out to sherpa-onnx and REQUIRE both ONNX models;
+# without them the engine emits segments with no speaker labels (silent
+# degradation, rejected at startup since t_5a287979).
+SHERPA_MODEL_METHODS = frozenset({"sherpa", "ecapa"})
+# Canonical model artifact names as printed by the engine's own help text
+# ("sherpa-pyannote-segmentation-3.0.onnx", "3dspeaker_speech_eres2net_base
+# _sv_zh-cn_3dspeaker_16k.onnx", "Download them from
+# https://github.com/k2-fsa/sherpa-onnx"). The Dockerfile pins matching
+# release assets; see README "Diarization models".
+SHERPA_SEGMENT_NAME = "sherpa-pyannote-segmentation-3.0.onnx"
+SHERPA_EMBEDDING_NAME = "3dspeaker_speech_eres2net_base_sv_zh-cn_3dspeaker_16k.onnx"
+SHERPA_MODELS_DIR = "/opt/models"
 GPU_BACKENDS = {"cpu", "cuda", "metal", "vulkan"}
 GPU_BACKEND_DEFAULT = "cuda"
 # nemotron Q4_K GGUF; see spike A3 — canonical repo is
@@ -151,6 +170,46 @@ def asr_language() -> str:
     return _env_str("CRISPASR_LANGUAGE", ASR_TARGET_LANG)
 
 
+def sherpa_segment_model() -> str:
+    return _env_str("SHERPA_SEGMENT_MODEL", f"{SHERPA_MODELS_DIR}/{SHERPA_SEGMENT_NAME}")
+
+
+def sherpa_embedding_model() -> str:
+    return _env_str("SHERPA_EMBEDDING_MODEL", f"{SHERPA_MODELS_DIR}/{SHERPA_EMBEDDING_NAME}")
+
+
+def sherpa_bin() -> str:
+    """Optional explicit sherpa-onnx CLI (image default is a wrapper script
+    that injects --clustering.cluster-threshold; empty => engine PATH lookup)."""
+    return _env_str("SHERPA_BIN")
+
+
+def _require_sherpa_artifacts(method: str) -> None:
+    """AC4 (t_5a287979): sherpa/ecapa without their models is a SILENT
+    no-label failure mode at runtime; reject it at startup instead."""
+    missing = [
+        f"{var}={path!r}"
+        for var, path in (
+            ("SHERPA_SEGMENT_MODEL", sherpa_segment_model()),
+            ("SHERPA_EMBEDDING_MODEL", sherpa_embedding_model()),
+        )
+        if not os.path.isfile(path)
+    ]
+    if missing:
+        raise CrispasrConfigError(
+            f"DIAR_METHOD={method!r} requires the sherpa-onnx models; missing: "
+            + ", ".join(missing)
+            + " — add them to the image (see README 'Diarization models') or "
+            "choose another DIAR_METHOD"
+        )
+    binary = sherpa_bin()
+    if binary and not os.access(binary, os.X_OK):
+        raise CrispasrConfigError(
+            f"SHERPA_BIN={binary!r} is not an executable file; DIAR_METHOD="
+            f"{method!r} shells out to it"
+        )
+
+
 def build_crispasr_command(wav_path: str, out_base: str) -> list[str]:
     """Compose the crispasr CLI invocation for one whole-file diarized run."""
     backend = gpu_backend()
@@ -185,6 +244,17 @@ def build_crispasr_command(wav_path: str, out_base: str) -> list[str]:
         else:
             # foxnose/ecapa/sherpa need the embedder for global speaker passes
             command += ["--diarize-embedder", "auto"]
+        if method in SHERPA_MODEL_METHODS:
+            # The external sherpa-onnx subprocess needs both ONNX models;
+            # without them the engine emits speaker=None segments (the
+            # silent-degradation mode rejected at startup, AC4 t_5a287979).
+            command += [
+                "--sherpa-segment-model", sherpa_segment_model(),
+                "--sherpa-embedding-model", sherpa_embedding_model(),
+            ]
+            binary = sherpa_bin()
+            if binary:
+                command += ["--sherpa-bin", binary]
     return command
 
 
@@ -288,7 +358,9 @@ def backend_identity() -> str:
 
 def _validate_runtime_config() -> None:
     probe_crispasr_binary()
-    diar_method()  # validates DIAR_METHOD
+    method = diar_method()  # validates DIAR_METHOD
+    if method in SHERPA_MODEL_METHODS:
+        _require_sherpa_artifacts(method)
     model = gguf_model_path()
     if model and not os.path.isfile(model):
         raise CrispasrConfigError(
@@ -392,8 +464,20 @@ def _clamp_monotonic(segments: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return segments
 
 
-def _normalize_speakers(segments: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Raw '(speaker N)' labels -> 'Speaker N' in first-appearance order."""
+def _normalize_speakers(
+    segments: list[dict[str, Any]], method: str | None = None
+) -> list[dict[str, Any]]:
+    """Raw '(speaker N)' labels -> 'Speaker N' in first-appearance order.
+
+    AC4 guard (card t_5a287979): when the configured DIAR_METHOD is a
+    labeling method (anything but 'none') and the engine produced NO
+    speaker labels anywhere, that is the silent sherpa/ecapa degradation
+    (missing models -> speaker=None on every segment) -- a hard failure,
+    never a fake single-speaker transcript. A PRESENT single label stays
+    a legitimate one-speaker result (AC7: do not invent speakers).
+    """
+    if method is None:
+        method = diar_method()
     order: dict[int, int] = {}
     seen_unlabeled = False
     for item in segments:
@@ -407,7 +491,15 @@ def _normalize_speakers(segments: list[dict[str, Any]]) -> list[dict[str, Any]]:
             label = f"Speaker {order[raw]}"
         item["speaker"] = label
     if seen_unlabeled and not order:
-        logger.info("crispasr output carried no speaker labels (DIAR_METHOD=none)")
+        if method == "none":
+            logger.info("crispasr output carried no speaker labels (DIAR_METHOD=none)")
+        else:
+            raise CrispasrError(
+                f"crispasr produced no speaker labels for DIAR_METHOD={method!r} "
+                "— the diarization pass failed silently (missing or miswired "
+                "--sherpa-* models?); refusing to emit a fake single-speaker "
+                "transcript"
+            )
     return segments
 
 

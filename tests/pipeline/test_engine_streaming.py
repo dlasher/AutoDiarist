@@ -30,6 +30,7 @@ CONFIG_ENVS = (
     "CRISPASR_GPU_BACKEND", "CRISPASR_CACHE_DIR", "CRISPASR_LIB_DIR",
     "CRISPASR_TIMEOUT_SECONDS", "MIN_FRAGMENT_SECONDS", "VRAM_LIMIT_MIB",
     "MOCK_PIPELINE", "CHUNK_SECONDS", "OVERLAP_SECONDS",
+    "SHERPA_SEGMENT_MODEL", "SHERPA_EMBEDDING_MODEL", "SHERPA_BIN",
 )
 
 
@@ -98,6 +99,14 @@ def _use(tmp_path, monkeypatch, fake: Path):
     gguf = tmp_path / "nemotron-3.5-asr-streaming-0.6b-q4_k.gguf"
     gguf.write_bytes(b"ggmf")
     monkeypatch.setenv("GGUF_MODEL", str(gguf))
+    # sherpa is the shipped default DIAR_METHOD; the startup validation
+    # (t_5a287979 AC4) requires both ONNX models on disk -- stub them.
+    for env, fname in (
+        ("SHERPA_SEGMENT_MODEL", "seg.onnx"),
+        ("SHERPA_EMBEDDING_MODEL", "emb.onnx"),
+    ):
+        (tmp_path / fname).write_bytes(b"onnx-stub")
+        monkeypatch.setenv(env, str(tmp_path / fname))
     wav = tmp_path / "in.wav"
     wav.write_bytes(b"RIFFfakewav")
     return str(wav)

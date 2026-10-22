@@ -103,7 +103,13 @@ def test_compose_pins_gpu_backend_and_persists_crispasr_state() -> None:
     assert "driver: nvidia" in compose
     assert "count: all" in compose
     assert "CRISPASR_GPU_BACKEND: cuda" in compose
-    assert "DIAR_METHOD: foxnose" in compose
+    assert "DIAR_METHOD: sherpa" in compose
+    # t_5a287979: the sherpa method must ship its model wiring in compose,
+    # same defaults on CUDA and Vulkan images (AC5).
+    assert "SHERPA_SEGMENT_MODEL" in compose
+    assert "SHERPA_EMBEDDING_MODEL" in compose
+    assert "SHERPA_BIN" in compose
+    assert "SHERPA_CLUSTER_THRESHOLD" in compose
     assert "VRAM_LIMIT_MIB: 3584" in compose
     assert "CRISPASR_TIMEOUT_SECONDS: 1800" in compose
     assert "crispasr-cache:/var/cache/crispasr" in compose

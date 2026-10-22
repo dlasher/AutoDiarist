@@ -18,7 +18,22 @@ services:
       GGUF_MODEL: ${GGUF_MODEL:-/opt/models/nemotron-3.5-asr-streaming-0.6b-q4_k.gguf}
       CRISPASR_LIB_DIR: ${CRISPASR_LIB_DIR:-/usr/local/cuda-13.0/targets/x86_64-linux/lib}
       CRISPASR_GPU_BACKEND: cuda
-      DIAR_METHOD: foxnose
+      # Diarization (card t_5a287979): sherpa = external sherpa-onnx
+      # subprocess (segmentation + speaker embedding + clustering) -- the
+      # engine's "reliable diarization" path. foxnose's global BIC counter
+      # collapses panel recordings (5 speakers -> 1, cosine single-speaker
+      # veto on the 249s NASA SEWP file); sherpa separates them correctly.
+      # The two ONNX models are baked into the image (/opt/models); if they
+      # are absent the service REFUSES to start instead of silently
+      # emitting one speaker (pipeline/transcribe.py AC4 guard).
+      DIAR_METHOD: sherpa
+      SHERPA_SEGMENT_MODEL: ${SHERPA_SEGMENT_MODEL:-/opt/models/sherpa-onnx-reverb-diarization-v1.onnx}
+      SHERPA_EMBEDDING_MODEL: ${SHERPA_EMBEDDING_MODEL:-/opt/models/3dspeaker_speech_eres2net_base_sv_zh-cn_3dspeaker_16k.onnx}
+      # wrapper injects --clustering.cluster-threshold (the engine has no
+      # flag for it; it is the knob that sets how many speakers
+      # FastClustering emits). Override SHERPA_CLUSTER_THRESHOLD to tune.
+      SHERPA_BIN: ${SHERPA_BIN:-/opt/sherpa/sherpa-diarization-wrapper}
+      SHERPA_CLUSTER_THRESHOLD: ${SHERPA_CLUSTER_THRESHOLD:-0.35}
       VRAM_LIMIT_MIB: 3584
       CRISPASR_TIMEOUT_SECONDS: 1800
       # Retention + disk-pressure (card t_5e6200fc). Defaults match

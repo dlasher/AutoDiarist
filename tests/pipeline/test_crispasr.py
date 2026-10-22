@@ -20,6 +20,7 @@ CONFIG_ENVS = (
     "CRISPASR_GPU_BACKEND", "CRISPASR_CACHE_DIR", "CRISPASR_LIB_DIR",
     "CRISPASR_TIMEOUT_SECONDS", "MIN_FRAGMENT_SECONDS", "VRAM_LIMIT_MIB",
     "MOCK_PIPELINE", "CHUNK_SECONDS", "OVERLAP_SECONDS",
+    "SHERPA_SEGMENT_MODEL", "SHERPA_EMBEDDING_MODEL", "SHERPA_BIN",
 )
 
 
@@ -40,12 +41,28 @@ def _fake_binary(tmp_path: Path, name: str, body: str) -> Path:
     return path
 
 
+def _stub_sherpa_models(tmp_path: Path, monkeypatch) -> None:
+    """DIAR_METHOD=sherpa is the shipped default; the startup validation
+    (t_5a287979 AC4) demands the two ONNX models on disk. Fake-engine
+    tests stub them exactly like the GGUF stub above."""
+    for env, fname in (
+        ("SHERPA_SEGMENT_MODEL", "sherpa-pyannote-segmentation-3.0.onnx"),
+        ("SHERPA_EMBEDDING_MODEL", "3dspeaker_speech_eres2net_base_sv_zh-cn_3dspeaker_16k.onnx"),
+    ):
+        stub = tmp_path / fname
+        stub.write_bytes(b"onnx-stub")
+        monkeypatch.setenv(env, str(stub))
+
+
 # ---------------------------------------------------------------------------
 # AC: config surface — CRISPASR_BIN, GGUF_MODEL, DIAR_METHOD=foxnose default,
 #     language en-US, Q4_K GGUF invocation shape
 # ---------------------------------------------------------------------------
 
-def test_build_command_defaults_to_foxnose_and_en_us(tmp_path):
+def test_build_command_defaults_to_sherpa_and_en_us(tmp_path):
+    """t_5a287979: the shipped default is sherpa (foxnose's BIC counter
+    collapses 5-speaker panel audio to one label; sherpa is the engine's
+    'reliable diarization' path -- see engine --help)."""
     cmd = tr.build_crispasr_command("/tmp/in.wav", "/tmp/out_base")
     assert cmd[0] == "/opt/crispasr/crispasr"
     joined = " ".join(cmd)
@@ -53,13 +70,24 @@ def test_build_command_defaults_to_foxnose_and_en_us(tmp_path):
     assert cmd[cmd.index("-m") + 1] == "/models/nemotron-3.5-asr-streaming-0.6b-q4_k.gguf"
     assert cmd[cmd.index("-l") + 1] == "en-US"
     assert "--diarize" in cmd
-    assert cmd[cmd.index("--diarize-method") + 1] == "foxnose"
+    assert cmd[cmd.index("--diarize-method") + 1] == "sherpa"
     assert "--diarize-embedder" in cmd  # embedder auto for stable global IDs
+    assert "--sherpa-segment-model" in cmd
+    assert "--sherpa-embedding-model" in cmd
     assert cmd[cmd.index("--gpu-backend") + 1] == "cuda"  # no silent CPU fallback
     assert "--suppress-nst" in cmd
     assert "-oj" in cmd
     assert cmd[cmd.index("-of") + 1] == "/tmp/out_base"
     assert "-f" in cmd and cmd[cmd.index("-f") + 1] == "/tmp/in.wav"
+
+
+def test_build_command_foxnose_still_selectable(tmp_path, monkeypatch):
+    """foxnose stays a supported, explicitly-selectable method (fast path
+    on well-separated audio) -- t_5a287979 changed only the default."""
+    monkeypatch.setenv("DIAR_METHOD", "foxnose")
+    cmd = tr.build_crispasr_command("/tmp/in.wav", "/tmp/out_base")
+    assert cmd[cmd.index("--diarize-method") + 1] == "foxnose"
+    assert "--sherpa-segment-model" not in cmd  # models only for sherpa paths
 
 
 def test_build_command_sortformer_selectable():
@@ -185,6 +213,7 @@ EOF
     gguf = tmp_path / "nemotron-3.5-asr-streaming-0.6b-q4_k.gguf"
     gguf.write_bytes(b"ggmf")
     monkeypatch.setenv("GGUF_MODEL", str(gguf))
+    _stub_sherpa_models(tmp_path, monkeypatch)
     wav = tmp_path / "in.wav"
     wav.write_bytes(b"RIFF")
     return wav
@@ -248,7 +277,8 @@ def test_parse_relabels_speakers_by_first_appearance():
     assert [s["speaker"] for s in segments] == ["Speaker 1"] * 2 + ["Speaker 2", "Speaker 1"]
 
 
-def test_parse_merges_short_fragments_into_previous():
+def test_parse_merges_short_fragments_into_previous(monkeypatch):
+    monkeypatch.setenv("DIAR_METHOD", "none")
     payload = {"transcription": [
         _seg(0, 10000, "Long turn text."),
         _seg(10000, 10300, "day.", 1),
@@ -260,7 +290,8 @@ def test_parse_merges_short_fragments_into_previous():
     assert segments[0]["t1"] == pytest.approx(10.3)
 
 
-def test_parse_clamps_non_monotonic():
+def test_parse_clamps_non_monotonic(monkeypatch):
+    monkeypatch.setenv("DIAR_METHOD", "none")
     payload = {"transcription": [
         _seg(0, 10000, "first"),
         _seg(9000, 20000, "overlap"),
@@ -270,7 +301,8 @@ def test_parse_clamps_non_monotonic():
     assert segments[1]["t1"] >= segments[1]["t0"]
 
 
-def test_parse_drops_empty_and_strips_lang_tags():
+def test_parse_drops_empty_and_strips_lang_tags(monkeypatch):
+    monkeypatch.setenv("DIAR_METHOD", "none")
     payload = {"transcription": [
         _seg(0, 1000, " "),
         _seg(1000, 5000, "<en-US> hello <de-DE>"),
@@ -279,7 +311,8 @@ def test_parse_drops_empty_and_strips_lang_tags():
     assert [s["text"] for s in segments] == ["hello"]
 
 
-def test_parse_sorts_unordered_input():
+def test_parse_sorts_unordered_input(monkeypatch):
+    monkeypatch.setenv("DIAR_METHOD", "none")
     payload = {"transcription": [
         _seg(30000, 40000, "later"),
         _seg(0, 10000, "earlier"),
@@ -288,7 +321,8 @@ def test_parse_sorts_unordered_input():
     assert [s["text"] for s in segments] == ["earlier", "later"]
 
 
-def test_parse_falls_back_to_timestamps():
+def test_parse_falls_back_to_timestamps(monkeypatch):
+    monkeypatch.setenv("DIAR_METHOD", "none")
     payload = {"transcription": [
         {"timestamps": {"from": "00:01:30,500", "to": "01:00:00,000"}, "text": "deep"},
     ]}
