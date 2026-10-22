@@ -9,8 +9,10 @@ import hashlib
 import logging
 import threading
 from contextlib import asynccontextmanager, suppress
+from datetime import datetime, timezone
 from pathlib import Path
-from fastapi import FastAPI, Request, UploadFile, File, HTTPException, status
+from fastapi import FastAPI, Request, Response, UploadFile, File, HTTPException, status
+from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, ConfigDict
 
@@ -35,11 +37,73 @@ JOBS_DIR.mkdir(parents=True, exist_ok=True)
 # Queue-hardening limits (card t_daebf369). Read at request/boot time (not
 # import time) so a deployment can tune them via env without code changes.
 DEFAULT_MAX_QUEUE_DEPTH = 50
-DEFAULT_MAX_JOBS_PER_SESSION = 2
 DEFAULT_RETRY_AFTER_SECONDS = 30
 DEFAULT_QUEUE_POLL_SECONDS = 0.2
-# Which header names the session identity; default Authorization (bearer token).
-SESSION_HEADER_DEFAULT = "Authorization"
+# MAX_JOBS_PER_SESSION is DEPRECATED as of V1.5 (card t_82bfbc15): a session
+# may hold any number of active jobs; the env var is still accepted so
+# existing .env files load unchanged, but validate_config() warns that it is
+# ignored and admission is queue-depth only.
+# Which header names the session identity; default X-Session. "Authorization"
+# stays honored when explicitly configured via SESSION_HEADER.
+SESSION_HEADER_DEFAULT = "X-Session"
+# Server-issued session id cookie (V1.5, card t_920fb7dc). The value is also
+# returned in the POST body so API clients without a cookie jar can reuse it.
+# Name is overridable via SESSION_COOKIE_NAME for proxies that reserve it.
+SESSION_COOKIE_NAME_DEFAULT = "autodiarist_session"
+# Fair-share scheduling (V1.5, card t_4b40acfd): the worker claims the next
+# job round-robin across sessions (each session keeps FIFO order among its own
+# jobs), and a session may hold at most MAX_PROCESSING_PER_SESSION in-flight
+# jobs — enforced by the scheduler itself, not by the single-worker accident.
+# The round-robin pointer persists to JOBS_DIR/<SCHEDULER_STATE_NAME> so
+# fairness survives a restart.
+DEFAULT_MAX_PROCESSING_PER_SESSION = 1
+SCHEDULER_STATE_NAME = "_scheduler.json"
+# Session-scoped job listing (V1.5, card t_f97d12a8): default page size and
+# hard max for GET /v1/jobs. Deliberately constants, not env knobs (scope 8:
+# "keep it knob-free"). ?limit= outside [1, MAX_LIST_LIMIT] clamps, never 4xx.
+DEFAULT_LIST_LIMIT = 50
+MAX_LIST_LIMIT = 200
+# Queue-aware wait estimate (V1.5, card t_b3ae9366). ETA comes from ONE
+# linear model — duration_seconds x PROCESSING_SECONDS_PER_AUDIO_SECOND —
+# summed over the fair execution order. It is an ESTIMATE, never a
+# guarantee: it ignores diarization variance and chunk overhead, and
+# observed wall time can differ (short files land worst — fixed startup
+# cost dominates; the long-file asymptote is what the default is tuned to).
+#
+# The default rate is HARDWARE-SPECIFIC and documented at its source: the
+# V1.5 T400 (4 GB Turing) integration run measured a 39-minute meeting
+# (2340 s of audio) at 423-434 s wall on CUDA — 434/2340 ~= 0.185 s of GPU
+# time per s of audio. Re-derive it for any other GPU (see CONFIG.md).
+# Set the env var to 0 to disable ETA emission entirely.
+DEFAULT_PROCESSING_SECONDS_PER_AUDIO_SECOND = 0.185
+# Substituted into the prefix sum for a queued job AHEAD whose admission
+# probe failed (duration unknown) — one unprobeable file must not poison
+# every estimate behind it. The polled job itself gets NO ETA when its own
+# duration is unknown: the API never fabricates a duration it does not
+# have, and never re-probes at request time. Configurable via
+# AUDIO_DURATION_FALLBACK_SECONDS.
+DEFAULT_AUDIO_DURATION_SECONDS = 300.0
+# HTTP token charset (RFC 7230) — header/cookie names must match it.
+_HEADER_TOKEN_RE = re.compile(r"[!#$%&'*+\-.^_`|~0-9A-Za-z]+")
+
+
+def _validated_env_name(var: str, default: str) -> str:
+    """Read a header/cookie NAME knob, falling back to the documented default."""
+    raw = (os.environ.get(var) or "").strip()
+    if not raw:
+        return default
+    if not _HEADER_TOKEN_RE.fullmatch(raw):
+        logger.warning("config: %s=%r is not a valid HTTP token; using %r", var, raw, default)
+        return default
+    return raw
+
+
+def _session_header_name() -> str:
+    return _validated_env_name("SESSION_HEADER", SESSION_HEADER_DEFAULT)
+
+
+def _session_cookie_name() -> str:
+    return _validated_env_name("SESSION_COOKIE_NAME", SESSION_COOKIE_NAME_DEFAULT)
 
 
 def _env_int(name: str, default: int) -> int:
@@ -47,6 +111,64 @@ def _env_int(name: str, default: int) -> int:
         return int(os.environ.get(name, str(default)))
     except ValueError:
         return default
+
+
+def _max_processing_per_session() -> int:
+    """Cap on concurrently-PROCESSING jobs per session (card t_4b40acfd).
+
+    Read at every claim so a deployment can tune it via env. Values < 1 or
+    unparseable input warn and clamp to the default: a zero cap would freeze
+    the queue entirely, exactly the MAX_QUEUE_DEPTH=0 footgun.
+    """
+    raw = (os.environ.get("MAX_PROCESSING_PER_SESSION") or "").strip()
+    if not raw:
+        return DEFAULT_MAX_PROCESSING_PER_SESSION
+    try:
+        value = int(raw)
+    except ValueError:
+        logger.warning(
+            "config: MAX_PROCESSING_PER_SESSION=%r is not an integer; using %d",
+            raw, DEFAULT_MAX_PROCESSING_PER_SESSION,
+        )
+        return DEFAULT_MAX_PROCESSING_PER_SESSION
+    if value < 1:
+        logger.warning(
+            "config: MAX_PROCESSING_PER_SESSION=%d would freeze the queue; clamped to %d",
+            value, DEFAULT_MAX_PROCESSING_PER_SESSION,
+        )
+        return DEFAULT_MAX_PROCESSING_PER_SESSION
+    return value
+
+
+def _processing_rate() -> float:
+    """Seconds of GPU processing per second of audio (card t_b3ae9366).
+
+    Read at every estimate so a deployment can retune via env. EXACT 0 is
+    the documented switch that disables ETA emission. Negative or
+    non-numeric warn and fall back to the default — mirroring the
+    _max_processing_per_session style. The default is the measured T400
+    rate (0.185 = 434 s wall for 2340 s of audio); on other hardware it
+    is off by roughly the CUDA-vs-CPU factor (see CONFIG.md).
+    """
+    raw = (os.environ.get("PROCESSING_SECONDS_PER_AUDIO_SECOND") or "").strip()
+    if not raw:
+        return DEFAULT_PROCESSING_SECONDS_PER_AUDIO_SECOND
+    try:
+        value = float(raw)
+    except ValueError:
+        logger.warning(
+            "config: PROCESSING_SECONDS_PER_AUDIO_SECOND=%r is not a number; using %.3f",
+            raw, DEFAULT_PROCESSING_SECONDS_PER_AUDIO_SECOND,
+        )
+        return DEFAULT_PROCESSING_SECONDS_PER_AUDIO_SECOND
+    if value < 0:
+        logger.warning(
+            "config: PROCESSING_SECONDS_PER_AUDIO_SECOND=%r is negative; using %.3f "
+            "(0 is the documented way to disable ETA emission)",
+            value, DEFAULT_PROCESSING_SECONDS_PER_AUDIO_SECOND,
+        )
+        return DEFAULT_PROCESSING_SECONDS_PER_AUDIO_SECOND
+    return value
 
 
 # --- Job retention + disk-pressure eviction (card t_5e6200fc) -----------------
@@ -384,20 +506,260 @@ def _queued_states(states: list[dict] | None = None) -> list[dict]:
     )
 
 
-def _session_id(request: Request) -> str:
-    """Bearer/session header if present, else client IP, else anonymous.
+# --- Fair-share scheduling (card t_4b40acfd) ----------------------------------
+# Per-session FIFO sub-queues served round-robin. The pointer (which session
+# was served when) persists under JOBS_DIR so a restart continues the same
+# round instead of letting a big submitter re-jump the line.
 
-    Hashed so secrets/PII (tokens, IPs) never land in job state on disk.
+def _scheduler_state_path() -> Path:
+    return JOBS_DIR / SCHEDULER_STATE_NAME
+
+
+def _load_scheduler_state() -> dict:
+    """Read the round-robin pointer; a fresh process derives fairness from
+    this file alone (claim_next never trusts an in-memory copy).
+
+    Missing file or malformed JSON heals to a fresh state with a warning:
+    the worst case is one round of tie-break-by-arrival, never a crash."""
+    fresh = {"serve_counter": 0, "last_served": {}}
+    path = _scheduler_state_path()
+    if not path.exists():
+        return fresh
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        logger.warning(
+            "scheduler state: unreadable %s (%s) — resetting round-robin pointer",
+            path, exc,
+        )
+        return fresh
+    if not isinstance(raw, dict):
+        logger.warning("scheduler state: malformed %s — resetting round-robin pointer", path)
+        return fresh
+    try:
+        counter = max(0, int(raw.get("serve_counter", 0)))
+        last = {str(k): int(v) for k, v in (raw.get("last_served") or {}).items()}
+    except (TypeError, ValueError):
+        logger.warning("scheduler state: malformed %s — resetting round-robin pointer", path)
+        return fresh
+    return {"serve_counter": counter, "last_served": last}
+
+
+def _save_scheduler_state(sched: dict) -> None:
+    path = _scheduler_state_path()
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(json.dumps(sched), encoding="utf-8")
+    tmp.replace(path)
+
+
+def _session_key(state: dict) -> str:
+    """Grouping key for the per-session sub-queue: the dedicated hashed
+    session_ident (V1.5) with graceful fallbacks for legacy states."""
+    return str(state.get("session_ident") or state.get("session") or "_anonymous")
+
+
+def _queued_groups(states: list[dict]) -> dict[str, list[dict]]:
+    groups: dict[str, list[dict]] = {}
+    for st in _queued_states(states):
+        groups.setdefault(_session_key(st), []).append(st)
+    return groups
+
+
+def _rr_pick(groups: dict[str, list[dict]], served: dict[str, int]) -> str:
+    """Round-robin turn: the session served longest ago wins (never-served
+    sessions count as served at 0, so new arrivals cannot starve behind an
+    established submitter); ties break by earliest FIFO head seq, then the
+    session key for full determinism."""
+    return min(groups, key=lambda k: (served.get(k, 0), groups[k][0].get("seq", float("inf")), k))
+
+
+def _fair_queued_order(states: list[dict], sched: dict) -> list[str]:
+    """Pure simulation of the fair pickup order over the queued jobs — the
+    sequence _claim_next_queued() would produce if nothing new arrived and no
+    cap blocked a session (see README: queue_position is a rank in THIS
+    order). Does not mutate inputs or the scheduler file."""
+    groups = _queued_groups(states)
+    served = dict(sched["last_served"])
+    counter = sched["serve_counter"]
+    order: list[str] = []
+    while groups:
+        key = _rr_pick(groups, served)
+        st = groups[key].pop(0)
+        if not groups[key]:
+            del groups[key]
+        order.append(str(st.get("token", "")))
+        counter += 1
+        served[key] = counter
+    return order
+
+
+# --- Queue-aware wait estimate (card t_b3ae9366) ------------------------------
+
+
+def _known_duration_seconds(state: dict) -> float | None:
+    """The job's probed audio duration, or None when it is unknown/zero.
+
+    Only ever read from job state — the API never re-probes at request
+    time (AC5): the value is the ffprobe container-header result recorded
+    at admission, refreshed once by the decode-time probe when the job
+    actually runs.
     """
-    header = os.environ.get("SESSION_HEADER", SESSION_HEADER_DEFAULT)
+    try:
+        dur = float(state.get("duration_seconds") or 0.0)
+    except (TypeError, ValueError):
+        return None
+    return dur if dur > 0 else None
+
+
+def _estimate_seconds_for(state: dict, rate: float) -> float:
+    """Linear model cost of one job: duration_seconds x rate.
+
+    A job whose duration is unknown substitutes the documented fallback
+    constant so one unprobeable file cannot poison the estimates of every
+    job queued behind it; the owning client still gets no ETA for its own
+    unknown-duration job (see _wait_estimates)."""
+    dur = _known_duration_seconds(state)
+    if dur is None:
+        dur = max(0.0, _env_float("AUDIO_DURATION_FALLBACK_SECONDS",
+                                  DEFAULT_AUDIO_DURATION_SECONDS))
+    return dur * rate
+
+
+def _processing_remaining_seconds(processing: dict | None, rate: float,
+                                  now: float) -> float:
+    """The currently-PROCESSING job's honest remaining share (never > est).
+
+    With started_at (every real claim sets one; reclaimed attempts preserve
+    it): remaining = estimate - wall time so far, clamped to [0, estimate]
+    — a straggler that overshoots its linear estimate contributes 0, it
+    never subtracts from the prefix (AC5 negative clamp). The value falls
+    monotonically as `now` advances, so a polled estimate only moves when
+    queue members genuinely leave (AC4). Without started_at (seeded or
+    pre-V1.5 state), the monotonic progress fraction is the fallback."""
+    if processing is None:
+        return 0.0
+    est = _estimate_seconds_for(processing, rate)
+    started = processing.get("started_at")
+    try:
+        if started is not None:
+            remaining = est - (now - float(started))
+        else:
+            prog = float(processing.get("progress") or 0.0)
+            remaining = est * (1.0 - min(1.0, max(0.0, prog)))
+    except (TypeError, ValueError):
+        remaining = est
+    return max(0.0, min(est, remaining))
+
+
+def _wait_estimates(states: list[dict], sched: dict,
+                    now: float | None = None) -> dict[str, tuple[float, float]]:
+    """token -> (estimated_wait_seconds, estimated_completion_epoch) for
+    every estimable queued job, in the FAIR execution order (AC3/AC4).
+
+    Prefix-sum walk. estimated_wait_seconds answers the question a waiting
+    client actually asks — "how long until MY result exists" — so it is
+    the currently-processing job's REMAINING estimate + every queued job
+    ahead of the position + the job's OWN estimate. Consequences:
+      * positions are distinct and non-overlapping by construction (each
+        adds its own positive cost); completion times chain exactly:
+        c(k+1) = c(k) + own(k+1);
+      * there is no shared/blanket wait — the only common term is the
+        processing job's remaining estimate, which shrinks with elapsed
+        time and vanishes when it leaves the processing state;
+      * the whole map is recomputed from live state on every poll, so
+        admissions, cancellations and completions are reflected instantly
+        (AC5). It is an ESTIMATE of a linear model, not a guarantee.
+    A queued job with unknown own duration gets NO entry (honest null,
+    never a fabricated duration). PROCESSING_SECONDS_PER_AUDIO_SECOND=0
+    disables emission entirely (empty map).
+    """
+    rate = _processing_rate()
+    if rate <= 0:
+        return {}
+    if now is None:
+        now = time.time()
+    by_token = {str(s.get("token")): s for s in states}
+    processing = next(
+        (s for s in states if s.get("status") == "processing"), None)
+    prefix = _processing_remaining_seconds(processing, rate, now)
+    out: dict[str, tuple[float, float]] = {}
+    for token in _fair_queued_order(states, sched):
+        st = by_token.get(token)
+        if st is None:
+            continue
+        own = _estimate_seconds_for(st, rate)
+        wait = max(0.0, prefix + own)
+        if _known_duration_seconds(st) is not None:
+            out[token] = (wait, now + wait)
+        prefix += own
+    return out
+
+
+def _iso_utc(ts: float) -> str:
+    """Wall-clock stamp in the documented YYYY-MM-DDTHH:MM:SSZ form.
+    fromtimestamp+strftime is the only spelling that keeps the literal Z
+    (astimezone().isoformat() emits '+00:00')."""
+    return datetime.fromtimestamp(ts, timezone.utc).strftime(
+        "%Y-%m-%dT%H:%M:%SZ")
+
+
+def _select_next_queued(
+    states: list[dict], sched: dict, cap: int
+) -> tuple[dict | None, dict]:
+    """Pick the next claimable job: round-robin across sessions, FIFO inside
+    a session, sessions at the processing cap skipped. Returns (job, new
+    scheduler state); (None, sched) when nothing may be claimed."""
+    inflight: dict[str, int] = {}
+    for st in states:
+        if st.get("status") == "processing":
+            key = _session_key(st)
+            inflight[key] = inflight.get(key, 0) + 1
+    groups = _queued_groups(states)
+    eligible = {k: g for k, g in groups.items() if inflight.get(k, 0) < cap}
+    if not eligible:
+        return None, sched
+    key = _rr_pick(eligible, sched["last_served"])
+    chosen = eligible[key][0]
+    counter = sched["serve_counter"] + 1
+    return chosen, {"serve_counter": counter,
+                    "last_served": {**sched["last_served"], key: counter}}
+
+
+def _hash_ident(raw: str) -> str:
+    """Domain-separated SHA-256 digest (first 32 hex chars).
+
+    Raw session tokens, cookies and IPs are hashed exactly as in V1.0 so
+    no secret or PII ever lands in job state on disk.
+    """
+    return hashlib.sha256(raw.encode()).hexdigest()[:32]
+
+
+def _new_session_id() -> str:
+    """Fresh high-entropy session id (uuid4 hex, ~122 bits of entropy)."""
+    return uuid.uuid4().hex
+
+
+def _resolve_session(request: Request) -> tuple[str, str, str]:
+    """(identity hash, session id, source) for the V1.5 precedence chain.
+
+    Highest first: explicit SESSION_HEADER header (default "X-Session"),
+    server-issued session cookie, client IP, "anonymous". The session id is
+    the presented header/cookie value, or a freshly issued one when the
+    client had neither (the caller returns it via Set-Cookie + response body,
+    and it is hashed under the dedicated `session_ident` job-state key).
+    Stateless: the server stores no session table; only hashes are persisted.
+    """
+    header = _session_header_name()
     value = request.headers.get(header)
     if value and value.strip():
-        raw = f"header:{header}:{value.strip()}"
-    elif request.client and request.client.host:
-        raw = f"ip:{request.client.host}"
-    else:
-        raw = "anonymous"
-    return hashlib.sha256(raw.encode()).hexdigest()[:32]
+        return _hash_ident(f"header:{header}:{value.strip()}"), value.strip(), "header"
+    cookie = request.cookies.get(_session_cookie_name())
+    if cookie and cookie.strip():
+        return _hash_ident(f"cookie:{cookie.strip()}"), cookie.strip(), "cookie"
+    session = _new_session_id()
+    if request.client and request.client.host:
+        return _hash_ident(f"ip:{request.client.host}"), session, "ip"
+    return _hash_ident("anonymous"), session, "anonymous"
 
 
 def _probe_duration(path: str) -> float:
@@ -442,11 +804,11 @@ def process_job_background(token: str, audio_path: str, filename: str,
     job_dir = JOBS_DIR / token
     state_file = job_dir / "status.json"
 
-    def update_state(st, prog=None, msg="", err="", stage=None):
+    def update_state(st, prog=None, msg="", err="", stage=None, dur=None):
         with _queue_lock:
             if state_file.exists():
                 try:
-                    st_data = json.loads(state_file.read_text())
+                    st_data: dict = json.loads(state_file.read_text())
                 except Exception:
                     st_data = {"token": token}
                 # A cancelled/absent job must not be resurrected by a straggler.
@@ -456,6 +818,10 @@ def process_job_background(token: str, audio_path: str, filename: str,
                 prev = float(st_data.get("progress") or 0.0)
                 if stage is not None:
                     st_data["stage"] = stage
+                if dur:
+                    # AC1 refresh (card t_b3ae9366): the decode-time probe of
+                    # the real 16k wav replaces the admission-time estimate.
+                    st_data["duration_seconds"] = float(dur)
                 if st == "failed":
                     # Stage stays where the work broke; progress keeps its
                     # monotonic position but 1.0 is reserved for done, so a
@@ -495,7 +861,8 @@ def process_job_background(token: str, audio_path: str, filename: str,
             duration = _probe_duration(wav_path)
 
         update_state("processing", _stage_progress("transcribing"), "Transcribing speech...",
-                     stage="transcribing")
+                     stage="transcribing",
+                     dur=duration if not mock else None)
         segments = transcribe_and_diarize(
             wav_path,
             mock=mock,
@@ -576,12 +943,20 @@ def process_job_background(token: str, audio_path: str, filename: str,
 
 
 def _claim_next_queued() -> dict | None:
-    """Atomically pick the FIFO head and mark it processing (concurrency=1)."""
+    """Atomically pick the fair-share next job and mark it processing.
+
+    V1.5 (card t_4b40acfd): selection is round-robin across sessions (FIFO
+    within a session) and honours MAX_PROCESSING_PER_SESSION — a session that
+    already holds the cap in flight is skipped even when its jobs sit at the
+    global FIFO head. The pointer is persisted to disk per claim, so the
+    service does not lose its place on restart.
+    """
+    cap = _max_processing_per_session()
     with _queue_lock:
-        queued = _queued_states()
-        if not queued:
+        job, sched = _select_next_queued(_iter_states(), _load_scheduler_state(), cap)
+        if job is None:
             return None
-        job = queued[0]
+        _save_scheduler_state(sched)
         job["status"] = "processing"
         job["stage"] = "queued"
         # Clamp, never reset: a job requeued by the lifespan reclaim keeps the
@@ -590,14 +965,21 @@ def _claim_next_queued() -> dict | None:
         # 0.05; reclaimed jobs stay at their preserved value and the band
         # publishes catch up via update_state()'s max(prev, prog) clamp.
         job["progress"] = max(float(job.get("progress") or 0.0), 0.05)
+        # Fair-scheduled pickup: the admission-order rank is no longer
+        # meaningful once the job leaves the queue (AC6, card t_4b40acfd).
+        job["queue_position"] = None
         job["message"] = "Claimed by worker"
         job["started_at"] = time.time()
         _write_state(job)
+        logger.info(
+            "queue: claimed job token=%s session=%s serve_counter=%d cap=%d",
+            job.get("token"), _session_key(job), sched["serve_counter"], cap,
+        )
         return job
 
 
 async def _queue_worker_loop() -> None:
-    """Single-GPU worker: one job at a time, FIFO by seq.
+    """Single-GPU worker: one job at a time, fair round-robin across sessions.
 
     The pipeline is CPU/GPU-bound synchronous code, so it runs in the default
     executor and the event loop stays responsive for admissions and polls.
@@ -630,8 +1012,55 @@ async def _queue_worker_loop() -> None:
             await asyncio.sleep(_env_float("QUEUE_POLL_SECONDS", DEFAULT_QUEUE_POLL_SECONDS))
 
 
+def validate_config() -> str:
+    """Boot-time config validation + report (V1.5 AC8, card t_920fb7dc).
+
+    Surfaces every session/queue/retention knob the service reads —
+    SESSION_HEADER and SESSION_COOKIE_NAME (HTTP-token validated, invalid
+    values warn and fall back to the documented defaults), MAX_QUEUE_DEPTH
+    and RETENTION_DAYS — so misconfiguration is visible in `docker logs`
+    instead of silently degrading behavior. Invalid integers keep the
+    established _env_int fallback; a non-positive depth is called out and
+    pinned to the default. MAX_JOBS_PER_SESSION is accepted but IGNORED
+    (deprecated with the per-session rejection path, card t_82bfbc15): if
+    it is set, startup logs a warning saying so — no job is ever rejected
+    on its basis.
+    """
+    header = _session_header_name()
+    cookie = _session_cookie_name()
+    depth = _env_int("MAX_QUEUE_DEPTH", DEFAULT_MAX_QUEUE_DEPTH)
+    days = _retention_days()
+    if "MAX_JOBS_PER_SESSION" in os.environ:
+        logger.warning(
+            "config: MAX_JOBS_PER_SESSION=%r is DEPRECATED and IGNORED — "
+            "sessions may hold multiple active jobs; the only admission "
+            "rejection is queue depth (503). Remove it from your env.",
+            os.environ["MAX_JOBS_PER_SESSION"],
+        )
+    if depth < 1:
+        logger.warning(
+            "config: MAX_QUEUE_DEPTH=%d would reject every submission; using %d",
+            depth, DEFAULT_MAX_QUEUE_DEPTH,
+        )
+        depth = DEFAULT_MAX_QUEUE_DEPTH
+    # ETA model constant (card t_b3ae9366): invalid values warn here via
+    # _processing_rate() and fall back to the default; exact 0 is valid and
+    # switches ETA emission off. The value is hardware-specific — the
+    # default is the measured T400 rate, re-derive it for other GPUs.
+    rate = _processing_rate()
+    summary = (
+        f"config: session header={header} cookie={cookie} "
+        f"max_queue_depth={depth} max_processing_per_session="
+        f"{_max_processing_per_session()} retention_days={days} "
+        f"eta_rate={rate} eta={'on' if rate > 0 else 'OFF'}"
+    )
+    logger.info(summary)
+    return summary
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    validate_config()
     # Boot revalidation: jobs left 'processing' by a crash/restart return to
     # the queue with their seq intact, preserving FIFO order across restarts;
     # admission limits are revalidated by every POST from this persisted state.
@@ -688,6 +1117,18 @@ app = FastAPI(title="AutoDiarist", version="1.0.0", lifespan=lifespan)
 class JobResponse(BaseModel):
     token: str
     status: str
+    session: str = ""
+    # 1-based rank at admission in the FAIR-SCHEDULED execution order
+    # (V1.5, cards t_82bfbc15 + t_4b40acfd): the client learns its queue
+    # position from the 202 itself, without a first poll.
+    queue_position: int | None = None
+    # Queue-aware wait ESTIMATE at admission (V1.5, card t_b3ae9366):
+    # seconds from now until the result should exist, and the matching
+    # UTC wall-clock time. ESTIMATE only — linear model, never a
+    # guarantee. None when the duration probe failed or the rate
+    # constant disables ETA emission (see README / CONFIG.md).
+    estimated_wait_seconds: float | None = None
+    estimated_completion_at: str | None = None
 
 
 class JobStatus(BaseModel):
@@ -697,7 +1138,7 @@ class JobStatus(BaseModel):
 
 
 @app.post("/v1/jobs", response_model=JobResponse, status_code=status.HTTP_202_ACCEPTED)
-async def create_job(request: Request, file: UploadFile = File(...)):
+async def create_job(request: Request, response: Response, file: UploadFile = File(...)):
     token = str(uuid.uuid4())
     job_dir = JOBS_DIR / token
 
@@ -727,57 +1168,205 @@ async def create_job(request: Request, file: UploadFile = File(...)):
         shutil.rmtree(job_dir, ignore_errors=True)
         raise
 
-    # 3. Admission control under the queue lock: depth first (system-level
-    #    backpressure, AC1), then the per-session quota (AC2). Rejected
-    #    uploads leave no enqueued trace on disk.
-    session = _session_id(request)
+    # 2b. Duration probe at admission (V1.5, card t_b3ae9366): a cheap
+    #     ffprobe container-header read — NO full decode — off the event
+    #     loop, so the very first response can carry an honest wait
+    #     estimate. A failed/unparseable probe stores duration_seconds
+    #     None (unknown): the job then shows NO ETA, and polls never
+    #     re-probe (the value is refreshed exactly once by the decode-time
+    #     probe when the job actually runs).
+    probed = await run_in_threadpool(_probe_duration, str(audio_path))
+    duration_seconds = round(float(probed), 3) if probed and probed > 0 else None
+
+    # 3. Admission control under the queue lock: queue depth is the single
+    #    system-level backpressure gate (AC1, card t_daebf369). Since V1.5
+    #    (card t_82bfbc15) the per-session quota rejection is gone: every
+    #    submission that fits under the depth is accepted with 202 and
+    #    queued behind the others. Rejected uploads leave no trace on disk.
+    session, session_id, session_source = _resolve_session(request)
     depth_limit = _env_int("MAX_QUEUE_DEPTH", DEFAULT_MAX_QUEUE_DEPTH)
-    session_limit = _env_int("MAX_JOBS_PER_SESSION", DEFAULT_MAX_JOBS_PER_SESSION)
     retry_after = str(_env_int("RETRY_AFTER_SECONDS", DEFAULT_RETRY_AFTER_SECONDS))
     with _queue_lock:
         states = _iter_states()
         queued = [s for s in states if s.get("status") == "queued"]
         if len(queued) >= depth_limit:
             shutil.rmtree(job_dir, ignore_errors=True)
+            # Detail names both the queue depth and the Retry-After value
+            # (card t_82bfbc15 scope 5) so a client can back off from the
+            # response body alone.
             raise HTTPException(
                 status_code=503,
-                detail=f"Queue is full ({len(queued)}/{depth_limit} jobs queued). Retry later.",
+                detail=(
+                    f"Queue is full ({len(queued)}/{depth_limit} jobs queued). "
+                    f"Retry after {retry_after}s."
+                ),
                 headers={"Retry-After": retry_after},
             )
-        active = [
-            s for s in states
-            if s.get("status") in ("queued", "processing") and s.get("session") == session
-        ]
-        if len(active) >= session_limit:
-            shutil.rmtree(job_dir, ignore_errors=True)
-            raise HTTPException(
-                status_code=429,
-                detail=(
-                    f"Session limit reached: {len(active)}/{session_limit} active jobs "
-                    "per session (queued+processing). Wait for a job to finish or cancel one."
-                ),
-            )
         seq = max((s.get("seq", 0) for s in states), default=0) + 1
+        admitted_at = time.time()
         state = {
             "token": token,
             "status": "queued",
             "session": session,
-            "queued_at": time.time(),
+            # Dedicated session key (V1.5): hash of the session id the client
+            # presents (or that was just issued to it) so the scheduler and
+            # job listing can group per person. Raw id never hits disk.
+            "session_ident": _hash_ident(f"session:{session_id}"),
+            "session_source": session_source,
+            # created_at (card t_f97d12a8): stable job-creation timestamp for
+            # the session listing's newest-first order. queued_at stays the
+            # queue-facing clock (boot requeue stamps it on restart); a fresh
+            # admission sets both. Legacy jobs lacking created_at fall back
+            # to queued_at in the listing.
+            "created_at": admitted_at,
+            "queued_at": admitted_at,
             "seq": seq,
             "progress": 0.0,
             "message": "Queued",
             "stage": "queued",
             "filename": name,
             "audio_path": str(audio_path),
+            # AC1: duration probed at admission (None = unknown). The ETA
+            # model reads ONLY this value from state — never the audio.
+            "duration_seconds": duration_seconds,
         }
         _write_state(state)
+        # Fair-schedule rank at admission (1-based, card t_4b40acfd): the
+        # position in the round-robin execution order the worker will
+        # actually follow — NOT raw arrival order. A queued job that
+        # arrived first can therefore report a position behind a later
+        # arrival from a different session (semantic change from FIFO;
+        # within one session the order stays FIFO by seq). Same rank GET
+        # /v1/jobs/{token} recomputes for a queued job.
+        sched = _load_scheduler_state()
+        simulated = states + [state]  # processing job included: it is the
+        # prefix the queue-aware ETA must account for (card t_b3ae9366).
+        queue_position = _fair_queued_order(simulated, sched).index(token) + 1
+        eta = _wait_estimates(simulated, sched).get(token)
 
     # Wake the worker if it's idle-waiting.
     wake = getattr(app.state, "wake", None)
     if wake is not None:
         wake.set()
 
-    return JobResponse(token=token, status="queued")
+    # Session identity issuance (V1.5): the cookie lets browsers stay in one
+    # bucket without any client setup; the body field lets raw-HTTP clients
+    # reuse the id without a cookie jar. Stateless server: the value comes
+    # from the client (header/cookie) or is freshly minted here.
+    response.set_cookie(
+        key=_session_cookie_name(),
+        value=session_id,
+        httponly=True,
+        samesite="lax",
+        path="/",
+    )
+    return JobResponse(
+        token=token,
+        status="queued",
+        session=session_id,
+        queue_position=queue_position,
+        # Queue-aware ETA at admission (card t_b3ae9366) — honest estimate,
+        # recomputed by the scheduler order simulation, never a guarantee.
+        estimated_wait_seconds=round(eta[0], 1) if eta else None,
+        estimated_completion_at=_iso_utc(eta[1]) if eta else None,
+    )
+
+
+def _listing_created_at(state: dict) -> float:
+    """Ordering clock for the session listing: created_at, falling back to
+    queued_at for jobs admitted before the field existed (t_f97d12a8)."""
+    return state.get("created_at") or state.get("queued_at") or 0.0
+
+
+def _session_job_entries(
+    states: list[dict], session_ident: str, limit: int, queued_order: list[str],
+    estimates: dict[str, tuple[float, float]] | None = None,
+) -> tuple[list[dict], int]:
+    """Pure session view (card t_f97d12a8): the caller's jobs only,
+    newest-first (created_at desc, seq desc tiebreak), truncated to `limit`.
+
+    Every entry carries token/status/progress/stage/source/created_at;
+    queued entries additionally carry queue_position (the fair-scheduled
+    execution rank from `queued_order`, the same simulation GET /v1/jobs/
+    {token} and POST 202 use) and, while ETA emission is enabled, the
+    queue-aware wait estimate estimated_wait_seconds /
+    estimated_completion_at — the SAME live values the poll endpoint
+    reports (card t_b3ae9366), null when no honest estimate exists for
+    that job; failed entries carry the error string.
+    Cancelled jobs stay in the listing — they are terminal states users
+    want to see. Returns (entries, total_before_truncation)."""
+    mine = [s for s in states if s.get("session_ident") == session_ident]
+    mine.sort(key=lambda s: (_listing_created_at(s), s.get("seq") or 0), reverse=True)
+    rank = {token: i + 1 for i, token in enumerate(queued_order)}
+    entries = []
+    for s in mine[:limit]:
+        entry = {
+            "token": s.get("token"),
+            "status": s.get("status"),
+            "progress": s.get("progress", 0.0),
+            "stage": s.get("stage") or s.get("status"),
+            "source": s.get("filename", "unknown"),
+            "created_at": _listing_created_at(s),
+        }
+        if s.get("status") == "queued":
+            entry["queue_position"] = rank.get(s["token"])
+            if estimates is not None:
+                # Computed from the same live queue snapshot as the rank —
+                # never persisted, never re-probed (AC5).
+                eta = estimates.get(s["token"])
+                entry["estimated_wait_seconds"] = round(eta[0], 1) if eta else None
+                entry["estimated_completion_at"] = _iso_utc(eta[1]) if eta else None
+        if s.get("status") == "failed":
+            entry["error"] = s.get("error") or s.get("message") or ""
+        entries.append(entry)
+    return entries, len(mine)
+
+
+@app.get("/v1/jobs")
+async def list_jobs(request: Request, response: Response, limit: int = DEFAULT_LIST_LIMIT):
+    """Session-scoped job listing (V1.5, card t_f97d12a8).
+
+    GET /v1/jobs/{token} answers "what is THIS job doing" for anyone holding
+    the token; this endpoint answers "what did I submit" — it is filtered by
+    the same hashed session identity admission stamps on every job, so a
+    client can find its token, watch status/progress, and cancel a queued
+    job without the server ever storing a plaintext session id. Other
+    sessions' jobs cannot appear (identity hash equality is the only filter)
+    and there is deliberately no admin/cross-session mode.
+
+    Order: newest-first (created_at desc, seq desc tiebreak). ?limit= takes
+    precedence over the default page size, clamped into [1, MAX_LIST_LIMIT]
+    — out-of-range values clamp, they never 4xx. Non-integer limit is the
+    only rejected input (FastAPI 422).
+    """
+    _, session_id, _ = _resolve_session(request)
+    page = max(1, min(limit, MAX_LIST_LIMIT))
+    with _queue_lock:
+        states = _iter_states()
+        sched = _load_scheduler_state()
+        queued_order = _fair_queued_order(states, sched)
+        # One live queue snapshot drives rank AND ETA (card t_b3ae9366):
+        # both surfaces agree because both come from this pass. Disabled
+        # emission (rate=0) omits the fields entirely, like the poll.
+        estimates = _wait_estimates(states, sched) if _processing_rate() > 0 else None
+    entries, total = _session_job_entries(
+        states, _hash_ident(f"session:{session_id}"), page, queued_order,
+        estimates,
+    )
+    # Echo the identity exactly like POST does (card t_920fb7dc): a client
+    # that only had an IP-derived identity gets the minted id back via
+    # cookie (+ default header when the client doesn't already manage one)
+    # so its next listing matches its submissions.
+    response.set_cookie(
+        key=_session_cookie_name(),
+        value=session_id,
+        httponly=True,
+        samesite="lax",
+        path="/",
+    )
+    if not request.headers.get(_session_header_name(), "").strip():
+        response.headers[_session_header_name()] = session_id
+    return {"jobs": entries, "count": len(entries), "total": total, "limit": page}
 
 
 @app.get("/v1/jobs/{token}")
@@ -791,13 +1380,36 @@ async def get_job_status(token: str):
         # coarse status so the field is never absent from a response.
         state["stage"] = state.get("status", "unknown")
     if state.get("status") == "queued":
-        # queue_position is the 1-based FIFO rank among currently queued jobs:
-        # exactly the worker's pickup order (both keyed on `seq`).
+        # queue_position is the 1-based rank in the FAIR-SCHEDULED execution
+        # order the worker actually follows (card t_4b40acfd): per-session
+        # FIFO sub-queues served round-robin — NOT raw admission order, so a
+        # job can report a rank behind a later arrival from a different
+        # session. Recomputed from the current queue + persisted pointer, so
+        # it only moves downward as work ahead completes or leaves the queue
+        # (a cancelled job drops out of the simulation; positions behind it
+        # compress). Assumes no new arrivals — same caveat FIFO had.
+        # estimated_wait_seconds / estimated_completion_at (card t_b3ae9366)
+        # are computed in that SAME fair order on EVERY poll — never read
+        # back from disk, never re-probed — so the estimate tracks queue
+        # movement (admissions/cancellations/completions) instantly. They
+        # are an ESTIMATE from a linear duration model, not a guarantee, and
+        # are None for a job whose own duration probe failed at admission.
         with _queue_lock:
-            rank = 1 + sum(
-                1 for s in _queued_states() if s.get("seq", 0) < state.get("seq", 0)
-            )
-        state["queue_position"] = rank
+            states = _iter_states()
+            sched = _load_scheduler_state()
+            order = _fair_queued_order(states, sched)
+            estimates = _wait_estimates(states, sched)
+        state["queue_position"] = order.index(token) + 1 if token in order else None
+        if _processing_rate() > 0:
+            eta = estimates.get(token)
+            state["estimated_wait_seconds"] = round(eta[0], 1) if eta else None
+            state["estimated_completion_at"] = _iso_utc(eta[1]) if eta else None
+    elif state.get("status") == "processing" and _processing_rate() > 0:
+        # A running job is past the queue: stage + monotonic progress carry
+        # the truth, so the ETA fields are present-but-null (never stale),
+        # mirroring the queue_position: None convention on claim (AC6).
+        state["estimated_wait_seconds"] = None
+        state["estimated_completion_at"] = None
     return JobStatus(**state)
 
 

@@ -1,5 +1,190 @@
 # Changelog
 
+## [Unreleased] — V1.5 session-scoped job listing: GET /v1/jobs (card t_f97d12a8)
+
+Building on session identity (card t_920fb7dc) and accept-and-queue admission
+(card t_82bfbc15): a client can now answer "what did I submit?" — the
+user-facing requirement to wait for a job or cancel it needs a way to find
+its own tokens first.
+
+- **`GET /v1/jobs` — session-scoped listing.** Entries carry `token`,
+  `status`, `progress`, `stage`, `source` (uploaded filename) and
+  `created_at`; `queued` entries add `queue_position` (the same fair rank
+  the poll endpoint and the POST 202 report, computed from one shared
+  simulation), `failed` entries add `error`, and `cancelled` jobs stay
+  listed (terminal states are still part of what the user submitted).
+  Filtered by the same hashed `session_ident` admission stamps on every job
+  — no cross-session leakage is possible and there is no admin mode.
+- **Ordering & paging.** Newest-first (`created_at` desc, stable `seq` desc
+  tiebreak). `?limit=` defaults to `50` and clamps to `[1, 200]` (clamped,
+  never an error; non-integer `limit` is `422`). `total` reports the
+  session's job count before truncation. Deliberately knob-free: the two
+  limits are constants, not env vars.
+- **`created_at` joins the job state at admission** as the listing's stable
+  clock; `queued_at` keeps its queue-facing meaning (boot requeue stamps
+  it). Legacy jobs without `created_at` fall back to `queued_at`, so an
+  upgrade lists pre-existing history without re-admission.
+- `GET /v1/jobs/{token}` is unchanged — token-based access stays as it is;
+  the listing is the session-based view. The response echoes the session
+  identity exactly like `POST` does (cookie + `X-Session` default header).
+- Tests: 9 new acceptance tests (`tests/api/test_jobs_listing.py`); full
+  suite 254 green. README documents the endpoint; CONFIG.md unchanged.
+
+## [Unreleased] — V1.5 honest wait estimate: duration probe + queue-aware ETA (card t_b3ae9366)
+
+Building on fair-share scheduling (card t_4b40acfd): a queued client can now
+decide *wait or cancel* from an honest number instead of a bare position.
+
+- **Duration probe at admission.** `POST /v1/jobs` runs a cheap ffprobe
+  container-header read (no decode) on the stored upload and persists the
+  result as `duration_seconds` in the job state; a failed probe stores
+  `null` (unknown — never a fabricated 0). The job's own run refreshes the
+  value once from the decoded 16k wav. Polls NEVER re-probe and never read
+  the audio file.
+- **`PROCESSING_SECONDS_PER_AUDIO_SECOND` (default `0.185`).** The linear
+  model rate (GPU seconds per audio-second). The default is documented at
+  its source — measured on the T400 rig: 39-min audio ran 423–434 s wall on
+  CUDA — and is hardware-specific; CONFIG.md gives the re-derivation
+  procedure. Exact `0` disables ETA emission; negative/non-numeric warn at
+  boot and fall back to the default (also in the boot config summary as
+  `eta_rate=... eta=on|OFF`). `AUDIO_DURATION_FALLBACK_SECONDS` (default
+  `300`) substitutes for queue members AHEAD whose probe failed, so one
+  unprobeable file cannot poison the tail.
+- **Queue-aware ETA on every session surface.** Queued jobs carry
+  `estimated_wait_seconds` (seconds from now until the RESULT should exist:
+  the running job's remaining estimate + every fair-order job ahead + own
+  estimate) and `estimated_completion_at` (`YYYY-MM-DDTHH:MM:SSZ`) — on the
+  202 admission body, on every `GET /v1/jobs/{token}` poll, and on every
+  `queued` entry of the session job listing `GET /v1/jobs` (one shared
+  queue snapshot, so the surfaces cannot disagree). Positions
+  get distinct, non-overlapping estimates by the prefix-sum construction;
+  completion times chain (each position finishes exactly its own estimate
+  after the one ahead). Polling alone keeps the estimate current across
+  admissions, cancellations and completions — everything recomputes from
+  live state in the fair execution order, and the processing job's
+  remaining share shrinks monotonically with elapsed time (negatives
+  clamp to 0).
+- **Honesty contract.** The fields are explicitly ESTIMATES from a linear
+  model: diarization variance, chunk overhead and fixed startup cost are
+  not modeled and observed wall time can and will differ; a `processing`
+  job returns the fields as `null` (stage/progress carry the truth), a
+  finished job omits them, and a queued job with unknown own duration gets
+  no estimate rather than a fabricated one.
+
+Tests: `tests/api/test_wait_estimate.py` (30, CPU-only, no real audio — the
+probe is stubbed where needed): empty-queue estimate, N-jobs-ahead prefix
+sums, fair-order (not admission-order) ranks, decrease as jobs ahead
+complete/cancel, explicit nulls while processing, negative clamps, no
+re-probe at request time, rate validation (0 disables, invalid warns), and
+the 202/poll/listing HTTP surfaces (listing entries agree with the poll
+endpoint by construction). Full suite green: 284 passed (stacked on
+card t_f97d12a8's listing branch).
+
+## [Unreleased] — V1.5 fair-share scheduling: round-robin per session + processing cap (card t_4b40acfd)
+
+Building on accept-and-queue admission (card t_82bfbc15): the shared GPU is
+now allocated fairly across sessions, so a session that submits many jobs
+can no longer starve one that submits a single job.
+
+- **Round-robin claim order.** The worker picks the next job from the
+  session whose turn is longest overdue (FIFO by `seq` inside each
+  session). The pointer — a global `serve_counter` plus per-session
+  `last_served` stamps — persists to `JOBS_DIR/_scheduler.json` and is
+  re-read on every claim, so a restarted service continues the same
+  fairness round instead of letting an established submitter re-jump the
+  line. A missing or corrupt pointer heals to a fresh round with a warning
+  (worst case: one round ordered by arrival); service start never fails on
+  it.
+- **`MAX_PROCESSING_PER_SESSION` (default `1`)** caps how many jobs of one
+  session may be `processing` concurrently. The cap is enforced by the
+  scheduler at claim time — a session at the cap is skipped even when its
+  queued jobs sit at the head of its sub-queue — so it holds under a future
+  multi-worker scale-up, not by accident of the single worker. Values `< 1`
+  or unparseable log a warning and clamp to `1` (a zero cap would freeze
+  the queue).
+- **`queue_position` semantic change (explicit):** the field is now the
+  rank in the fair-scheduled **execution order**, not raw admission order.
+  A job can therefore report a position behind a later arrival from a
+  session that has waited longer, and — unlike under FIFO — a new arrival
+  from a never-served session can jump ahead, so a queued job's reported
+  position can rise as well as fall. Within-session FIFO is guaranteed:
+  jobs of one session never overtake each other. `POST` 202 and `GET`
+  polling share one deterministic simulation of the worker's real pickup
+  order.
+- **Preserved guarantees:** monotonic `seq` (now documented as the arrival
+  ticket it always was), FIFO-within-session, on-disk persistence across
+  restart, boot requeue of orphaned `processing` jobs with `seq` intact,
+  and never two `processing` jobs for one session — now a scheduler
+  invariant, not a worker-count accident.
+- Out of scope by maintainer decision: duration/size-aware priority and
+  preemption of a running job; fairness applies at selection only.
+- Docs updated: README (architecture block, admission + GET schemas with
+  the semantic-change note, new *Fair-share scheduling* section), CONFIG.md
+  knob table, TROUBLESHOOTING.md restart & endpoint gotchas, PIPELINE.md
+  worker note, `.env.example`.
+- `tests/api/test_fair_share.py` (AC1-AC6, 14 cases, no GPU): fairness
+  ordering, cap enforcement independent of worker count, position ranks,
+  restart preserving fairness with no starvation, corrupt-pointer recovery,
+  boot requeue, cancelled-job order removal.
+
+## [Unreleased] — V1.5 admission: accept-and-queue, no per-session rejection (card t_82bfbc15)
+
+- **POST /v1/jobs now accepts and queues instead of rejecting.** A session
+  may hold any number of active jobs; every submission that fits under
+  `MAX_QUEUE_DEPTH` answers `202` with the `token`, the `session` id and
+  the `queue_position` (1-based FIFO rank at admission — the same rank
+  `GET /v1/jobs/{token}` reports while `queued`). The per-session `429`
+  ("Session limit reached") response path is removed; the service no
+  longer emits `429` anywhere.
+- **`503` is the only rejection path** (queue genuinely full): `Retry-After`
+  header as before, and the detail now names both the depth and the
+  Retry-After value — `Queue is full (n/limit jobs queued). Retry after Xs.`
+- **`MAX_JOBS_PER_SESSION` is deprecated but accepted**: existing `.env`
+  files keep loading; when set, startup logs
+  `config: MAX_JOBS_PER_SESSION=... is DEPRECATED and IGNORED` and the
+  value is dropped from the boot config summary. No job is rejected on its
+  basis.
+- Docs updated: README HTTP API admission table + examples, CONFIG.md
+  queue/admission rows, TROUBLESHOOTING.md queue failures & restart
+  semantics, `.env.example` no longer ships the deprecated knob.
+- `tests/api/test_admission_202.py` (AC1-AC6); the retired-quota cases in
+  `test_queue_hardening.py` / `test_session_issue.py` were rewritten to the
+  accept-and-queue contract.
+
+## [Unreleased] — V1.5 server-issued session identity (card t_920fb7dc)
+
+Quotas and per-job attribution become per-*person* rather than per-IP:
+the server now mints a random high-entropy session id (uuid4 hex) on
+first contact and returns it BOTH as the `autodiarist_session` cookie
+(HttpOnly, SameSite=Lax) AND as the `session` field of the
+`POST /v1/jobs` body, so API clients without a cookie jar can capture
+and reuse it. The server stays stateless — no session table; identity
+is derived purely from what the client presents.
+
+- **`api/main.py`** — `_session_id` replaced by `_resolve_session`, a
+  precedence chain: `SESSION_HEADER` header (default now **`X-Session`**;
+  `Authorization` remains honored when configured explicitly) > server-issued
+  cookie > client IP > `anonymous`. Every accepted job persists the identity
+  digest under `session` (unchanged domain-separated SHA-256, first 32 hex —
+  raw ids/cookies/IPs never hit disk) plus the dedicated `session_ident` key
+  (hash of the session id itself, including the first-contact issuance) so
+  the scheduler and job listing can group by person; `session_source` records
+  which branch resolved (`header`/`cookie`/`ip`/`anonymous`). Cookie name is
+  overridable via `SESSION_COOKIE_NAME`; `validate_config()` runs at boot and
+  logs the effective `SESSION_HEADER`, `SESSION_COOKIE_NAME`,
+  `MAX_JOBS_PER_SESSION`, `MAX_QUEUE_DEPTH`, `RETENTION_DAYS`, warning and
+  falling back on invalid values.
+- **`tests/api/test_session_issue.py`** — new: AC1-AC8 coverage — issuance
+  in Set-Cookie + body, entropy/uniqueness, cookie-reuse stability,
+  header-beats-cookie precedence, configured `Authorization`, IP/anonymous
+  fallback, raw-value leak check, two-session distinguishability with
+  per-session quota, statelessness (no files but job dirs; identity
+  never remembered server-side), and the boot config report incl.
+  `SESSION_COOKIE_NAME` override + invalid-name warn/fallback.
+- **Docs** — README *Session identity* rewritten for the issuance/reuse
+  flow, `CONFIG.md` `SESSION_HEADER` default and chain, TROUBLESHOOTING
+  shared-bucket row.
+
 ## [1.3.1] - 2026-10-21 — conversational-word rejection in self-ID capture (card t_ac7889e4)
 
 Live strict-tier defect found during the (b) verification (t_90e1752b):

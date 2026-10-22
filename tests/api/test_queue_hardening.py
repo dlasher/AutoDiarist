@@ -34,7 +34,9 @@ def _setup(tmp_path, monkeypatch, worker="0", depth=None, per_session=None, poll
 
 
 def _post(client, session=None, name="a.wav"):
-    headers = {"Authorization": f"Bearer {session}"} if session else None
+    # V1.5 (card t_920fb7dc): the session identity header defaults to
+    # X-Session. Authorization is only honored when SESSION_HEADER names it.
+    headers = {"X-Session": session} if session else None
     return client.post(
         "/v1/jobs",
         files={"file": (name, AUDIO, "audio/wav")},
@@ -101,46 +103,56 @@ def test_ac1_depth_limit_rejects_third_with_503_retry_after(tmp_path, monkeypatc
 # AC2 -------------------------------------------------------------------------
 
 
-def test_ac2_per_session_quota_429_others_unaffected(tmp_path, monkeypatch):
-    """GIVEN MAX_JOBS_PER_SESSION=2 WHEN session POSTs 3 THEN 3rd is 429."""
+def test_ac2_per_session_admission_multiple_jobs_all_202(tmp_path, monkeypatch):
+    """GIVEN MAX_JOBS_PER_SESSION=2 WHEN session POSTs 3 THEN all 3 are 202.
+
+    V1.5 (card t_82bfbc15): the per-session rejection path is gone; the
+    deprecated knob must not gate admission in any way.
+    """
     _setup(tmp_path, monkeypatch, depth=50, per_session=2)
     with TestClient(main.app) as client:
         assert _post(client, "alice").status_code == 202
         assert _post(client, "alice").status_code == 202
         r3 = _post(client, "alice")
-        assert r3.status_code == 429, r3.text
-        # 429 + explanation
-        detail = r3.json()["detail"].lower()
-        assert "session" in detail and "limit" in detail
+        assert r3.status_code == 202, r3.text
 
-        # Other sessions unaffected.
+        # Other sessions keep their own identity buckets (never rejected).
         assert _post(client, "bob").status_code == 202
 
         # Distinct bearer tokens are distinct sessions even with same client IP.
         assert _post(client, "carol").status_code == 202
 
 
-def test_ac2_default_session_limit_is_two(tmp_path, monkeypatch):
-    """MAX_JOBS_PER_SESSION unset -> documented default (2) applies."""
+def test_ac2_no_session_admission_limit_by_default(tmp_path, monkeypatch):
+    """MAX_JOBS_PER_SESSION unset -> there is no session cap any more.
+
+    Replaces the retired "default limit is two" contract (card t_82bfbc15):
+    five jobs from one session are all admitted and queued.
+    """
     _setup(tmp_path, monkeypatch, depth=50, per_session=None)
     with TestClient(main.app) as client:
-        assert _post(client, "alice").status_code == 202
-        assert _post(client, "alice").status_code == 202
-        assert _post(client, "alice").status_code == 429
+        for _ in range(5):
+            assert _post(client, "alice").status_code == 202
 
 
-def test_ac2_cancelled_jobs_free_session_quota(tmp_path, monkeypatch):
-    _setup(tmp_path, monkeypatch, depth=50, per_session=2)
+def test_ac2_cancel_never_gates_admission(tmp_path, monkeypatch):
+    """Cancel does not "free quota" because there is no quota (t_82bfbc15).
+
+    Regression guard: with the deprecated knob at its most restrictive
+    value, a session may submit again immediately — with or without a
+    prior cancel.
+    """
+    _setup(tmp_path, monkeypatch, depth=50, per_session=1)
     with TestClient(main.app) as client:
         t1 = _post(client, "alice").json()["token"]
         assert _post(client, "alice").status_code == 202
-        assert _post(client, "alice").status_code == 429
+        assert _post(client, "alice").status_code == 202
         assert client.delete(f"/v1/jobs/{t1}").status_code == 202
         assert _post(client, "alice").status_code == 202
 
 
-def test_rejected_by_depth_does_not_burn_session_quota(tmp_path, monkeypatch):
-    """A 503 from queue depth must not count against the session's quota."""
+def test_rejected_by_depth_leaves_no_enqueued_trace(tmp_path, monkeypatch):
+    """A 503 from queue depth must not enqueue anything for the caller."""
     root = _setup(tmp_path, monkeypatch, depth=1, per_session=1)
     with TestClient(main.app) as client:
         t1 = _post(client, "alice").json()["token"]

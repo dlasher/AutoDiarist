@@ -13,8 +13,9 @@ diarization by default. The retired in-process NeMo/torch path is gone; no
 client
   | POST /v1/jobs (multipart audio; extension whitelist wav/mp3/m4a/aac/ogg/flac)
   v
-FastAPI + persistent FIFO job queue on disk
-  JOBS_DIR/<token>/status.json   atomic writes, monotonic `seq` = FIFO order
+FastAPI + persistent fair-share job queue on disk
+  JOBS_DIR/<token>/status.json   atomic writes, monotonic `seq` = arrival order
+  JOBS_DIR/_scheduler.json       round-robin pointer (survives restart)
   JOBS_DIR/<token>/status_journal.jsonl   append-only publish history (stage audit)
   JOBS_DIR/<token>/audio_source.<ext>
   |
@@ -29,7 +30,8 @@ worker stages per job (api/main.py process_job_background):
   speaker self-ID      (pipeline.self_identification, weighted evidence)
   render               (pipeline.renderer -> markdown_report.md)
   v
-GET    /v1/jobs/{token}          -> status (+ queue_position while queued; stage + monotonic progress)
+GET    /v1/jobs                  -> list MY jobs (session-scoped; newest first; ?limit=1..200, default 50; + ETA for queued)
+GET    /v1/jobs/{token}          -> status (+ queue_position and queue-aware ETA while queued; stage + monotonic progress)
 DELETE /v1/jobs/{token}          -> cancel a queued job (409 while processing)
 GET    /v1/jobs/{token}/download -> output_result.json (default) or ?format=md
 ```
@@ -40,7 +42,7 @@ behaves identically, which is what the API integration tests run against.
 
 ## HTTP API
 
-Five endpoints, all under `/v1/jobs`. Base URL in the examples below is the
+Six endpoints, all under `/v1/jobs`. Base URL in the examples below is the
 quickstart default (`http://127.0.0.1:8000`). All error responses use the
 FastAPI envelope `{"detail": "..."}` unless noted. Every status code here is
 implemented in `api/main.py`.
@@ -53,7 +55,7 @@ from the uploaded filename). On success:
 
 ```bash
 curl -sS -F 'file=@audio.wav;type=audio/wav' http://127.0.0.1:8000/v1/jobs
-# -> 202 {"token": "6a7f…uuid4…", "status": "queued"}
+# -> 202 {"token": "6a7f…uuid4…", "status": "queued", "session": "9f2c…uuid4hex…", "queue_position": 1, "estimated_wait_seconds": 1273.5, "estimated_completion_at": "2026-10-21T09:12:33Z"}
 ```
 
 Admission is checked in this order, each with its own failure mode:
@@ -62,11 +64,61 @@ Admission is checked in this order, each with its own failure mode:
 |---|---|---|
 | 415 | extension not whitelisted (checked before the upload touches disk) | `Unsupported file type. Supported: wav, mp3, m4a, aac, ogg, flac` |
 | 413 | upload exceeds `MAX_UPLOAD_BYTES` (enforced while streaming, not after) | `File exceeds maximum size of <bytes> bytes` |
-| 503 | queue at `MAX_QUEUE_DEPTH` (count of `queued` jobs; default 50) | `Queue is full (n/50 jobs queued). Retry later.` + `Retry-After: <RETRY_AFTER_SECONDS>` header (default 30) |
-| 429 | the caller's session already has `MAX_JOBS_PER_SESSION` active jobs (default 2; see *Session identity*) | `Session limit reached: 2/2 active jobs per session (queued+processing). Wait for a job to finish or cancel one.` |
+| 503 | queue at `MAX_QUEUE_DEPTH` (count of `queued` jobs; default 50) — **the only rejection path** (V1.5): a second job from the same session is queued, never turned away | `Queue is full (n/50 jobs queued). Retry after 30s.` + `Retry-After: <RETRY_AFTER_SECONDS>` header (default 30); the detail names both the depth and the Retry-After value |
+
+A request that passes these checks is always accepted with `202` and
+queued: the body carries the `token`, the `session` id, the
+`queue_position` (1-based rank in the **fair-scheduled execution order** at
+admission — see *Fair-share scheduling* below) and the queue-aware wait
+estimate (`estimated_wait_seconds` + `estimated_completion_at`, recomputed
+on every poll — see *Wait estimates* below). `MAX_JOBS_PER_SESSION` is
+deprecated — if set, the service warns at boot and ignores it; the live
+per-session knob is `MAX_PROCESSING_PER_SESSION` (default **1**), which caps
+concurrently `processing` jobs per session.
 
 Rejected uploads leave no trace on disk: the partially streamed job directory
 is deleted before the error is returned.
+
+### GET /v1/jobs — list my jobs
+
+Session-scoped view of what *you* submitted (V1.5): find your own tokens,
+watch progress, and decide what to cancel. Filtered by the same hashed
+session identity admission stamps on every job (see *Session identity*) —
+other sessions' jobs can never appear, and there is deliberately no
+cross-session/admin mode or pagination cursor at this scale.
+
+```bash
+curl -sS -H 'X-Session: user-a' http://127.0.0.1:8000/v1/jobs
+curl -sS -H 'X-Session: user-a' 'http://127.0.0.1:8000/v1/jobs?limit=10'
+```
+
+Answers `200` for every session, including a brand-new one (empty list):
+
+```json
+{"jobs": [{"token": "6a7f…uuid4…", "status": "queued", "progress": 0.0,
+           "stage": "queued", "source": "meeting.wav",
+           "created_at": 1760000000.1, "queue_position": 1,
+           "estimated_wait_seconds": 1273.5,
+           "estimated_completion_at": "2026-10-21T09:12:33Z"}],
+ "count": 1, "total": 1, "limit": 50}
+```
+
+- Every entry carries `token`, `status`, `progress`, `stage`, `source` (the
+  uploaded filename) and `created_at`. `queued` entries add `queue_position`
+  (the same fair-scheduled rank the poll endpoint reports) plus the
+  queue-aware wait estimate `estimated_wait_seconds` /
+  `estimated_completion_at` — the SAME live values `GET /v1/jobs/{token}`
+  reports (see *Wait estimates*; `null` when no honest estimate exists,
+  absent when ETA emission is disabled); `failed` entries
+  add `error`. `cancelled` jobs stay listed — terminal states are still part
+  of "what did I submit".
+- Order: newest-first (`created_at` desc, stable `seq` desc tiebreak).
+- `?limit=` defaults to 50 and clamps to `[1, 200]` — out-of-range values
+  clamp instead of erroring; a non-integer `limit` is `422`. `total` reports
+  the session's job count before truncation so a client can see it was cut.
+- Like `POST`, the response echoes the session identity (`Set-Cookie`, plus
+  the `X-Session` header when the client doesn't manage its own), so an
+  IP-only client can re-list by replaying the minted id.
 
 ### GET /v1/jobs/{token} — poll a job
 
@@ -75,18 +127,40 @@ curl -sS http://127.0.0.1:8000/v1/jobs/$TOKEN
 ```
 
 The response is the job's persisted state. Common to every status: `token`,
-`status`, `stage` (see *Progress stages* below), `seq` (FIFO position at
-admission), `queued_at`, `progress`, `message`, `filename`, plus the
-bookkeeping fields `session` (the hashed session id) and `audio_path`
-(server-local path) — treat those as opaque.
+`status`, `stage` (see *Progress stages* below), `seq` (monotonic admission
+ticket — arrival order), `queued_at`, `progress`, `message`, `filename`,
+`duration_seconds` (the audio length probed at admission; `null` when the
+probe could not read the file), plus the
+bookkeeping fields `session` (hashed session identity), `session_ident`
+(hashed session id, see *Session identity*) and `audio_path` (server-local
+path) — treat those as opaque.
 `status` is one of `queued`, `processing`, `done`, `failed`, `cancelled`:
 
-- `queued` — adds `queue_position`: the job's **1-based rank among currently
-  queued jobs** against the single worker's pickup order; `queue_position: 1`
-  means next.
+- `queued` — adds `queue_position`: the job's **1-based rank in the
+  fair-scheduled execution order** the worker actually follows (see
+  *Fair-share scheduling*), recomputed from the live queue + round-robin
+  pointer on every poll; `queue_position: 1` means next. **Semantic change
+  in V1.5** (card t_4b40acfd): under strict FIFO this field was the raw
+  admission rank, and it never rose while a job stayed queued. With
+  fair-share two things change: a job can sit *behind* a later arrival from
+  a session that has been waiting longer, and a brand-new arrival from a
+  never-served session can jump ahead of it (raising its reported position).
+  What is preserved: jobs of the **same session** never overtake each other
+  (within-session FIFO by `seq`). It also adds the queue-aware wait
+  estimate (see *Wait estimates*): `estimated_wait_seconds` — seconds from
+  *now* until this job's result should exist (the running job's remaining
+  estimate + everything queued ahead in the fair order + this job's own
+  estimate) — and `estimated_completion_at`, the matching UTC wall-clock
+  time (`YYYY-MM-DDTHH:MM:SSZ`). Both are recomputed on every poll, so they
+  track queue movement instantly; both are `null` when no honest estimate
+  exists (this job's duration probe failed at admission), and the fields
+  are omitted entirely when `PROCESSING_SECONDS_PER_AUDIO_SECOND=0`
+  disables ETA emission.
 - `processing` — adds `started_at`; `stage` moves through the pipeline in
   order while `progress` advances monotonically and `message` carries the
-  stage text (e.g. `Claimed by worker`, `Transcribing pass 2/4`).
+  stage text (e.g. `Claimed by worker`, `Transcribing pass 2/4`). The two
+  `estimated_*` fields are present but `null`: a running job is past the
+  queue, so `stage`/`progress` carry the truth instead.
 - `done` — `stage: "done"`, `progress: 1.0`, `message: "Transcription complete."`.
   The result itself is fetched from the download endpoint at
   `/v1/jobs/{token}/download` (the poll payload does not carry a URL field).
@@ -96,6 +170,42 @@ bookkeeping fields `session` (the hashed session id) and `audio_path`
 - `cancelled` — `message: "Cancelled by client while queued"` plus
   `cancelled_at`; `stage`/`progress` freeze at their last published values.
 
+#### Wait estimates (ESTIMATES, never guarantees)
+
+A queued client gets an honest number to decide *wait or cancel* from.
+Reported on the `POST /v1/jobs` 202 body, on every `GET /v1/jobs/{token}`
+poll, and on `queued` entries of the session listing `GET /v1/jobs` — all
+three from the same live queue snapshot, recomputed on each request. The
+model is deliberately simple and fully deterministic:
+
+```
+estimate(job) = duration_seconds(job) x PROCESSING_SECONDS_PER_AUDIO_SECOND
+wait(job@rank k) = remaining(currently processing) + sum(estimates of ranks 1..k-1) + estimate(job)
+```
+
+- `duration_seconds` comes from a cheap ffprobe container-header read at
+  **admission** — never a full decode, and never re-probed when you poll.
+  The job's own run refreshes it once with the decoded-wav truth.
+- The rank walk uses the **fair-scheduled execution order** (round-robin
+  across sessions), i.e. the same order `queue_position` reports, so
+  successive positions get distinct, non-overlapping estimates and the
+  completion times chain: each position finishes exactly its own estimate
+  after the one ahead.
+- The currently-processing job contributes only its **remaining** estimate
+  (linear estimate minus wall time since it was claimed, clamped at 0), and
+  that value only shrinks as the job runs — the ETA never moves because of
+  a timer alone, only when queue members genuinely leave.
+- Each poll recomputes everything from live state, so admissions,
+  cancellations and completions are reflected with no client hint.
+
+What it ignores: diarization variance, chunk overhead, VRAM contention, and
+the fixed per-run startup cost — short files land worst (the measured T400
+long-file asymptote is 0.185 s/audio-s; a 1-min file adds ~55 s of fixed
+cost the linear model does not see). Observed wall time can and will
+differ: treat the numbers as a planning estimate, **not a service-level
+guarantee**. A job whose own duration probe failed shows `null` — the API
+never fabricates a duration for the job you are asking about.
+
 #### Progress stages
 
 `stage` is the machine-readable pipeline position — a stable enum, in order
@@ -103,7 +213,7 @@ of first appearance:
 
 | Stage | Meaning | Progress band |
 |-------|---------|---------------|
-| `queued` | waiting in the FIFO queue (briefly also when a worker claims the job before decode starts) | 0.00 |
+| `queued` | waiting in the fair-share queue (briefly also when a worker claims the job before decode starts) | 0.00 |
 | `decoding` | audio decode / resample to 16 kHz | 0.05 |
 | `transcribing` | ASR passes; engine-reported pass/chunk counts refine within the band (e.g. `Transcribing pass 2/4`) | 0.30–0.60 |
 | `diarizing` | diarized assembly, likewise refined per reported boundary | 0.60–0.75 |
@@ -166,18 +276,50 @@ yet` — GPU concurrency is 1 and the pipeline is mid-card in v1); `done` and
 
 The queue lives entirely on disk under `JOBS_DIR`: one directory per token
 holding `status.json` (written atomically via temp-file rename) and the
-uploaded `audio_source.wav`. Admission assigns `seq = max(existing seq) + 1`
-under a lock, so `seq` is a monotonic FIFO order — this is exactly the order
-the single in-process worker (`GPU concurrency = 1`, `QUEUE_WORKER_ENABLED=1`)
-claims jobs in, and exactly what `queue_position` reports. `queued` and
+uploaded `audio_source.wav`, plus a single `JOBS_DIR/_scheduler.json` round-robin
+pointer. Admission assigns `seq = max(existing seq) + 1`
+under a lock, so `seq` is a monotonic arrival ticket — inside one session it
+is exactly the execution order (within-session FIFO). Across sessions the
+worker does **not** follow raw seq: it serves sessions round-robin
+(*Fair-share scheduling* below), and `queue_position` reports ranks in that
+fair order. `queued` and
 `processing` jobs count against limits; each job's `session` id is persisted
 alongside it.
 
 **Restart behavior:** the queue is rebuilt by scanning `JOBS_DIR`, so a
 restart (crash or redeploy) does not lose queued work. A job caught
 mid-`processing` is requeued on boot with its `seq` intact (message:
-`Requeued after service restart`) and re-runs from the start — FIFO order is
-preserved across restarts.
+`Requeued after service restart`) and re-runs from the start — per-session
+FIFO order is preserved across restarts. The round-robin pointer is a file
+under `JOBS_DIR` too, so a restarted service continues the same fairness
+round instead of letting an established submitter re-jump ahead of a session
+that has not been served yet.
+
+#### Fair-share scheduling (V1.5, card t_4b40acfd)
+
+The GPU is a shared resource, so one session submitting many jobs must not
+starve another that submitted one. Selection at claim time:
+
+- Each session gets a FIFO sub-queue (ordered by `seq`); the worker serves
+  the session **whose turn is longest overdue** — tracked as a global
+  `serve_counter` and a per-session `last_served` stamp in
+  `_scheduler.json`. Never-served sessions count as overdue-0, so a fresh
+  session always gets a turn before an established one is served twice.
+  Ties break by earliest sub-queue head (`seq`), then session key — fully
+  deterministic, which is what lets `queue_position` predict the worker's
+  real pickup order.
+- `MAX_PROCESSING_PER_SESSION` (default **1**) caps how many jobs of one
+  session may be `processing` concurrently. A session at the cap is skipped
+  at claim time even when its jobs sit at the head of the queue; its work
+  simply stays queued. The cap is enforced by the **scheduler itself**, not
+  by the single-worker setup, so fairness and the "never two in-flight jobs
+  of one session" guarantee survive a future multi-worker scale-up. Values
+  `< 1` or unparseable warn and clamp to 1 (a zero cap would freeze the
+  queue).
+- Deferred by the maintainer, deliberately out of scope: duration/size-aware
+  priority and preemption of a running job. Fairness applies at selection
+  only — a long job holds the GPU to its end, then the overdue session gets
+  the next turn.
 
 **Retention:** `RETENTION_DAYS` (default **30**) is live. Finished jobs
 (`done`/`failed`/`cancelled`) whose `status.json` mtime is older than the
@@ -191,19 +333,36 @@ never evicted — checked at boot and every `DISK_CHECK_INTERVAL_SECONDS`
 
 ### Session identity
 
-`MAX_JOBS_PER_SESSION` is enforced per *session*, resolved for every request
-in this order (then hashed, sha256 → first 32 hex chars, so no raw token or
-IP is ever stored on disk):
+Every client is tracked as a *session*. On first contact the server issues a
+random high-entropy session id (uuid4 hex) and returns it **both** as the
+`autodiarist_session` cookie (HttpOnly, SameSite=Lax) **and** as the `session`
+field of the `POST /v1/jobs` body — so raw API clients can capture the id
+without a cookie jar and send it back themselves. The server keeps no session
+table: the id lives on the client, and identity is always derived from what
+the client presents, in this order (then hashed, sha256 → first 32 hex chars,
+so no raw id, token or IP is ever stored on disk):
 
-1. the value of the session header — `Authorization` by default, override
-   with `SESSION_HEADER` (e.g. `-H 'Authorization: Bearer alice'` gives
-   `alice` a stable quota across IP changes);
-2. the client IP when no such header is present (`request.client.host`);
-3. an anonymous bucket when neither is available.
+1. the value of the session header — `X-Session` by default, override with
+   `SESSION_HEADER` (e.g. `-H 'X-Session: alice'`; with
+   `SESSION_HEADER=Authorization`, `-H 'Authorization: Bearer ***'`
+   works as before and gives `alice` a stable identity across IP changes);
+2. the server-issued `autodiarist_session` cookie (name overridable via
+   `SESSION_COOKIE_NAME`; a browser sends it back automatically, a curl
+   client can with `-c jar -b jar`);
+3. the client IP when neither header nor cookie is present (`request.client.host`);
+4. an anonymous bucket when neither is available.
+
+Each accepted job persists two digests in its state: `session` (the identity
+above; since V1.5 it no longer gates admission — `MAX_JOBS_PER_SESSION` is
+deprecated and ignored) and the dedicated `session_ident`
+key (the hash of the session id itself — including the one issued on the very
+first contact — so the scheduler and job listing can group by person rather
+than by IP).
 
 A slot frees when the job reaches `done`, `failed`, or `cancelled`. Behind a
 reverse proxy that replaces the peer address, all clients share one IP
-bucket — set a real session header in that deployment.
+bucket until a cookie or session header flows — set a real `SESSION_HEADER`
+or trust the issued cookie in that deployment.
 
 ## Quickstart (GPU host, Docker)
 
