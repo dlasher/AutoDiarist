@@ -120,6 +120,12 @@ def test_dockerfile_bakes_sherpa_diarization_stack_backend_independent() -> None
     # wrapper installed at exactly the SHERPA_BIN default (compose + ENV)
     assert "COPY scripts/sherpa-diarization-wrapper.sh /opt/sherpa/sherpa-diarization-wrapper" in dockerfile
     assert "chmod +x /opt/sherpa/sherpa-diarization-wrapper" in dockerfile
+    # build-time wrapper self-check (planner review 3): proves LD_LIBRARY_PATH
+    # resolution and the injected flag against the vendored CLI at build time
+    assert "/opt/sherpa/sherpa-diarization-wrapper --help" in dockerfile
+    assert "clustering.cluster-threshold" in dockerfile
+    # include/ cleanup targets the extraction dir, not /tmp (planner review 1)
+    assert "rm -rf /opt/sherpa/include" in dockerfile
     assert "SHERPA_BIN=/opt/sherpa/sherpa-diarization-wrapper" in dockerfile
     assert "SHERPA_CLUSTER_THRESHOLD=0.40" in dockerfile
     # AC5: the diarization layers run on CPU onnxruntime -- they must not

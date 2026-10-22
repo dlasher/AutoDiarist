@@ -124,8 +124,10 @@ RUN mkdir -p /opt/models \
 # BACKEND-INDEPENDENT ON PURPOSE: sherpa-onnx runs clustering on CPU
 # (onnxruntime provider=cpu), so the CUDA and Vulkan images built from this
 # Dockerfile carry the SAME model files and the SAME DIAR_METHOD default
-# (AC5). Packaging card t_f82ad22a folds the engine tarball into a
-# GPU_BACKEND build arg; nothing in these layers may depend on it.
+# (AC5). There is no GPU_BACKEND build ARG in this Dockerfile yet -- card
+# t_f82ad22a (packaging) will introduce one for the ENGINE tarball; these
+# layers must not come to depend on that arg, so they reference no CUDA
+# asset at all.
 #
 # (1) sherpa-onnx CLI + shared libs. The crispasr engine shells out to
 #     sherpa-onnx-offline-speaker-diarization for --diarize-method
@@ -138,7 +140,7 @@ RUN curl -fsSL -o /tmp/sherpa.tar.bz2 \
     && echo "c0bdb7907d3a74bba1d55d22bf4d9fa75586cf1530614ebe88a27b9118e015c4  /tmp/sherpa.tar.bz2" | sha256sum -c - \
     && mkdir -p /opt/sherpa \
     && tar -xjf /tmp/sherpa.tar.bz2 -C /opt/sherpa --strip-components=1 \
-    && rm -rf /tmp/sherpa/include /tmp/sherpa.tar.bz2
+    && rm -rf /opt/sherpa/include /tmp/sherpa.tar.bz2
 
 # (2) The two diarization ONNX models (k2-fsa/sherpa-onnx release assets;
 #     filenames as advertised by crispasr --help: "Download them from
@@ -167,6 +169,18 @@ RUN curl -fsSL -o /tmp/reverb.tar.bz2 \
 COPY scripts/sherpa-diarization-wrapper.sh /opt/sherpa/sherpa-diarization-wrapper
 RUN chmod +x /opt/sherpa/sherpa-diarization-wrapper \
     && ls -l /opt/sherpa/bin/sherpa-onnx-offline-speaker-diarization
+
+# Build-time self-check: the sherpa CLI is dynamically linked against
+# libonnxruntime.so, so a wrong LD_LIBRARY_PATH resolves only at exec
+# time (a runtime failure per job, far from its cause). Running the
+# wrapper's --help here proves, at BUILD time, that (a) SHERPA_REAL
+# resolves, (b) /opt/sherpa/lib is picked up by the wrapper's
+# prepend (no "error while loading shared libraries"), and (c) the
+# --clustering.cluster-threshold flag the wrapper injects actually
+# exists in the vendored CLI version. Verified by hand on the NV host
+# against the staged v1.13.8 assets 2026-10-22 (rc=0, flag listed).
+RUN sh -c '/opt/sherpa/sherpa-diarization-wrapper --help 2>&1 \
+        | grep -q "clustering.cluster-threshold"'
 
 # API service itself.
 COPY --from=builder /wheels /wheels
