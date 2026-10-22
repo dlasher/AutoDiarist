@@ -30,8 +30,8 @@ worker stages per job (api/main.py process_job_background):
   speaker self-ID      (pipeline.self_identification, weighted evidence)
   render               (pipeline.renderer -> markdown_report.md)
   v
-GET    /v1/jobs                  -> list MY jobs (session-scoped; newest first; ?limit=1..200, default 50)
-GET    /v1/jobs/{token}          -> status (+ queue_position while queued; stage + monotonic progress)
+GET    /v1/jobs                  -> list MY jobs (session-scoped; newest first; ?limit=1..200, default 50; + ETA for queued)
+GET    /v1/jobs/{token}          -> status (+ queue_position and queue-aware ETA while queued; stage + monotonic progress)
 DELETE /v1/jobs/{token}          -> cancel a queued job (409 while processing)
 GET    /v1/jobs/{token}/download -> output_result.json (default) or ?format=md
 ```
@@ -55,7 +55,7 @@ from the uploaded filename). On success:
 
 ```bash
 curl -sS -F 'file=@audio.wav;type=audio/wav' http://127.0.0.1:8000/v1/jobs
-# -> 202 {"token": "6a7f…uuid4…", "status": "queued", "session": "9f2c…uuid4hex…", "queue_position": 1}
+# -> 202 {"token": "6a7f…uuid4…", "status": "queued", "session": "9f2c…uuid4hex…", "queue_position": 1, "estimated_wait_seconds": 1273.5, "estimated_completion_at": "2026-10-21T09:12:33Z"}
 ```
 
 Admission is checked in this order, each with its own failure mode:
@@ -67,9 +67,11 @@ Admission is checked in this order, each with its own failure mode:
 | 503 | queue at `MAX_QUEUE_DEPTH` (count of `queued` jobs; default 50) — **the only rejection path** (V1.5): a second job from the same session is queued, never turned away | `Queue is full (n/50 jobs queued). Retry after 30s.` + `Retry-After: <RETRY_AFTER_SECONDS>` header (default 30); the detail names both the depth and the Retry-After value |
 
 A request that passes these checks is always accepted with `202` and
-queued: the body carries the `token`, the `session` id and the
+queued: the body carries the `token`, the `session` id, the
 `queue_position` (1-based rank in the **fair-scheduled execution order** at
-admission — see *Fair-share scheduling* below). `MAX_JOBS_PER_SESSION` is
+admission — see *Fair-share scheduling* below) and the queue-aware wait
+estimate (`estimated_wait_seconds` + `estimated_completion_at`, recomputed
+on every poll — see *Wait estimates* below). `MAX_JOBS_PER_SESSION` is
 deprecated — if set, the service warns at boot and ignores it; the live
 per-session knob is `MAX_PROCESSING_PER_SESSION` (default **1**), which caps
 concurrently `processing` jobs per session.
@@ -95,13 +97,19 @@ Answers `200` for every session, including a brand-new one (empty list):
 ```json
 {"jobs": [{"token": "6a7f…uuid4…", "status": "queued", "progress": 0.0,
            "stage": "queued", "source": "meeting.wav",
-           "created_at": 1760000000.1, "queue_position": 1}],
+           "created_at": 1760000000.1, "queue_position": 1,
+           "estimated_wait_seconds": 1273.5,
+           "estimated_completion_at": "2026-10-21T09:12:33Z"}],
  "count": 1, "total": 1, "limit": 50}
 ```
 
 - Every entry carries `token`, `status`, `progress`, `stage`, `source` (the
   uploaded filename) and `created_at`. `queued` entries add `queue_position`
-  (the same fair-scheduled rank the poll endpoint reports); `failed` entries
+  (the same fair-scheduled rank the poll endpoint reports) plus the
+  queue-aware wait estimate `estimated_wait_seconds` /
+  `estimated_completion_at` — the SAME live values `GET /v1/jobs/{token}`
+  reports (see *Wait estimates*; `null` when no honest estimate exists,
+  absent when ETA emission is disabled); `failed` entries
   add `error`. `cancelled` jobs stay listed — terminal states are still part
   of "what did I submit".
 - Order: newest-first (`created_at` desc, stable `seq` desc tiebreak).
@@ -120,7 +128,9 @@ curl -sS http://127.0.0.1:8000/v1/jobs/$TOKEN
 
 The response is the job's persisted state. Common to every status: `token`,
 `status`, `stage` (see *Progress stages* below), `seq` (monotonic admission
-ticket — arrival order), `queued_at`, `progress`, `message`, `filename`, plus the
+ticket — arrival order), `queued_at`, `progress`, `message`, `filename`,
+`duration_seconds` (the audio length probed at admission; `null` when the
+probe could not read the file), plus the
 bookkeeping fields `session` (hashed session identity), `session_ident`
 (hashed session id, see *Session identity*) and `audio_path` (server-local
 path) — treat those as opaque.
@@ -136,10 +146,21 @@ path) — treat those as opaque.
   a session that has been waiting longer, and a brand-new arrival from a
   never-served session can jump ahead of it (raising its reported position).
   What is preserved: jobs of the **same session** never overtake each other
-  (within-session FIFO by `seq`).
+  (within-session FIFO by `seq`). It also adds the queue-aware wait
+  estimate (see *Wait estimates*): `estimated_wait_seconds` — seconds from
+  *now* until this job's result should exist (the running job's remaining
+  estimate + everything queued ahead in the fair order + this job's own
+  estimate) — and `estimated_completion_at`, the matching UTC wall-clock
+  time (`YYYY-MM-DDTHH:MM:SSZ`). Both are recomputed on every poll, so they
+  track queue movement instantly; both are `null` when no honest estimate
+  exists (this job's duration probe failed at admission), and the fields
+  are omitted entirely when `PROCESSING_SECONDS_PER_AUDIO_SECOND=0`
+  disables ETA emission.
 - `processing` — adds `started_at`; `stage` moves through the pipeline in
   order while `progress` advances monotonically and `message` carries the
-  stage text (e.g. `Claimed by worker`, `Transcribing pass 2/4`).
+  stage text (e.g. `Claimed by worker`, `Transcribing pass 2/4`). The two
+  `estimated_*` fields are present but `null`: a running job is past the
+  queue, so `stage`/`progress` carry the truth instead.
 - `done` — `stage: "done"`, `progress: 1.0`, `message: "Transcription complete."`.
   The result itself is fetched from the download endpoint at
   `/v1/jobs/{token}/download` (the poll payload does not carry a URL field).
@@ -148,6 +169,42 @@ path) — treat those as opaque.
   `error` (the exception message from the worker).
 - `cancelled` — `message: "Cancelled by client while queued"` plus
   `cancelled_at`; `stage`/`progress` freeze at their last published values.
+
+#### Wait estimates (ESTIMATES, never guarantees)
+
+A queued client gets an honest number to decide *wait or cancel* from.
+Reported on the `POST /v1/jobs` 202 body, on every `GET /v1/jobs/{token}`
+poll, and on `queued` entries of the session listing `GET /v1/jobs` — all
+three from the same live queue snapshot, recomputed on each request. The
+model is deliberately simple and fully deterministic:
+
+```
+estimate(job) = duration_seconds(job) x PROCESSING_SECONDS_PER_AUDIO_SECOND
+wait(job@rank k) = remaining(currently processing) + sum(estimates of ranks 1..k-1) + estimate(job)
+```
+
+- `duration_seconds` comes from a cheap ffprobe container-header read at
+  **admission** — never a full decode, and never re-probed when you poll.
+  The job's own run refreshes it once with the decoded-wav truth.
+- The rank walk uses the **fair-scheduled execution order** (round-robin
+  across sessions), i.e. the same order `queue_position` reports, so
+  successive positions get distinct, non-overlapping estimates and the
+  completion times chain: each position finishes exactly its own estimate
+  after the one ahead.
+- The currently-processing job contributes only its **remaining** estimate
+  (linear estimate minus wall time since it was claimed, clamped at 0), and
+  that value only shrinks as the job runs — the ETA never moves because of
+  a timer alone, only when queue members genuinely leave.
+- Each poll recomputes everything from live state, so admissions,
+  cancellations and completions are reflected with no client hint.
+
+What it ignores: diarization variance, chunk overhead, VRAM contention, and
+the fixed per-run startup cost — short files land worst (the measured T400
+long-file asymptote is 0.185 s/audio-s; a 1-min file adds ~55 s of fixed
+cost the linear model does not see). Observed wall time can and will
+differ: treat the numbers as a planning estimate, **not a service-level
+guarantee**. A job whose own duration probe failed shows `null` — the API
+never fabricates a duration for the job you are asking about.
 
 #### Progress stages
 

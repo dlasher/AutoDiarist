@@ -30,6 +30,56 @@ its own tokens first.
 - Tests: 9 new acceptance tests (`tests/api/test_jobs_listing.py`); full
   suite 254 green. README documents the endpoint; CONFIG.md unchanged.
 
+## [Unreleased] — V1.5 honest wait estimate: duration probe + queue-aware ETA (card t_b3ae9366)
+
+Building on fair-share scheduling (card t_4b40acfd): a queued client can now
+decide *wait or cancel* from an honest number instead of a bare position.
+
+- **Duration probe at admission.** `POST /v1/jobs` runs a cheap ffprobe
+  container-header read (no decode) on the stored upload and persists the
+  result as `duration_seconds` in the job state; a failed probe stores
+  `null` (unknown — never a fabricated 0). The job's own run refreshes the
+  value once from the decoded 16k wav. Polls NEVER re-probe and never read
+  the audio file.
+- **`PROCESSING_SECONDS_PER_AUDIO_SECOND` (default `0.185`).** The linear
+  model rate (GPU seconds per audio-second). The default is documented at
+  its source — measured on the T400 rig: 39-min audio ran 423–434 s wall on
+  CUDA — and is hardware-specific; CONFIG.md gives the re-derivation
+  procedure. Exact `0` disables ETA emission; negative/non-numeric warn at
+  boot and fall back to the default (also in the boot config summary as
+  `eta_rate=... eta=on|OFF`). `AUDIO_DURATION_FALLBACK_SECONDS` (default
+  `300`) substitutes for queue members AHEAD whose probe failed, so one
+  unprobeable file cannot poison the tail.
+- **Queue-aware ETA on every session surface.** Queued jobs carry
+  `estimated_wait_seconds` (seconds from now until the RESULT should exist:
+  the running job's remaining estimate + every fair-order job ahead + own
+  estimate) and `estimated_completion_at` (`YYYY-MM-DDTHH:MM:SSZ`) — on the
+  202 admission body, on every `GET /v1/jobs/{token}` poll, and on every
+  `queued` entry of the session job listing `GET /v1/jobs` (one shared
+  queue snapshot, so the surfaces cannot disagree). Positions
+  get distinct, non-overlapping estimates by the prefix-sum construction;
+  completion times chain (each position finishes exactly its own estimate
+  after the one ahead). Polling alone keeps the estimate current across
+  admissions, cancellations and completions — everything recomputes from
+  live state in the fair execution order, and the processing job's
+  remaining share shrinks monotonically with elapsed time (negatives
+  clamp to 0).
+- **Honesty contract.** The fields are explicitly ESTIMATES from a linear
+  model: diarization variance, chunk overhead and fixed startup cost are
+  not modeled and observed wall time can and will differ; a `processing`
+  job returns the fields as `null` (stage/progress carry the truth), a
+  finished job omits them, and a queued job with unknown own duration gets
+  no estimate rather than a fabricated one.
+
+Tests: `tests/api/test_wait_estimate.py` (30, CPU-only, no real audio — the
+probe is stubbed where needed): empty-queue estimate, N-jobs-ahead prefix
+sums, fair-order (not admission-order) ranks, decrease as jobs ahead
+complete/cancel, explicit nulls while processing, negative clamps, no
+re-probe at request time, rate validation (0 disables, invalid warns), and
+the 202/poll/listing HTTP surfaces (listing entries agree with the poll
+endpoint by construction). Full suite green: 284 passed (stacked on
+card t_f97d12a8's listing branch).
+
 ## [Unreleased] — V1.5 fair-share scheduling: round-robin per session + processing cap (card t_4b40acfd)
 
 Building on accept-and-queue admission (card t_82bfbc15): the shared GPU is
