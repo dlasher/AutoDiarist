@@ -28,6 +28,23 @@ section. New API surface: `GET /v1/jobs` session listing (t_f97d12a8),
 on the 202, every poll and queued listing entries (t_b3ae9366), and the
 `session` field + session cookie on `POST` responses (t_920fb7dc).
 
+**Known limitations (accepted by maintainer ruling, release card
+t_f41ad4f2 — no hotfix card for 1.5.0):**
+
+- **Job-artifact authorization is by token possession.** Session identity
+  gates *listing*; it does not gate per-job operations. A
+  `DELETE /v1/jobs/{token}` (or status/download GET) carrying a valid job
+  token is honored even when it comes from a different session — live
+  observation on the canonical `:8000` deployment: session A's DELETE of
+  session B's job token returned 202 and the job was cancelled
+  (`Cancelled by client while queued`). This is unchanged, deliberate
+  behavior from the identity card (t_920fb7dc), which explicitly scoped
+  itself to session issuance/precedence/listing and declared per-job
+  authorization out of scope; no wave card implemented session-authz on
+  the job endpoints. Release-card AC(e) is amended accordingly: own-cancel
+  evidence is `202` → `cancelled`, and the cross-session DELETE is
+  recorded as this known limitation.
+
 ### V1.5 session-scoped job listing: GET /v1/jobs (card t_f97d12a8)
 
 Building on session identity (card t_920fb7dc) and accept-and-queue admission
