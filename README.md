@@ -366,17 +366,43 @@ or trust the issued cookie in that deployment.
 
 ## Quickstart (GPU host, Docker)
 
-Prerequisites: Docker with the NVIDIA container toolkit and a CUDA 13-era
-host driver. The reference GPU is the NVIDIA T400 4GB (Turing, compute
-capability 7.5) on which the pinned engine build's real `sm_75` kernels were
-validated during the spike; other architectures were not the release target.
+One repo, one Dockerfile, two compose files. **You know your hardware —
+pick the compose file that matches it. `docker compose up` is the entire
+activation: no file edits, no `.env` creation, nothing else required**
+(packaging contract, card t_f82ad22a).
+
+NVIDIA CUDA host (reference GPU: T400 4GB, Turing CC 7.5, validated
+`sm_75` kernels; prerequisites: Docker with the NVIDIA container toolkit
+and a CUDA-13-era host driver):
 
 ```bash
 git clone https://github.com/dlasher/AutoDiarist.git autodiarist
 cd autodiarist
-cp .env.example .env
 docker compose up --build
 ```
+
+AMD/Vulkan host (reference GPU: RX 6600, gfx11; Mesa **RADV** hardware
+Vulkan on amdgpu — no ROCm stack needed; prerequisites: loaded `amdgpu`
+driver exposing `/dev/dri` + `/dev/kfd`, docker without any GPU runtime
+plugin):
+
+```bash
+git clone https://github.com/dlasher/AutoDiarist.git autodiarist
+cd autodiarist
+sudo bash scripts/vulkan-host-setup.sh --persist
+docker compose -f docker-compose.amd.yml up --build
+```
+
+`vulkan-host-setup.sh` is the ONE host-side step, and only for device
+permission: it grants the image's `app` user (uid 10001) rw access to
+`/dev/kfd` and `/dev/dri/*` via `setfacl` (primary), or node mode 0666
+with a loud note if `setfacl` is missing (fallback), and with
+`--persist` installs a udev rule so it survives reboots. Idempotent. The
+compose file itself is static — host gids never enter any tracked file.
+This replaces `~/CODE/HERMES-PATTERNS/amd-bringup.sh`: that script
+GENERATED its own Dockerfile.amd + compose with `DIAR_METHOD=foxnose`
+and no sherpa stack, silently regressing the diarization fix — do not
+run it anymore (see "AMD/Vulkan bring-up gotchas" below).
 
 In another terminal (see *Test fixture* below — `audio.wav` is not tracked
 in this repo):
@@ -393,11 +419,16 @@ curl -sS http://127.0.0.1:8000/v1/jobs/$TOKEN
 curl -sS "http://127.0.0.1:8000/v1/jobs/$TOKEN/download?format=md" -o transcript.md
 ```
 
-The compose file pins the backend contract (`CRISPASR_GPU_BACKEND=cuda`,
-`DIAR_METHOD=sherpa`, `VRAM_LIMIT_MIB=3584`, `CRISPASR_TIMEOUT_SECONDS=1800`)
-and persists the engine embedder cache (`crispasr-cache:/var/cache/crispasr`)
-and job state (`jobs-data:/data/jobs`). `HOST_PORT` (default 8000) remaps the
-published port.
+Both compose files pin the same app contract (`DIAR_METHOD=sherpa`, the
+baked sherpa-onnx CLI + both ONNX models, `CRISPASR_TIMEOUT_SECONDS=1800`,
+retention/disk defaults from `api/main.py`) and the same non-root `app`
+user; they differ ONLY in hardware: backend literal (`cuda` | `vulkan`
+pinned literals — never env defaults that could silently CPU-fall-back),
+the GPU_BACKEND build arg (engine asset + runtime libs layer), device
+access (nvidia `deploy.resources` reservation | `/dev/dri` + `/dev/kfd`
+devices), and the VRAM ceiling (3584 MiB for the 4 GB T400, 7168 MiB for
+the 8 GB RX 6600). State persists in named volumes (`crispasr-cache:/var/cache/crispasr`,
+`jobs-data:/data/jobs`); `HOST_PORT` (default 8000) remaps the published port.
 
 ## Diarization models (card t_5a287979)
 
@@ -554,29 +585,73 @@ passes `-l en-US` (overridable via `CRISPASR_LANGUAGE` for local per-locale
 experimentation) and the rendered metadata table reports `en-US`. No
 `language` request parameter is accepted.
 
+### AMD/Vulkan bring-up gotchas (card t_f82ad22a)
+
+The AMD host (10.4.10.55) is a live bring-up target, and the old
+operator flow (`~/CODE/HERMES-PATTERNS/amd-bringup.sh`) hit two traps
+that the in-repo pack closes structurally. Keep them in mind if you
+bring up another AMD box:
+
+1. **Two entrypoints.** The generated `Dockerfile.amd` carried its own
+   `/usr/local/bin/entrypoint.sh` CMD while the repo Dockerfile launched
+   uvicorn through an inline `CMD ["sh", "-c", ...]` — two competing
+   startup definitions, only one of which did Vulkan ICD selection, and
+   drift between them was guaranteed. The pack now has exactly ONE
+   entrypoint (`scripts/docker-entrypoint.sh`, baked via `ENTRYPOINT`),
+   shared by both hardware targets: it exports `VK_ICD_FILENAMES` to the
+   single `*radeon*|*amdgpu*` ICD found in `/usr/share/vulkan/icd.d/`
+   and execs uvicorn. Selecting ALL ICD jsons there made the engine die
+   at init with `vulkan:11` (`VK_ERROR_INITIALIZATION_FAILED`) — the
+   restricted glob is the fix, and it no-ops on the CUDA image.
+2. **The `video` group is NOT the group you need.** On this host class
+   the *card* node `/dev/dri/cardN` and the *render* node
+   `/dev/dri/renderD*` are owned by DIFFERENT groups, and which is
+   `video` vs `render` varies by driver stack and kernel — so any
+   hardcoded gid/group (the old flow's `group_add: [video, render]` +
+   `HOST_VIDEO_GID` build args) is wrong on at least one host. Device
+   gids are host state, and compose cannot interpolate `group_add` from
+   `.env` anyway. The pack's answer: grant **uid 10001 directly**
+   (`setfacl -m u:10001:rw`, run by `scripts/vulkan-host-setup.sh`,
+   `--persist` installs the udev rule), with mode-0666 as the loud
+   fallback; the tracked compose file contains NO host-specific value
+   of any kind.
+
+`amd-bringup.sh` must not be used to rebuild this service anymore: its
+generated image predates card t_5a287979 (no sherpa stack,
+`DIAR_METHOD=foxnose`) and a rebuild through it silently regresses
+multi-speaker diarization to one label. Its job is now: `git pull`, then
+`docker compose -f docker-compose.amd.yml up --build`.
+
 ## Other backends
 
-The image pins the `cuda13` Linux release asset, but the engine itself
-carries a wider build matrix. The authoritative source for per-asset
-detail is upstream: CrispASR
+The image pins the `cuda13` Linux release asset on the CUDA target (the
+Dockerfile's `GPU_BACKEND=cuda` default) and the `vulkan` asset on the
+AMD target (`GPU_BACKEND=vulkan`, `docker-compose.amd.yml`), but the
+engine itself carries a wider build matrix. The authoritative source for
+per-asset detail is upstream: CrispASR
 [docs/install.md](https://github.com/CrispStrobe/CrispASR/blob/main/docs/install.md)
 ("Prebuilt Linux tarballs") and
 [docs/environment-variables.md](https://github.com/CrispStrobe/CrispASR/blob/main/docs/environment-variables.md).
-**Aside from the CPU execution path (measured below), no row under `cuda13`
-is verified by this project** — the only hardware we have here is NVIDIA, so
-the remaining non-CUDA paths are documented as upstream facts for reference,
-not as supported deployments of this service. The
-adapter additionally accepts only `cpu`/`cuda`/`metal`/`vulkan` for
-`CRISPASR_GPU_BACKEND` (CONFIG.md); there is no supported engine path here
-for HIP, WASM, or CANN at all. **Diarization parity (card t_5a287979,
+**Aside from the CPU execution path (measured below), no further row
+under `cuda13` is verified by this project.** The AMD/Vulkan target is
+**packaged in-repo (card t_f82ad22a)** — base `ubuntu:24.04` +
+`libvulkan1` + `mesa-vulkan-drivers` (Mesa RADV on amdgpu, no ROCm), the
+sha-pinned vulkan engine asset, `/dev/dri` + `/dev/kfd` — built on the
+GPU path proven live on the AMD host (10.4.10.55) by the old
+`amd-bringup.sh` bring-up; run the Quickstart's AMD block on the host for
+the zero-edit contract proof. HIP, WASM, and CANN remain unsupported: the
+adapter accepts only `cpu`/`cuda`/`metal`/`vulkan` for
+`CRISPASR_GPU_BACKEND` (CONFIG.md). **Diarization parity (card t_5a287979,
 AC5):** the sherpa-onnx CLI, its shared libraries, and both diarization
 ONNX models live in backend-independent Dockerfile layers (sherpa-onnx
 clustering runs on CPU onnxruntime — see "Diarization models"), so the
 CUDA and Vulkan images carry the SAME model files and the SAME default
-`DIAR_METHOD=sherpa`. Operator details for the unverified rows —
-per-row URLs, prerequisites, selection flags, a container-asset-swap
-recipe, and a "convert a row to verified" checklist — follow in the
-subsections below the measured-CPU material.
+`DIAR_METHOD=sherpa` — literally the same instructions, since t_f82ad22a
+unified the pack into ONE Dockerfile (asserted by
+tests/test_docker_packaging.py). Operator details for the remaining
+unverified rows — per-row URLs, prerequisites, selection flags, a
+container-asset-swap recipe, and a "convert a row to verified" checklist
+— follow in the subsections below the measured-CPU material.
 
 | Engine path (v0.8.43 asset) | Prerequisites | Selection flag | Differences that matter operationally | Verified here? |
 | --- | --- | --- | --- | --- |
@@ -586,7 +661,7 @@ subsections below the measured-CPU material.
 | `crispasr-linux-x86_64.tar.gz` (plain) | none (CPU-only build); AVX2 baseline — "it fails fast with an explanatory error on older CPUs since #380/#405" (upstream install.md) | plain binary; `--gpu-backend cpu` | CPU-only standalone asset; the asset GitHub-release installers default to | no — NOT verified on this project's hardware (as a separate asset) |
 | `crispasr-linux-x86_64-cpu-legacy.tar.gz` | none (CPU-only); generic x86-64/SSE2 baseline (upstream install.md table) | `--gpu-backend cpu` | CPU-only; targets pre-AVX2 hosts | no — NOT verified on this project's hardware (as a separate asset) |
 | `crispasr-linux-x86_64-avx512.tar.gz` | none (CPU-only); AVX-512-capable CPU (upstream install.md table) | `--gpu-backend cpu` | CPU-only; AVX-512 vectorized build | no — NOT verified on this project's hardware (as a separate asset) |
-| `crispasr-linux-x86_64-vulkan.tar.gz` | Vulkan-capable GPU plus its vendor ICD/runtime — upstream: the tarball "require[s] their respective runtimes at link time (no CPU fallback)" | `--gpu-backend vulkan` (+ `-dev N` to pick the device); service-side `CRISPASR_GPU_BACKEND=vulkan` is an accepted value | statically linked: **no** CPU fallback — fails loudly without the runtime | no — NOT verified on this project's hardware |
+| `crispasr-linux-x86_64-vulkan.tar.gz` | Vulkan-capable GPU plus its vendor ICD/runtime — upstream: the tarball "require[s] their respective runtimes at link time (no CPU fallback)" | **packaged AMD target (t_f82ad22a):** built via `docker-compose.amd.yml` (`GPU_BACKEND=vulkan` + `CRISPASR_GPU_BACKEND: vulkan` pinned literal, `--gpu-backend vulkan` at the engine; `-dev N` picks the device) | statically linked: **no** CPU fallback — fails loudly without the runtime; entrypoint pins the RADV/amdgpu ICD | GPU path proven on 10.4.10.55 via amd-bringup v3; zero-edit compose contract runs on the host per the AMD Quickstart |
 | `crispasr-linux-x86_64-hip.tar.gz` | AMD GPU + ROCm runtime (same upstream sentence as Vulkan) | the asset *is* the ROCm build; upstream documents no `--gpu-backend hip` example — and there is **no service-side path**: `CRISPASR_GPU_BACKEND` accepts only `cuda`/`cpu`/`metal`/`vulkan` (CONFIG.md) | statically linked: **no** CPU fallback | no — NOT verified on this project's hardware |
 | Metal — `-DGGML_METAL=ON` source build on macOS/Apple Silicon (the v0.8.43 page also carries `crispasr-macos-arm64.tar.gz`; never opened here) | macOS on Apple Silicon (upstream marks `-DGGML_METAL=ON` as the Apple Silicon flag) | `--gpu-backend metal`; service-side `CRISPASR_GPU_BACKEND=metal` is accepted for the pip-install dev path, not the Linux container | there is no Metal release asset for Linux at all — this project's image is Linux | no — NOT verified on this project's hardware |
 | WASM — `crispasr-wasm.tar.gz` (prebuilt) or `build-wasm.sh` source build | browser with threading (upstream README: "Multithreaded, runs entirely client-side with COOP/COEP headers"); emsdk toolchain for source builds | n/a for the CLI/service — browser client-side artifact; this service spawns the native CLI | browser-oriented path, not a server deployment | no — NOT verified on this project's hardware |
@@ -657,8 +732,10 @@ itself at startup. Upstream states the order verbatim (install.md,
 runtime, in ggml's registration order (CUDA > Metal > SYCL > Vulkan > CPU —
 MUSA registers through the CUDA slot, so it shares CUDA's position)". This
 project never relies on that order: the adapter always passes
-`--gpu-backend $CRISPASR_GPU_BACKEND` (pinned `cuda` in the image — see
-`pipeline/transcribe.py` and `docker-compose.yml`), and asserts before the
+`--gpu-backend $CRISPASR_GPU_BACKEND` (a pinned literal per hardware —
+`cuda` in `docker-compose.yml`, `vulkan` in `docker-compose.amd.yml`; the
+image ENV default follows the `GPU_BACKEND` build ARG, never a silent
+fallback — see `pipeline/transcribe.py`), and asserts before the
 first job of each process that the pinned backend appears in
 `crispasr --version`'s registered-backends list — so there is no silent
 fallback surprise: a build or host that cannot run the pinned backend
@@ -683,15 +760,20 @@ v0.8.43 release listing (names only — no tarballs were downloaded here,
 per the docs-only decision).
 
 - **Vulkan** — asset
-  [`crispasr-linux-x86_64-vulkan.tar.gz`](https://github.com/CrispStrobe/CrispASR/releases/download/v0.8.43/crispasr-linux-x86_64-vulkan.tar.gz).
-  Prerequisite: a Vulkan-capable GPU with its vendor ICD/runtime —
+  [`crispasr-linux-x86_64-vulkan.tar.gz`](https://github.com/CrispStrobe/CrispASR/releases/download/v0.8.43/crispasr-linux-x86_64-vulkan.tar.gz)
+  — **packaged as the AMD target (card t_f82ad22a)**; build it with
+  `docker compose -f docker-compose.amd.yml up --build` (Quickstart), not
+  by hand. Prerequisite: a Vulkan-capable GPU with its vendor ICD/runtime —
   upstream: "The HIP and Vulkan tarballs still require their respective
-  runtimes at link time (no CPU fallback)." Select with
+  runtimes at link time (no CPU fallback)." Our reference host pairs it
+  with Mesa RADV (`mesa-vulkan-drivers`) on amdgpu, so no ROCm stack is
+  needed; the image entrypoint exports `VK_ICD_FILENAMES` to exactly one
+  `*radeon*|*amdgpu*` ICD. Select with
   `crispasr --gpu-backend vulkan -dev N -m <gguf> -f <wav>` (`-dev N` picks
   the device on hybrid-GPU hosts); service-side, `CRISPASR_GPU_BACKEND=vulkan`
-  is an accepted pin value. Difference that matters: statically linked —
-  without the Vulkan runtime the binary fails loudly at load instead of
-  degrading to CPU.
+  is a pinned literal in the AMD compose file. Difference that matters:
+  statically linked — without the Vulkan runtime the binary fails loudly
+  at load instead of degrading to CPU.
 - **HIP / ROCm** — asset
   [`crispasr-linux-x86_64-hip.tar.gz`](https://github.com/CrispStrobe/CrispASR/releases/download/v0.8.43/crispasr-linux-x86_64-hip.tar.gz).
   Prerequisite: AMD GPU + ROCm runtime (same upstream sentence as Vulkan).
@@ -781,10 +863,11 @@ are the real contract — cross-checked against CONFIG.md,
 
 Baked into the image are the engine at `/opt/crispasr` and the model at
 `/opt/models`; to run a different prebuilt asset against the same service
-without rebuilding, mount over those paths. Example — pointing the
-container at the Vulkan tarball (NOT verified on this project's hardware;
-the adapter whitelist accepts `vulkan`, and the engine must be a Vulkan
-build because the container's baked CUDA-13 libs do not affect it):
+without rebuilding, mount over those paths. For AMD/Vulkan this recipe is
+SUPERSEDED by the in-repo target — `docker compose -f
+docker-compose.amd.yml up --build` builds the vulkan asset into the same
+image shape with the sherpa stack intact; the manual override below is for
+the other experimental rows (cuda12, plain CPU):
 
 ```bash
 # host: extract the tarball into ./vulkan-engine/ (upstream layout: a

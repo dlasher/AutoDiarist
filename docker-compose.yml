@@ -1,12 +1,30 @@
+# =============================================================================
+# AutoDiarist — NVIDIA CUDA host (T400 reference, sm_75; CUDA-13 runtime).
+# For an AMD/Vulkan GPU (RX 6600 class, amdgpu + Mesa RADV) use
+# docker-compose.amd.yml instead — same repo, same Dockerfile, other file.
+#
+# ONE COMMAND, ZERO EDITS (packaging card t_f82ad22a):
+#     git clone https://github.com/dlasher/AutoDiarist.git autodiarist
+#     cd autodiarist
+#     docker compose up --build
+#
+# No .env is required: every optional knob below carries an inline default
+# (${VAR:-default}), and docker compose resolves a fresh clone with no .env
+# present. env_file was removed for exactly this reason. .env.example
+# documents the knobs you MAY override.
+# =============================================================================
 services:
   autodiarist:
     build:
       context: .
+      args:
+        # One Dockerfile, two hardware targets — this file pins the CUDA
+        # path: CUDA-13 apt libs + the cuda13 engine asset + the nvidia
+        # device reservation below, identical to the pre-ARG build.
+        GPU_BACKEND: cuda
     image: autodiarist:local
     ports:
       - "${HOST_PORT:-8000}:8000"
-    env_file:
-      - .env
     environment:
       JOBS_DIR: /data/jobs
       MOCK_PIPELINE: ${MOCK_PIPELINE:-0}
