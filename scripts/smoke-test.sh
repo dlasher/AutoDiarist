@@ -24,9 +24,14 @@
 #              `mktemp -d` temp dir, upload it AS PUBLISHED (never
 #              pre-converted — if the service mishandles the format that is a
 #              genuine finding this script must surface, not paper over).
-#   fallback : if the download fails (offline, blocked), generate a throwaway
-#              ~5 s 16 kHz mono tone via ffmpeg — the README's own recipe —
-#              and say clearly which fixture was used.
+#   fallback : if the download fails (offline, blocked) OR answers 200 with a
+#              body that fails the RIFF/WAVE sanity check, discard any staged
+#              bytes first (rm -f; ffmpeg also runs with -y — never upload
+#              untrusted leftovers) and generate a throwaway ~5 s 16 kHz mono
+#              tone via ffmpeg — the README's own recipe — verifying the
+#              generated file is RIFF/WAVE before it is uploaded. Output
+#              states truthfully WHICH case occurred and WHICH fixture was
+#              used.
 #   cleanup  : the temp dir (and the wav inside it) is removed on exit,
 #              including on failure and on SIGINT/SIGTERM. Nothing is cached
 #              anywhere user-visible; nothing touches /data/jobs or any
@@ -178,6 +183,8 @@ if [ -n "$AUDIO" ]; then
   [ -f "$AUDIO" ] || die "--audio file not found: $AUDIO"
   FIXTURE_STAGED="user-supplied file $AUDIO"
 else
+  # FALLBACK_CAUSE records why we fall back; provenance must stay truthful: a
+  # 200 whose body is not a real WAV is NOT a "download failure" (RR1).
   info "staging fixture: downloading $FIXTURE_URL"
   if curl_show "$CURL_ERRLOG" -fsSL --connect-timeout 10 --max-time 180 \
        -o "$DEST" "$FIXTURE_URL"; then
@@ -188,20 +195,33 @@ else
     if [ "$magic" = "RIFF" ] && [ "${size:-0}" -gt 44 ]; then
       FIXTURE_STAGED="downloaded marklex1min.wav ($size bytes) from $FIXTURE_URL — uploaded as published"
     else
-      info "downloaded payload is not RIFF/WAVE (got '$magic', $size bytes) — treating as download failure"
-      FIXTURE_URL="http://invalid/download-not-wav"
+      FALLBACK_CAUSE="downloaded content failed the WAV sanity check (got '$magic', ${size:-0} bytes)"
     fi
+  else
+    CURL_RC=$?
+    CURL_HINT="$(tail -n 1 "$CURL_ERRLOG" 2>/dev/null | tr -d '\r\n')"
+    FALLBACK_CAUSE="fixture download failed (curl exit $CURL_RC${CURL_HINT:+: $CURL_HINT})"
   fi
   if [ -z "$FIXTURE_STAGED" ]; then
-    info "fixture download failed — falling back to generated ffmpeg tone (README recipe)"
-    command -v ffmpeg >/dev/null 2>&1 || die "fixture download failed AND ffmpeg is not installed — cannot stage a smoke-test fixture.
-  Causes: (1) could not fetch $FIXTURE_URL (check network/proxy), (2) ffmpeg missing.
+    # RR1 blocker guard: staged bytes are untrusted here (curl-failure
+    # leftovers OR a 200-non-WAV body). ffmpeg refuses to overwrite a
+    # pre-existing file yet STILL EXITS 0 on refusal, so without `rm -f` and
+    # `-y` those junk bytes would be uploaded under a "generated tone" label.
+    info "$FALLBACK_CAUSE — generating throwaway tone fallback via ffmpeg"
+    rm -f "$DEST"
+    command -v ffmpeg >/dev/null 2>&1 || die "fallback tone unavailable: $FALLBACK_CAUSE
+  AND ffmpeg is not installed — cannot stage a smoke-test fixture.
+  Causes: (1) could not fetch $FIXTURE_URL (check network/proxy) or its 200 body was not a WAV, (2) ffmpeg missing.
   Fix either one, or pass --audio FILE (any .wav) to supply your own throwaway file.
   NOTE: ffmpeg is only needed on this fallback path; the tone fixture is a fallback."
     # Same recipe README.md documents for audio.wav.
-    ffmpeg -hide_banner -loglevel error -f lavfi \
+    ffmpeg -hide_banner -loglevel error -y -f lavfi \
       -i sine=frequency=440:duration=5 -ac 1 -ar 16000 "$DEST" \
-      || die "ffmpeg tone generation failed (see ffmpeg error above)"
+      || die "ffmpeg tone generation failed (see ffmpeg error above; cause: $FALLBACK_CAUSE)"
+    # Fail-safe: never upload a suspect fallback file.
+    tone_magic="$(dd if="$DEST" bs=1 skip=0 count=4 2>/dev/null)"
+    [ -s "$DEST" ] && [ "$tone_magic" = "RIFF" ] \
+      || die "ffmpeg produced no valid RIFF/WAVE at $DEST (got '${tone_magic:-<empty>}') — pass --audio FILE"
     FIXTURE_STAGED="generated ffmpeg tone fallback (5 s, 16 kHz mono)"
   fi
 fi
@@ -212,9 +232,12 @@ info "fixture used: $FIXTURE_STAGED"
 CODE="$(curl_show "$CURL_ERRLOG" -sS -o /dev/null -w '%{http_code}' --connect-timeout 5 --max-time 15 \
         "$ENDPOINT/docs" || true)"
 if [ "$CODE" = "200" ]; then
-  pass a "GET $ENDPOINT/docs -> HTTP 200 (service alive)"
+  pass a "GET $ENDPOINT/docs -> HTTP 200 (service is listening)"
 else
-  fail a "GET $ENDPOINT/docs -> HTTP '${CODE:-no-response}' (expected 200; is the service up and the endpoint correct?)"
+  # RR1 nit (c): surface curl's own last error (connection refused, DNS, TLS)
+  # so the FAIL line is actionable, not just "HTTP no-response".
+  A_ERR="$(tail -n 1 "$CURL_ERRLOG" 2>/dev/null | tr -d '\r\n')"
+  fail a "GET $ENDPOINT/docs returned '${CODE:-no-response}'${A_ERR:+ — curl: $A_ERR} — is the service running? (SMOKE_TEST_ENDPOINT=... / --endpoint)"
 fi
 
 # ---- check (b): admission --------------------------------------------------

@@ -21,16 +21,25 @@ AC map (amended fixture lifecycle per planner update, 2026-10-22):
   AC9  README documents the script as OPTIONAL (readme_documents_optional)
   AC10 these tests themselves are the stub-server coverage
   INFO informational speaker count, non-gating (speaker_count_informational)
+  RR1  review-round-1 blocker regression: a fixture URL that answers 200
+       with a NON-WAV body must fall back to a REAL generated tone, must
+       state the truth (WAV sanity check failed, not "download failed"),
+       must upload genuine RIFF/WAVE bytes, and must exit 2 without ever
+       uploading when ffmpeg is absent
+       (junk_200_download_falls_back_to_real_tone,
+        junk_200_missing_ffmpeg_exits_2_never_uploads)
 """
 
 from __future__ import annotations
 
+import json
 import os
 import signal
 import socket
 import subprocess
 import sys
 import time
+import urllib.request
 from pathlib import Path
 
 import pytest
@@ -286,6 +295,95 @@ def test_missing_ffmpeg_clear_error(tmp_path: Path) -> None:
         assert r.returncode != 0, out
         assert "ffmpeg" in out, f"error must name ffmpeg:\n{out}"
         # Card AC8: no silent pass/skip even on the error path.
+        assert "ALIVENESS AND PLUMBING ONLY" in out, out
+    finally:
+        proc.terminate()
+
+
+# ---- RR1 blocker regressions (review round 1, comment 135) ------------------
+# Repro of the blocker: the fixture URL answers 200 with a NON-WAV body (stub
+# route /fixture/notreal.wav). Pre-fix, those junk bytes stayed staged,
+# ffmpeg (without -y) refused to overwrite the existing file yet EXITED 0,
+# so `|| die` never fired and the script uploaded the HTML error page under a
+# "generated tone" label — wrong provenance and plumbing that could still
+# PASS end to end.
+
+def _has_ffmpeg() -> bool:
+    return any(os.access(os.path.join(p, "ffmpeg"), os.X_OK)
+               for p in os.environ["PATH"].split(os.pathsep))
+
+
+def _bin_sandbox(tmp_path: Path) -> Path:
+    """Minimal PATH without ffmpeg (POSIX). dd/tail are needed by the
+    sanity-check and error-hint paths the junk-URL case exercises."""
+    sandbox = tmp_path / "sandbox-bin"
+    sandbox.mkdir()
+    for name in ("bash", "sh", "curl", "python3", "mktemp", "rm", "mkdir",
+                 "sleep", "grep", "sed", "date", "wc", "head", "cat", "env",
+                 "uname", "sort", "tr", "cut", "dd", "tail"):
+        src = subprocess.run(["which", name], capture_output=True, text=True).stdout.strip()
+        if src:
+            os.symlink(src, sandbox / name)
+    assert not (sandbox / "ffmpeg").exists()
+    return sandbox
+
+
+def _last_upload(port: int) -> dict:
+    with urllib.request.urlopen(f"http://127.0.0.1:{port}/last-upload",
+                                timeout=10) as resp:
+        return json.loads(resp.read())
+
+
+def test_junk_200_download_falls_back_to_real_tone(tmp_path: Path) -> None:
+    if not _has_ffmpeg():
+        pytest.skip("ffmpeg not installed")
+    proc, port = _start_stub()
+    try:
+        r = _run(tmp_path, port, "--timeout", "30",
+                 extra_env={"SMOKE_TEST_FIXTURE_URL":
+                            f"http://127.0.0.1:{port}/fixture/notreal.wav"})
+        out = r.stdout + r.stderr
+        assert r.returncode == 0, out
+        # Truthful provenance: curl SUCCEEDED with 200; the cause is the WAV
+        # sanity check failing, never a phantom "download failed".
+        assert "WAV sanity check" in out, \
+            f"must state the real fallback cause:\n{out}"
+        assert "download failed" not in out, \
+            f"must not claim a download failure when 200 was served:\n{out}"
+        assert "generated" in out and "tone" in out and "fallback" in out, out
+        # What was ACTUALLY uploaded must be a genuine RIFF/WAVE tone, never
+        # the junk bytes the origin served.
+        up = _last_upload(port)
+        assert up.get("magic") == "RIFF", f"non-WAV bytes reached the API: {up}"
+        assert up.get("size", 0) > 44, up
+    finally:
+        proc.terminate()
+
+
+def test_junk_200_missing_ffmpeg_exits_2_never_uploads(tmp_path: Path) -> None:
+    if os.name != "posix":
+        pytest.skip("POSIX PATH sandboxing")
+    sandbox = _bin_sandbox(tmp_path)
+    proc, port = _start_stub()
+    try:
+        env = _env(tmp_path, {"PATH": str(sandbox),
+                              "SMOKE_TEST_FIXTURE_URL":
+                              f"http://127.0.0.1:{port}/fixture/notreal.wav"})
+        r = subprocess.run(
+            [str(sandbox / "bash"), str(SCRIPT),
+             "--endpoint", f"http://127.0.0.1:{port}", "--timeout", "30"],
+            capture_output=True, text=True, timeout=TIMEOUT, env=env,
+        )
+        out = r.stdout + r.stderr
+        assert r.returncode == 2, \
+            f"untrusted fixture + no ffmpeg must die (exit 2), got {r.returncode}:\n{out}"
+        assert "ffmpeg" in out, f"error must name ffmpeg:\n{out}"
+        assert "WAV sanity check" in out, \
+            f"die path must state the truth (200 served, not a download failure):\n{out}"
+        # The junk file must NEVER have been uploaded.
+        up = _last_upload(port)
+        assert up == {"uploaded": False}, f"junk upload reached the API: {up}"
+        # AC8: no silent pass/skip even on the error path.
         assert "ALIVENESS AND PLUMBING ONLY" in out, out
     finally:
         proc.terminate()

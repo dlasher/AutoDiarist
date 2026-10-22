@@ -6,7 +6,11 @@ api/main.py responses (POST /v1/jobs -> 202 JobResponse with `token`;
 GET /v1/jobs/{token} -> JobStatus; GET /v1/jobs/{token}/download?format=md|json),
 plus GET /docs (aliveness) and GET /fixture/<name> (a small but valid RIFF/WAVE
 payload) so the script's download -> use -> delete fixture lifecycle can be
-exercised without reaching the real internet.
+exercised without reaching the real internet. GET /fixture/notreal.wav answers
+200 with a NON-WAV body (a CDN/error-page stand-in) to reproduce the review
+RR1 blocker, and GET /last-upload reports the size and first-4-bytes magic of
+the most recent POST /v1/jobs body so tests can assert what was ACTUALLY
+uploaded (truthful-provenance checks).
 
 Prints `READY <port>` on stdout once listening (port 0 = ephemeral).
 
@@ -50,6 +54,10 @@ def _tiny_wav_bytes() -> bytes:
 
 WAV_BYTES = _tiny_wav_bytes()
 
+# 200-but-not-a-WAV body for the RR1 blocker repro (a CDN/HTML error page
+# served with status 200 would look exactly like this to a naive downloader).
+JUNK_BYTES = b"<html><body>ERROR: upstream origin unavailable</body></html>\n"
+
 MD_REPORT = (
     "# AutoDiarist transcript\n\n"
     "| Field | Value |\n"
@@ -72,6 +80,7 @@ class Handler(BaseHTTPRequestHandler):
     state = "pass"
     poll_count = 0
     lock = threading.Lock()
+    last_upload: dict | None = None  # {"size": int, "magic": str} of newest POST body
 
     def log_message(self, format, *args):  # noqa: A002 - match base signature
         pass
@@ -102,7 +111,16 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(200, b"<html><body>stub docs</body></html>", "text/html")
             return
         if path.startswith("/fixture/"):
+            if path == "/fixture/notreal.wav":
+                # RR1 blocker repro: 200 with a body that is NOT RIFF/WAVE.
+                self._send(200, JUNK_BYTES, "text/html")
+                return
             self._send(200, WAV_BYTES, "audio/wav")
+            return
+        if path == "/last-upload":
+            body = json.dumps(Handler.last_upload if Handler.last_upload
+                              else {"uploaded": False}).encode()
+            self._send(200, body, "application/json")
             return
         if path.endswith("/download") and path.startswith("/v1/jobs/"):
             token = path.split("/")[3]
@@ -133,11 +151,19 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         if self.path.startswith("/v1/jobs"):
-            # Drain the multipart body without parsing it — the real API
-            # validates the .wav extension and streams to disk; the smoke
-            # test only cares about the response shape.
+            # Drain the multipart body; parse ONLY enough to record the file
+            # part's magic bytes (see below). The real API validates the .wav
+            # extension and streams to disk; the smoke test only cares about
+            # the response shape.
             length = int(self.headers.get("Content-Length", "0"))
-            self.rfile.read(length)
+            body = self.rfile.read(length)
+            # The upload is a multipart form; the FILE payload begins after
+            # the first part's headers (first \r\n\r\n). Record that magic,
+            # not the envelope's boundary bytes — "what was really uploaded".
+            parts = body.split(b"\r\n\r\n", 1)
+            magic = (parts[1][:4] if len(parts) == 2 else body[:4]).decode("latin-1")
+            with Handler.lock:
+                Handler.last_upload = {"size": length, "magic": magic}
             if Handler.state == "post_fail":
                 self._send(500, b'{"detail":"stub refuses"}', "application/json")
                 return

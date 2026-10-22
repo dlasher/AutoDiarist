@@ -470,16 +470,19 @@ the primary fixture is pyannote's published `marklex1min.wav`, a real 79 s
 two-speaker conversation, downloaded at runtime into a `mktemp -d` temp dir
 and uploaded **as published** (never pre-converted — if the pipeline cannot
 decode 44.1 kHz stereo, the smoke test surfaces that as a genuine finding).
-If the download fails (offline, blocked), the script falls back to the
-generated 5 s 16 kHz mono tone from *Test fixture* above and says clearly
-which fixture was used. The temp dir — and the wav inside it — is removed
+If the download fails (offline, blocked) — or the server answers 200 with a
+body that is not a real WAV — the script discards any downloaded bytes and
+falls back to the generated 5 s 16 kHz mono tone from *Test fixture* above,
+stating truthfully which case occurred and which fixture was used. The temp
+dir — and the wav inside it — is removed
 on exit, including on failure, Ctrl-C, or SIGTERM; nothing is cached in any
 user-visible location and nothing touches `/data/jobs` or any mounted
 volume. `--audio FILE` skips the lifecycle and uses your file as-is.
 
 Requirements: `curl` + `python3` only (ffmpeg is needed solely on the
-tone-fallback path; if ffmpeg is missing **and** the download failed, the
-script stops with a clear actionable error — never a silent pass or skip).
+tone-fallback path; if ffmpeg is missing **and** no usable download exists —
+fetch failed or the 200 body was not a real WAV — the script stops with a
+clear actionable error, never a silent pass or skip).
 The script runs zero docker commands and creates exactly one short job per
 invocation, so it is safe to run against the production deploy. Coverage:
 `tests/scripts/test_smoke_test.py` exercises it against a stdlib HTTP stub —
