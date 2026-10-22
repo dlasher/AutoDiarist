@@ -56,6 +56,11 @@ SESSION_COOKIE_NAME_DEFAULT = "autodiarist_session"
 # fairness survives a restart.
 DEFAULT_MAX_PROCESSING_PER_SESSION = 1
 SCHEDULER_STATE_NAME = "_scheduler.json"
+# Session-scoped job listing (V1.5, card t_f97d12a8): default page size and
+# hard max for GET /v1/jobs. Deliberately constants, not env knobs (scope 8:
+# "keep it knob-free"). ?limit= outside [1, MAX_LIST_LIMIT] clamps, never 4xx.
+DEFAULT_LIST_LIMIT = 50
+MAX_LIST_LIMIT = 200
 # HTTP token charset (RFC 7230) — header/cookie names must match it.
 _HEADER_TOKEN_RE = re.compile(r"[!#$%&'*+\-.^_`|~0-9A-Za-z]+")
 
@@ -1007,6 +1012,7 @@ async def create_job(request: Request, response: Response, file: UploadFile = Fi
                 headers={"Retry-After": retry_after},
             )
         seq = max((s.get("seq", 0) for s in states), default=0) + 1
+        admitted_at = time.time()
         state = {
             "token": token,
             "status": "queued",
@@ -1016,7 +1022,13 @@ async def create_job(request: Request, response: Response, file: UploadFile = Fi
             # job listing can group per person. Raw id never hits disk.
             "session_ident": _hash_ident(f"session:{session_id}"),
             "session_source": session_source,
-            "queued_at": time.time(),
+            # created_at (card t_f97d12a8): stable job-creation timestamp for
+            # the session listing's newest-first order. queued_at stays the
+            # queue-facing clock (boot requeue stamps it on restart); a fresh
+            # admission sets both. Legacy jobs lacking created_at fall back
+            # to queued_at in the listing.
+            "created_at": admitted_at,
+            "queued_at": admitted_at,
             "seq": seq,
             "progress": 0.0,
             "message": "Queued",
@@ -1058,6 +1070,86 @@ async def create_job(request: Request, response: Response, file: UploadFile = Fi
         session=session_id,
         queue_position=queue_position,
     )
+
+
+def _listing_created_at(state: dict) -> float:
+    """Ordering clock for the session listing: created_at, falling back to
+    queued_at for jobs admitted before the field existed (t_f97d12a8)."""
+    return state.get("created_at") or state.get("queued_at") or 0.0
+
+
+def _session_job_entries(
+    states: list[dict], session_ident: str, limit: int, queued_order: list[str]
+) -> tuple[list[dict], int]:
+    """Pure session view (card t_f97d12a8): the caller's jobs only,
+    newest-first (created_at desc, seq desc tiebreak), truncated to `limit`.
+
+    Every entry carries token/status/progress/stage/source/created_at;
+    queued entries additionally carry queue_position (the fair-scheduled
+    execution rank from `queued_order`, the same simulation GET /v1/jobs/
+    {token} and POST 202 use); failed entries carry the error string.
+    Cancelled jobs stay in the listing — they are terminal states users
+    want to see. Returns (entries, total_before_truncation)."""
+    mine = [s for s in states if s.get("session_ident") == session_ident]
+    mine.sort(key=lambda s: (_listing_created_at(s), s.get("seq") or 0), reverse=True)
+    rank = {token: i + 1 for i, token in enumerate(queued_order)}
+    entries = []
+    for s in mine[:limit]:
+        entry = {
+            "token": s.get("token"),
+            "status": s.get("status"),
+            "progress": s.get("progress", 0.0),
+            "stage": s.get("stage") or s.get("status"),
+            "source": s.get("filename", "unknown"),
+            "created_at": _listing_created_at(s),
+        }
+        if s.get("status") == "queued":
+            entry["queue_position"] = rank.get(s["token"])
+        if s.get("status") == "failed":
+            entry["error"] = s.get("error") or s.get("message") or ""
+        entries.append(entry)
+    return entries, len(mine)
+
+
+@app.get("/v1/jobs")
+async def list_jobs(request: Request, response: Response, limit: int = DEFAULT_LIST_LIMIT):
+    """Session-scoped job listing (V1.5, card t_f97d12a8).
+
+    GET /v1/jobs/{token} answers "what is THIS job doing" for anyone holding
+    the token; this endpoint answers "what did I submit" — it is filtered by
+    the same hashed session identity admission stamps on every job, so a
+    client can find its token, watch status/progress, and cancel a queued
+    job without the server ever storing a plaintext session id. Other
+    sessions' jobs cannot appear (identity hash equality is the only filter)
+    and there is deliberately no admin/cross-session mode.
+
+    Order: newest-first (created_at desc, seq desc tiebreak). ?limit= takes
+    precedence over the default page size, clamped into [1, MAX_LIST_LIMIT]
+    — out-of-range values clamp, they never 4xx. Non-integer limit is the
+    only rejected input (FastAPI 422).
+    """
+    _, session_id, _ = _resolve_session(request)
+    page = max(1, min(limit, MAX_LIST_LIMIT))
+    with _queue_lock:
+        states = _iter_states()
+        queued_order = _fair_queued_order(states, _load_scheduler_state())
+    entries, total = _session_job_entries(
+        states, _hash_ident(f"session:{session_id}"), page, queued_order
+    )
+    # Echo the identity exactly like POST does (card t_920fb7dc): a client
+    # that only had an IP-derived identity gets the minted id back via
+    # cookie (+ default header when the client doesn't already manage one)
+    # so its next listing matches its submissions.
+    response.set_cookie(
+        key=_session_cookie_name(),
+        value=session_id,
+        httponly=True,
+        samesite="lax",
+        path="/",
+    )
+    if not request.headers.get(_session_header_name(), "").strip():
+        response.headers[_session_header_name()] = session_id
+    return {"jobs": entries, "count": len(entries), "total": total, "limit": page}
 
 
 @app.get("/v1/jobs/{token}")

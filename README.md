@@ -30,6 +30,7 @@ worker stages per job (api/main.py process_job_background):
   speaker self-ID      (pipeline.self_identification, weighted evidence)
   render               (pipeline.renderer -> markdown_report.md)
   v
+GET    /v1/jobs                  -> list MY jobs (session-scoped; newest first; ?limit=1..200, default 50)
 GET    /v1/jobs/{token}          -> status (+ queue_position while queued; stage + monotonic progress)
 DELETE /v1/jobs/{token}          -> cancel a queued job (409 while processing)
 GET    /v1/jobs/{token}/download -> output_result.json (default) or ?format=md
@@ -41,7 +42,7 @@ behaves identically, which is what the API integration tests run against.
 
 ## HTTP API
 
-Five endpoints, all under `/v1/jobs`. Base URL in the examples below is the
+Six endpoints, all under `/v1/jobs`. Base URL in the examples below is the
 quickstart default (`http://127.0.0.1:8000`). All error responses use the
 FastAPI envelope `{"detail": "..."}` unless noted. Every status code here is
 implemented in `api/main.py`.
@@ -75,6 +76,41 @@ concurrently `processing` jobs per session.
 
 Rejected uploads leave no trace on disk: the partially streamed job directory
 is deleted before the error is returned.
+
+### GET /v1/jobs — list my jobs
+
+Session-scoped view of what *you* submitted (V1.5): find your own tokens,
+watch progress, and decide what to cancel. Filtered by the same hashed
+session identity admission stamps on every job (see *Session identity*) —
+other sessions' jobs can never appear, and there is deliberately no
+cross-session/admin mode or pagination cursor at this scale.
+
+```bash
+curl -sS -H 'X-Session: user-a' http://127.0.0.1:8000/v1/jobs
+curl -sS -H 'X-Session: user-a' 'http://127.0.0.1:8000/v1/jobs?limit=10'
+```
+
+Answers `200` for every session, including a brand-new one (empty list):
+
+```json
+{"jobs": [{"token": "6a7f…uuid4…", "status": "queued", "progress": 0.0,
+           "stage": "queued", "source": "meeting.wav",
+           "created_at": 1760000000.1, "queue_position": 1}],
+ "count": 1, "total": 1, "limit": 50}
+```
+
+- Every entry carries `token`, `status`, `progress`, `stage`, `source` (the
+  uploaded filename) and `created_at`. `queued` entries add `queue_position`
+  (the same fair-scheduled rank the poll endpoint reports); `failed` entries
+  add `error`. `cancelled` jobs stay listed — terminal states are still part
+  of "what did I submit".
+- Order: newest-first (`created_at` desc, stable `seq` desc tiebreak).
+- `?limit=` defaults to 50 and clamps to `[1, 200]` — out-of-range values
+  clamp instead of erroring; a non-integer `limit` is `422`. `total` reports
+  the session's job count before truncation so a client can see it was cut.
+- Like `POST`, the response echoes the session identity (`Set-Cookie`, plus
+  the `X-Session` header when the client doesn't manage its own), so an
+  IP-only client can re-list by replaying the minted id.
 
 ### GET /v1/jobs/{token} — poll a job
 

@@ -1,5 +1,35 @@
 # Changelog
 
+## [Unreleased] — V1.5 session-scoped job listing: GET /v1/jobs (card t_f97d12a8)
+
+Building on session identity (card t_920fb7dc) and accept-and-queue admission
+(card t_82bfbc15): a client can now answer "what did I submit?" — the
+user-facing requirement to wait for a job or cancel it needs a way to find
+its own tokens first.
+
+- **`GET /v1/jobs` — session-scoped listing.** Entries carry `token`,
+  `status`, `progress`, `stage`, `source` (uploaded filename) and
+  `created_at`; `queued` entries add `queue_position` (the same fair rank
+  the poll endpoint and the POST 202 report, computed from one shared
+  simulation), `failed` entries add `error`, and `cancelled` jobs stay
+  listed (terminal states are still part of what the user submitted).
+  Filtered by the same hashed `session_ident` admission stamps on every job
+  — no cross-session leakage is possible and there is no admin mode.
+- **Ordering & paging.** Newest-first (`created_at` desc, stable `seq` desc
+  tiebreak). `?limit=` defaults to `50` and clamps to `[1, 200]` (clamped,
+  never an error; non-integer `limit` is `422`). `total` reports the
+  session's job count before truncation. Deliberately knob-free: the two
+  limits are constants, not env vars.
+- **`created_at` joins the job state at admission** as the listing's stable
+  clock; `queued_at` keeps its queue-facing meaning (boot requeue stamps
+  it). Legacy jobs without `created_at` fall back to `queued_at`, so an
+  upgrade lists pre-existing history without re-admission.
+- `GET /v1/jobs/{token}` is unchanged — token-based access stays as it is;
+  the listing is the session-based view. The response echoes the session
+  identity exactly like `POST` does (cookie + `X-Session` default header).
+- Tests: 9 new acceptance tests (`tests/api/test_jobs_listing.py`); full
+  suite 254 green. README documents the endpoint; CONFIG.md unchanged.
+
 ## [Unreleased] — V1.5 fair-share scheduling: round-robin per session + processing cap (card t_4b40acfd)
 
 Building on accept-and-queue admission (card t_82bfbc15): the shared GPU is
