@@ -18,13 +18,18 @@ is derived purely from what the client presents.
   raw ids/cookies/IPs never hit disk) plus the dedicated `session_ident` key
   (hash of the session id itself, including the first-contact issuance) so
   the scheduler and job listing can group by person; `session_source` records
-  which branch resolved (`header`/`cookie`/`ip`/`anonymous`).
-- **`tests/api/test_session_issue.py`** — new: AC1-AC7 coverage — issuance
+  which branch resolved (`header`/`cookie`/`ip`/`anonymous`). Cookie name is
+  overridable via `SESSION_COOKIE_NAME`; `validate_config()` runs at boot and
+  logs the effective `SESSION_HEADER`, `SESSION_COOKIE_NAME`,
+  `MAX_JOBS_PER_SESSION`, `MAX_QUEUE_DEPTH`, `RETENTION_DAYS`, warning and
+  falling back on invalid values.
+- **`tests/api/test_session_issue.py`** — new: AC1-AC8 coverage — issuance
   in Set-Cookie + body, entropy/uniqueness, cookie-reuse stability,
   header-beats-cookie precedence, configured `Authorization`, IP/anonymous
   fallback, raw-value leak check, two-session distinguishability with
-  per-session quota, and statelessness (no files but job dirs; identity
-  never remembered server-side).
+  per-session quota, statelessness (no files but job dirs; identity
+  never remembered server-side), and the boot config report incl.
+  `SESSION_COOKIE_NAME` override + invalid-name warn/fallback.
 - **Docs** — README *Session identity* rewritten for the issuance/reuse
   flow, `CONFIG.md` `SESSION_HEADER` default and chain, TROUBLESHOOTING
   shared-bucket row.

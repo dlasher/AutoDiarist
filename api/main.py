@@ -43,7 +43,29 @@ DEFAULT_QUEUE_POLL_SECONDS = 0.2
 SESSION_HEADER_DEFAULT = "X-Session"
 # Server-issued session id cookie (V1.5, card t_920fb7dc). The value is also
 # returned in the POST body so API clients without a cookie jar can reuse it.
-SESSION_COOKIE_NAME = "autodiarist_session"
+# Name is overridable via SESSION_COOKIE_NAME for proxies that reserve it.
+SESSION_COOKIE_NAME_DEFAULT = "autodiarist_session"
+# HTTP token charset (RFC 7230) — header/cookie names must match it.
+_HEADER_TOKEN_RE = re.compile(r"[!#$%&'*+\-.^_`|~0-9A-Za-z]+")
+
+
+def _validated_env_name(var: str, default: str) -> str:
+    """Read a header/cookie NAME knob, falling back to the documented default."""
+    raw = (os.environ.get(var) or "").strip()
+    if not raw:
+        return default
+    if not _HEADER_TOKEN_RE.fullmatch(raw):
+        logger.warning("config: %s=%r is not a valid HTTP token; using %r", var, raw, default)
+        return default
+    return raw
+
+
+def _session_header_name() -> str:
+    return _validated_env_name("SESSION_HEADER", SESSION_HEADER_DEFAULT)
+
+
+def _session_cookie_name() -> str:
+    return _validated_env_name("SESSION_COOKIE_NAME", SESSION_COOKIE_NAME_DEFAULT)
 
 
 def _env_int(name: str, default: int) -> int:
@@ -402,10 +424,6 @@ def _new_session_id() -> str:
     return uuid.uuid4().hex
 
 
-def _session_header_name() -> str:
-    return os.environ.get("SESSION_HEADER", SESSION_HEADER_DEFAULT)
-
-
 def _resolve_session(request: Request) -> tuple[str, str, str]:
     """(identity hash, session id, source) for the V1.5 precedence chain.
 
@@ -420,7 +438,7 @@ def _resolve_session(request: Request) -> tuple[str, str, str]:
     value = request.headers.get(header)
     if value and value.strip():
         return _hash_ident(f"header:{header}:{value.strip()}"), value.strip(), "header"
-    cookie = request.cookies.get(SESSION_COOKIE_NAME)
+    cookie = request.cookies.get(_session_cookie_name())
     if cookie and cookie.strip():
         return _hash_ident(f"cookie:{cookie.strip()}"), cookie.strip(), "cookie"
     session = _new_session_id()
@@ -659,8 +677,46 @@ async def _queue_worker_loop() -> None:
             await asyncio.sleep(_env_float("QUEUE_POLL_SECONDS", DEFAULT_QUEUE_POLL_SECONDS))
 
 
+def validate_config() -> str:
+    """Boot-time config validation + report (V1.5 AC8, card t_920fb7dc).
+
+    Surfaces every session/queue/retention knob the service reads —
+    SESSION_HEADER and SESSION_COOKIE_NAME (HTTP-token validated, invalid
+    values warn and fall back to the documented defaults), MAX_JOBS_PER_SESSION,
+    MAX_QUEUE_DEPTH, RETENTION_DAYS — so misconfiguration is visible in
+    `docker logs` instead of silently degrading behavior. Invalid integers
+    keep the established _env_int fallback; a non-positive quota/depth is
+    called out and pinned to the default.
+    """
+    header = _session_header_name()
+    cookie = _session_cookie_name()
+    depth = _env_int("MAX_QUEUE_DEPTH", DEFAULT_MAX_QUEUE_DEPTH)
+    per_session = _env_int("MAX_JOBS_PER_SESSION", DEFAULT_MAX_JOBS_PER_SESSION)
+    days = _retention_days()
+    if per_session < 1:
+        logger.warning(
+            "config: MAX_JOBS_PER_SESSION=%d would admit no jobs; using %d",
+            per_session, DEFAULT_MAX_JOBS_PER_SESSION,
+        )
+        per_session = DEFAULT_MAX_JOBS_PER_SESSION
+    if depth < 1:
+        logger.warning(
+            "config: MAX_QUEUE_DEPTH=%d would reject every submission; using %d",
+            depth, DEFAULT_MAX_QUEUE_DEPTH,
+        )
+        depth = DEFAULT_MAX_QUEUE_DEPTH
+    summary = (
+        f"config: session header={header} cookie={cookie} "
+        f"max_jobs_per_session={per_session} max_queue_depth={depth} "
+        f"retention_days={days}"
+    )
+    logger.info(summary)
+    return summary
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    validate_config()
     # Boot revalidation: jobs left 'processing' by a crash/restart return to
     # the queue with their seq intact, preserving FIFO order across restarts;
     # admission limits are revalidated by every POST from this persisted state.
@@ -817,7 +873,7 @@ async def create_job(request: Request, response: Response, file: UploadFile = Fi
     # reuse the id without a cookie jar. Stateless server: the value comes
     # from the client (header/cookie) or is freshly minted here.
     response.set_cookie(
-        key=SESSION_COOKIE_NAME,
+        key=_session_cookie_name(),
         value=session_id,
         httponly=True,
         samesite="lax",

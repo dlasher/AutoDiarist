@@ -205,8 +205,9 @@ so no raw id, token or IP is ever stored on disk):
    `SESSION_HEADER` (e.g. `-H 'X-Session: alice'`; with
    `SESSION_HEADER=Authorization`, `-H 'Authorization: Bearer ***'`
    works as before and gives `alice` a stable quota across IP changes);
-2. the server-issued `autodiarist_session` cookie (a browser sends it back
-   automatically; a curl client can with `-c jar -b jar`);
+2. the server-issued `autodiarist_session` cookie (name overridable via
+   `SESSION_COOKIE_NAME`; a browser sends it back automatically, a curl
+   client can with `-c jar -b jar`);
 3. the client IP when neither header nor cookie is present (`request.client.host`);
 4. an anonymous bucket when neither is available.
 

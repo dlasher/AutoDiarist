@@ -38,6 +38,7 @@ GPU-default values.
 | `RETRY_AFTER_SECONDS` | `30` | Value of the `Retry-After` header on `429`/`503` admissions. |
 | `QUEUE_POLL_SECONDS` | `0.2` | Worker idle-poll period (float; invalid values fall back to the default). |
 | `SESSION_HEADER` | `X-Session` | Header carrying a client-supplied session identity; highest precedence in the identity chain. `Authorization` remains honored when set here explicitly. With no header, the server-issued `autodiarist_session` cookie (returned on `POST /v1/jobs` body + Set-Cookie) identifies the session; then client IP; then a shared `anonymous` bucket. All identities persist as SHA-256 digests (first 32 hex chars, domain-separated); raw values never hit disk. The issued id is additionally hashed under the job-state key `session_ident`. |
+| `SESSION_COOKIE_NAME` | `autodiarist_session` | Name of the server-issued session cookie. Overridable for proxies that reserve the default name; an invalid (non-HTTP-token) value warns at boot and falls back to the default. Effective values of both session knobs, `MAX_JOBS_PER_SESSION`, `MAX_QUEUE_DEPTH` and `RETENTION_DAYS` are validated and printed once at boot (`config: session header=... cookie=...`). |
 
 ## Job retention & disk pressure — `api/main.py`
 

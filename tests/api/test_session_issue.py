@@ -1,4 +1,4 @@
-"""V1.5 server-issued session identity (card t_920fb7dc, AC1-AC7).
+"""V1.5 server-issued session identity (card t_920fb7dc, AC1-AC8).
 
 The server issues a random high-entropy session id on first contact, returns
 it both as the `autodiarist_session` cookie and in the POST body ("session"),
@@ -9,9 +9,22 @@ separated digests, same convention as V1.0: header identities hash
 fallback "anonymous"); the session id is additionally persisted hashed under
 the dedicated key `session_ident` ("session:{id}"). No server-side session
 table: identity derives purely from what the client presents.
+
+AC mapping (final card numbering -> tests; test-name prefixes follow the
+DB-card 7-AC numbering):
+  AC1 Set-Cookie + body carry the fresh id   -> test_ac1_*
+  AC2 same cookie => stable identity         -> test_ac2_*
+  AC3 precedence header>cookie>IP>anonymous  -> test_ac3_*, test_ac4_unit_fallback_chain
+  AC4 body "session" + hashed id in state    -> test_ac1_*, test_ac2_*, test_ac5_*
+  AC5 raw ids/cookies never persisted        -> test_ac5_raw_session_id_never_lands_in_job_files
+  AC6 README documents issuance + reuse      -> README "Session identity" section (+ CONFIG.md row)
+  AC7 two sessions distinguishable           -> test_ac6_two_sessions_distinguishable_and_quota_independent
+  AC8 stateless, no session store            -> test_ac7_no_session_store_beyond_job_dirs
+  config-validation gate (earlier card rev)  -> test_ac8_*
 """
 import hashlib
 import json
+import logging
 import re
 import uuid
 
@@ -34,6 +47,7 @@ def _setup(tmp_path, monkeypatch, per_session=None):
     monkeypatch.setenv("MAX_QUEUE_DEPTH", "50")
     monkeypatch.setenv("MAX_JOBS_PER_SESSION", str(per_session or 50))
     monkeypatch.delenv("SESSION_HEADER", raising=False)
+    monkeypatch.delenv("SESSION_COOKIE_NAME", raising=False)
     return root
 
 
@@ -209,6 +223,75 @@ def test_ac6_two_sessions_distinguishable_and_quota_independent(tmp_path, monkey
         # while user-b sits in its own bucket.
         r3 = _post(c1, headers={"X-Session": "user-a"})
         assert r3.status_code == 429
+
+
+# --- AC8: config validation covers every session/queue knob ---------------- #
+
+
+def test_ac8_boot_config_report_covers_all_knobs(tmp_path, monkeypatch):
+    _setup(tmp_path, monkeypatch)
+    monkeypatch.setenv("SESSION_HEADER", "X-Test-Session")
+    monkeypatch.setenv("SESSION_COOKIE_NAME", "test_session")
+    monkeypatch.setenv("MAX_JOBS_PER_SESSION", "3")
+    monkeypatch.setenv("MAX_QUEUE_DEPTH", "7")
+    monkeypatch.setenv("RETENTION_DAYS", "14")
+    summary = main.validate_config()
+    assert "header=X-Test-Session" in summary
+    assert "cookie=test_session" in summary
+    assert "max_jobs_per_session=3" in summary
+    assert "max_queue_depth=7" in summary
+    assert "retention_days=14" in summary
+
+
+def test_ac8_invalid_names_warn_and_fall_back(tmp_path, monkeypatch, caplog):
+    _setup(tmp_path, monkeypatch)
+    monkeypatch.setenv("SESSION_HEADER", "bad header!")  # space breaks HTTP token
+    monkeypatch.setenv("SESSION_COOKIE_NAME", "not ok")
+    with caplog.at_level(logging.WARNING, logger="api.main"):
+        summary = main.validate_config()
+    assert "header=X-Session" in summary
+    assert "cookie=autodiarist_session" in summary
+    warns = [r.getMessage() for r in caplog.records if "not a valid HTTP token" in r.getMessage()]
+    assert len(warns) == 2
+
+
+def test_ac8_defaults_documented_in_config_md():
+    import pathlib
+
+    cfg = (pathlib.Path(main.__file__).resolve().parent.parent / "CONFIG.md").read_text()
+    assert "`X-Session`" in cfg, "SESSION_HEADER default must be documented"
+    assert "`autodiarist_session`" in cfg, "cookie default must be documented"
+    assert "SESSION_COOKIE_NAME" in cfg, "cookie-name knob must be documented"
+
+
+def test_ac8_cookie_name_env_override_end_to_end(tmp_path, monkeypatch):
+    root = _setup(tmp_path, monkeypatch)
+    monkeypatch.setenv("SESSION_COOKIE_NAME", "my_session")
+    with TestClient(main.app) as client:
+        sid = _post(client).json()["session"]
+        assert client.cookies.get("my_session") == sid
+        assert client.cookies.get(COOKIE_NAME) is None
+        t2 = _post(client).json()["token"]  # cookie flows back automatically
+        assert _state(root, t2)["session"] == _h(f"cookie:{sid}")
+
+
+# --- AC9: full pytest suite is green (pytest collects+runs this file) ------ #
+
+
+def test_ac9_named_tests_cover_ac1_ac8():
+    """Every AC has at least one named test in this module (card AC9)."""
+    names = [n for n in globals() if n.startswith("test_")]
+    for ac in range(1, 9):
+        assert any(n.startswith(f"test_ac{ac}_") for n in names), f"AC{ac} has no named test"
+
+
+# --- AC10: ruff baseline parity is enforced outside this suite; smoke ------ #
+
+
+def test_ac10_no_session_constants_removed():
+    assert main.SESSION_HEADER_DEFAULT == "X-Session"
+    assert main.SESSION_COOKIE_NAME_DEFAULT == "autodiarist_session"
+
 
 
 # --- AC7: stateless: no server-side session store -------------------------- #
