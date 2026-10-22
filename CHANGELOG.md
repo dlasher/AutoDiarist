@@ -1,5 +1,58 @@
 # Changelog
 
+## [Unreleased] — one-command deploy packaging (card t_f82ad22a)
+
+**Contract: `git clone`, pick your compose file, `docker compose up` —
+zero edits, on both hardware targets.** The user knows their hardware:
+`docker-compose.yml` = NVIDIA CUDA, new `docker-compose.amd.yml` =
+AMD/Vulkan. Nothing past `up` is part of activation.
+
+- **One Dockerfile, two GPU targets.** The `GPU_BACKEND` build ARG
+  (`cuda` | `vulkan`, default `cuda`) selects ONLY the host-runtime apt
+  layer (CUDA-13 keyring + `cuda-cudart-13-0`/`libcublas-13-0` vs
+  `libvulkan1` + `mesa-vulkan-drivers` = Mesa RADV on amdgpu, no ROCm)
+  and the sha256-pinned CrispASR v0.8.43 release asset (`cuda13` digest
+  unchanged; `vulkan` digest `d5c676e0…ca46` pinned per AC2). The app
+  layer — wheels, ffmpeg, the Nemotron Q4_K GGUF, the whole sherpa
+  diarization stack (card t_5a287979: CLI + both ONNX models + threshold
+  wrapper + build-time self-check), the entrypoint, the non-root `app`
+  user (uid 10001) — is ONE source of truth that cannot diverge between
+  backends. This closes the regression class where the AMD operator
+  script GENERATED a second `Dockerfile.amd` (foxnose-era, no sherpa):
+  `amd-bringup.sh` is superseded — its job is now `git pull` + the AMD
+  compose file; rebuilding via the old script would silently undo
+  t_5a287979. **The AMD host still runs the pre-fix image until the
+  operator rebuilds it with this path (pending).**
+- **Fresh-clone blocker removed.** `env_file: .env` is gone from BOTH
+  compose files (compose errors on a missing env_file target); every
+  optional knob carries an inline `${VAR:-default}`; `.env.example` is
+  now documented as optional overrides only.
+- **AMD compose file is fully STATIC** — no host-specific gid/path
+  anywhere (compose cannot interpolate `group_add` from `.env`; per-host
+  device groups differ across driver stacks). Device access = `/dev/dri`
+  + `/dev/kfd` devices + host-side `setfacl` grants for uid 10001 via
+  the new idempotent `scripts/vulkan-host-setup.sh` (setfacl primary,
+  announced 0666-mode fallback, `--persist` udev rule for reboots).
+  `CRISPASR_GPU_BACKEND: vulkan` is a pinned literal, so a missing
+  Vulkan runtime fails the `--version` probe instead of silently
+  CPU-falling-back. `CRISPASR_LIB_DIR` empty; `VRAM_LIMIT_MIB: 7168`
+  mirrors the proven bring-up on the 8 GB reference card.
+- **One entrypoint.** New `scripts/docker-entrypoint.sh` (executed as
+  the image `ENTRYPOINT` on both targets) exports `VK_ICD_FILENAMES` to
+  the single `*radeon*|*amdgpu*` ICD under `/usr/share/vulkan/icd.d/` —
+  selecting ALL ICDs made the engine die at init with `vulkan:11` on the
+  proven bring-up — and execs the same uvicorn command the CUDA path
+  used before. No-op on the CUDA image.
+- **Tests** (tests/test_docker_packaging.py, 11 -> 22): both engine
+  assets + digests in the single Dockerfile; structural assert that the
+  app layer never branches on `GPU_BACKEND`; the AMD contract (pinned
+  vulkan/sherpa literals, device list, forbidden
+  group_add/privileged/rocm/`ENV{`); no `env_file` and no bare
+  interpolations in either compose file; entrypoint ICD glob; and a
+  cross-check that EVERY env key set by either compose file is actually
+  consumed by `api/`+`pipeline/` sources or a baked script (invented
+  keys are silent config regressions — planner review).
+
 ## [Unreleased] — multi-speaker diarization fix (card t_5a287979)
 
 **Diarization default changed: `DIAR_METHOD=foxnose` -> `sherpa`.**
