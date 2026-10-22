@@ -35,7 +35,9 @@ deliberately — slow but useful for offline testing. Do not ship it.
 | Error (status.json `error` field) | Check |
 | --- | --- |
 | `CRISPASR_BIN is not set` / `CRISPASR_BIN='…' is not an executable file` | `CRISPASR_BIN` must be an executable path (image default `/opt/crispasr/crispasr`). |
-| `DIAR_METHOD='…' not supported` | Accepted values: `foxnose` (default), `ecapa`, `sherpa`, `sortformer`, `none`. |
+| `DIAR_METHOD='…' not supported` | Accepted values: `sherpa` (default), `ecapa`, `foxnose`, `sortformer`, `none`. |
+| `DIAR_METHOD='sherpa' requires the sherpa-onnx models; missing: …` | Startup refusal (card t_5a287979 AC4): the image lacks the ONNX files baked at `/opt/models` (see README "Diarization models"), or the env points somewhere else. The service refuses to start instead of silently emitting one speaker. |
+| `crispasr produced no speaker labels for DIAR_METHOD='sherpa'` | Runtime refusal of silent degradation: the engine ran but every segment came back without a speaker label — usually the sherpa subprocess failed (missing `SHERPA_BIN`/libs). Check `--sherpa-bin` wiring and `/opt/sherpa/lib`. |
 | `CRISPASR_GPU_BACKEND='…' not supported` | Accepted: `cpu`, `cuda`, `metal`, `vulkan`. |
 | `GGUF_MODEL='…' not found` | The baked GGUF path moved, or you set `GGUF_MODEL` to a non-existent file. Set it **empty** to use engine `-m auto --auto-download` into `CRISPASR_CACHE_DIR` (first download needs network). |
 | `crispasr exited with code N: …` | Engine-side failure; the tail of stderr/stdout is embedded. Common on the VM: GPU busy, unsupported audio, corrupt WAV. |
@@ -131,7 +133,7 @@ in an ephemeral temp dir and is gone after the run.
   is missing on the host, or the compose `deploy.resources` GPU reservation
   is skipped by a non-Swarm runtime; the image itself builds fine.
 - First run downloads nothing for the model (GGUF is baked into the image);
-  it **does** fetch the foxnose embedder on first diarized run into
+  it **does** fetch the --diarize-embedder auto GGUF embedders on first diarized run into
   `CRISPASR_CACHE_DIR` (`/var/cache/crispasr`, persisted by the
   `crispasr-cache` volume). No network at that moment fails the job with an
   engine-side error — pre-warm once or switch `DIAR_METHOD` deliberately.

@@ -3,8 +3,8 @@
 Asynchronous HTTP job API that takes WAV/MP3/M4A/AAC/OGG/FLAC uploads and
 returns a diarized Markdown transcript. Backend per the spike GO verdict
 (card t_7e17589e): the `crispasr` CUDA CLI v0.8.43 running the Nemotron 3.5
-ASR streaming 0.6B model as a Q4_K GGUF, with foxnose global-speaker
-diarization by default. The retired in-process NeMo/torch path is gone; no
+ASR streaming 0.6B model as a Q4_K GGUF, with sherpa-onnx global-speaker
+diarization by default (card t_5a287979; see "Diarization models"). The retired in-process NeMo/torch path is gone; no
 `nemo` or `torch` import remains on the real path.
 
 ## Architecture
@@ -394,10 +394,69 @@ curl -sS "http://127.0.0.1:8000/v1/jobs/$TOKEN/download?format=md" -o transcript
 ```
 
 The compose file pins the backend contract (`CRISPASR_GPU_BACKEND=cuda`,
-`DIAR_METHOD=foxnose`, `VRAM_LIMIT_MIB=3584`, `CRISPASR_TIMEOUT_SECONDS=1800`)
-and persists the foxnose embedder cache (`crispasr-cache:/var/cache/crispasr`)
+`DIAR_METHOD=sherpa`, `VRAM_LIMIT_MIB=3584`, `CRISPASR_TIMEOUT_SECONDS=1800`)
+and persists the engine embedder cache (`crispasr-cache:/var/cache/crispasr`)
 and job state (`jobs-data:/data/jobs`). `HOST_PORT` (default 8000) remaps the
 published port.
+
+## Diarization models (card t_5a287979)
+
+Default `DIAR_METHOD=sherpa`: the engine shells out to the external
+**sherpa-onnx** CLI for segmentation + speaker embedding + clustering —
+the engine's own `--help` names `sherpa`/`ecapa` as the reliable path.
+This replaced the old `foxnose` default after live measurement on the NV
+host: foxnose's global pass prints `windows=357 skipped=0 -> 1 speakers
+(cosine_similarity_single_speaker)` on the 249 s NASA SEWP panel file —
+its BIC counter's cosine single-speaker veto (fixed threshold 0.16 in
+the engine's spectral diarizer) collapses 5 real speakers to one label
+before any silhouette sweep runs. The embeddings are separable (pinning
+`--diarize-num-speakers 5` yields 76 turns across speakers 0..4), so the
+collapse is the count estimator, not the audio.
+
+Three vendored artifacts are baked into the image (`Dockerfile`, all
+from **k2-fsa/sherpa-onnx GitHub releases** — never guessed, each pinned
+by sha256 of the exact asset bytes; GitHub publishes no digests, ours
+were computed on the NV host 2026-10-22):
+
+| Artifact | Release asset URL | sha256 |
+|---|---|---|
+| sherpa-onnx CLI + libs | `github.com/k2-fsa/sherpa-onnx/releases/download/v1.13.8/sherpa-onnx-v1.13.8-linux-x64-shared.tar.bz2` -> `/opt/sherpa/{bin,lib}` | `c0bdb7907d3a74bba1d55d22bf4d9fa75586cf1530614ebe88a27b9118e015c4` |
+| segmentation model | `.../download/speaker-segmentation-models/sherpa-onnx-reverb-diarization-v1.tar.bz2` -> `/opt/models/sherpa-onnx-reverb-diarization-v1.onnx` | `615761e980be1688da0ef81618c056134d63aa55ea0a5f1494c47393b9398eab` (tarball), inner `model.onnx` `8249e2e323f8fb0566a387d94b40a73d0b75d54ee60d02dcd729a56a5ba8ecea` |
+| embedding model | `.../download/speaker-recongition-models/3dspeaker_speech_eres2net_base_sv_zh-cn_3dspeaker_16k.onnx` -> `/opt/models/` (same name) | `1a331345f04805badbb495c775a6ddffcdd1a732567d5ec8b3d5749e3c7a5e4b` |
+
+The segmentation model is the REVERB-trained variant, not plain
+pyannote-segmentation-3-0: NV-host A/B over the card fixtures shows it
+roughly halves the single-speaker over-split while the panel file keeps
+separating.
+
+`SHERPA_BIN` points the engine at `scripts/sherpa-diarization-wrapper.sh`
+(installed `/opt/sherpa/sherpa-diarization-wrapper`): the engine passes
+`--clustering.num-clusters` + the model paths but has **no flag** for
+`--clustering.cluster-threshold`, which is the knob that decides how
+many speakers sherpa's FastClustering emits. Measured via the full
+engine contract (reverb-seg + eres2net + threshold):
+
+| threshold | panel file (249 s, 5 real speakers) | BestPractice (137 s, ~1-2) | marklex control (79 s, 2) |
+|---|---|---|---|
+| 0.35 | **5 speakers** (= reference count) | 3 | 4 |
+| 0.38 | 3 | 3 | 4 |
+| 0.40 (shipped default) | 3 | 2 | 4 |
+| 0.45 | 2 (collapse) | 2 | not measured |
+
+The shipped default 0.40 meets the card's `>= 3` bar on the panel while
+keeping single-speaker output no worse than the retired foxnose default;
+tune `SHERPA_CLUSTER_THRESHOLD` per deployment (lower -> more speakers).
+Honest limits: 0.40 yields 3 speakers on a 5-speaker panel (the exact 5
+needs 0.35 at the cost of 3 labels on single-speaker audio — engine-side
+limitation, no service-side knob achieves both; filed upstream against
+CrispASR), and marklex over-splits 2 -> 4 on the zh-trained embedding.
+
+`DIAR_METHOD=foxnose` remains selectable and is faster; `none` is the
+documented escape (segments get one speaker by design). If `sherpa` or
+`ecapa` is configured without its models, the service **refuses to
+start** (`CrispasrConfigError` names the missing files) — the old silent
+degradation to a fake one-speaker transcript is closed at both startup
+and runtime.
 
 ## Quickstart (no GPU, mock pipeline)
 
@@ -509,7 +568,12 @@ the remaining non-CUDA paths are documented as upstream facts for reference,
 not as supported deployments of this service. The
 adapter additionally accepts only `cpu`/`cuda`/`metal`/`vulkan` for
 `CRISPASR_GPU_BACKEND` (CONFIG.md); there is no supported engine path here
-for HIP, WASM, or CANN at all. Operator details for the unverified rows —
+for HIP, WASM, or CANN at all. **Diarization parity (card t_5a287979,
+AC5):** the sherpa-onnx CLI, its shared libraries, and both diarization
+ONNX models live in backend-independent Dockerfile layers (sherpa-onnx
+clustering runs on CPU onnxruntime — see "Diarization models"), so the
+CUDA and Vulkan images carry the SAME model files and the SAME default
+`DIAR_METHOD=sherpa`. Operator details for the unverified rows —
 per-row URLs, prerequisites, selection flags, a container-asset-swap
 recipe, and a "convert a row to verified" checklist — follow in the
 subsections below the measured-CPU material.

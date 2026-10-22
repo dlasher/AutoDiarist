@@ -59,11 +59,20 @@ crispasr -f <wav> --backend nemotron \
          -oj -of <workdir>/crispasr_out \
          [--cache-dir <CRISPASR_CACHE_DIR>] \
          [--diarize --diarize-method <DIAR_METHOD> \
-          (--diarize-model auto for sortformer | --diarize-embedder auto otherwise)]
+          (--diarize-model auto for sortformer | --diarize-embedder auto otherwise) \
+          (--sherpa-segment-model <SHERPA_SEGMENT_MODEL> \
+           --sherpa-embedding-model <SHERPA_EMBEDDING_MODEL> \
+           [--sherpa-bin <SHERPA_BIN>] for sherpa/ecapa)]
 ```
 
 `DIAR_METHOD=none` omits the diarization flags; the segment mapping then
-collapses everything to a single speaker. The subprocess environment is
+collapses everything to a single speaker. For `sherpa`/`ecapa` the engine
+shells out to the sherpa-onnx CLI (`SHERPA_BIN`, a wrapper that injects
+`--clustering.cluster-threshold=<SHERPA_CLUSTER_THRESHOLD>`); if either
+ONNX model is missing the engine emits speaker-less segments — the
+adapter refuses that at startup (`CrispasrConfigError`) and rejects it
+at runtime (`CrispasrError`) instead of normalizing to one fake speaker
+(card t_5a287979 AC4). The subprocess environment is
 `os.environ` with the binary's own directory and `CRISPASR_LIB_DIR`
 prepended to `LD_LIBRARY_PATH`, so the bundled/CUDA-13 libraries resolve
 before system copies.

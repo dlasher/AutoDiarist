@@ -1,5 +1,46 @@
 # Changelog
 
+## [Unreleased] — multi-speaker diarization fix (card t_5a287979)
+
+**Diarization default changed: `DIAR_METHOD=foxnose` -> `sherpa`.**
+foxnose's global BIC speaker counter collapses panel recordings — live
+engine measurement on the 249 s NASA SEWP file:
+`foxnose windows=357 skipped=0 -> 1 speakers
+(cosine_similarity_single_speaker)`. The engine's own help names
+`sherpa`/`ecapa` ("external sherpa-onnx subprocess with segmentation +
+speaker embedding + clustering") as the reliable path; on the image it
+was dead — no sherpa CLI, no ONNX models — AND failing silently:
+label-less segments normalized into a fake single-speaker transcript.
+
+* `pipeline/transcribe.py`: `DIAR_METHOD_DEFAULT=sherpa`; the two model
+  paths + optional `SHERPA_BIN` wire into the engine command;
+  `sherpa`/`ecapa` without their models now raise `CrispasrConfigError`
+  at startup (AC4 — silent degradation closed); label-less engine output
+  for a labeling method raises `CrispasrError` at runtime; a present
+  single label still maps to exactly one speaker (AC7). `foxnose`/`none`
+  stay selectable.
+* `scripts/sherpa-diarization-wrapper.sh` + `SHERPA_CLUSTER_THRESHOLD`
+  (default 0.40): injects the clustering distance threshold the engine
+  cannot pass; calibration table in README "Diarization models".
+  Shipped default keeps panel >= 3 speakers (reference is 5; exact 5
+  needs 0.35 which costs single-speaker files — recorded honestly).
+* `Dockerfile`: three new vendored, sha256-pinned artifacts from
+  k2-fsa/sherpa-onnx releases (CLI tarball -> `/opt/sherpa`, reverb
+  segmentation + eres2net embedding ONNX -> `/opt/models`, wrapper ->
+  `/opt/sherpa/sherpa-diarization-wrapper`). The layers are
+  backend-independent (CPU onnxruntime), so CUDA and Vulkan images carry
+  the SAME files and the same default (AC5); packaging card t_f82ad22a
+  folds the GPU variant into a build arg around them.
+* `tests/pipeline/test_diarization_speakers.py`: RED-on-main regression
+  suite (9 failed / 1 passed before the fix) — startup refusals, command
+  wiring, silent-degradation guard, single-speaker preservation, plus
+  engine-gated integration tests asserting the panel fixture yields
+  >= 3 distinct speakers and the pyannote 2-speaker control keeps >= 2.
+* marklex 44.1 kHz stereo note: the service decode path (`ffmpeg -ac 1
+  -ar 16000`) already normalizes any input before the engine/sherpa
+  ever see it; the raw sherpa CLI's "Expect sample rate 16000" abort
+  only affects bypassing calls. Not a service bug.
+
 ## [1.5.0] - 2026-10-21 — V1.5 wave: multi-user behaviour on one service (integrated by card t_f41ad4f2)
 
 One deployment shared by several people at once: every user gets a

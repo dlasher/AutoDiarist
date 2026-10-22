@@ -90,11 +90,51 @@ def test_dockerfile_sets_runtime_env_contract_and_non_root_user() -> None:
         "CRISPASR_CACHE_DIR=/var/cache/crispasr",
         "CRISPASR_LIB_DIR=/usr/local/cuda-13.0/targets/x86_64-linux/lib",
         "CRISPASR_GPU_BACKEND=cuda",
-        "DIAR_METHOD=foxnose",
+        "DIAR_METHOD=sherpa",
         "VRAM_LIMIT_MIB=3584",
         "CRISPASR_TIMEOUT_SECONDS=1800",
     ):
         assert fragment in dockerfile
+
+
+def test_dockerfile_bakes_sherpa_diarization_stack_backend_independent() -> None:
+    """Card t_5a287979 (AC3/AC5/AC8): the sherpa method's THREE vendored
+    artifacts -- the sherpa-onnx CLI tarball, the segmentation model, the
+    embedding model -- plus the threshold wrapper are baked into the single
+    shared runtime layer, so the CUDA and Vulkan images carry the SAME
+    files and the same default DIAR_METHOD. URLs are k2-fsa/sherpa-onnx
+    GitHub release assets (never guessed), pinned by sha256."""
+    dockerfile = read("Dockerfile")
+
+    assert "k2-fsa/sherpa-onnx/releases/download/v1.13.8/" \
+        "sherpa-onnx-v1.13.8-linux-x64-shared.tar.bz2" in dockerfile
+    assert "c0bdb7907d3a74bba1d55d22bf4d9fa75586cf1530614ebe88a27b9118e015c4" in dockerfile
+    assert "speaker-segmentation-models/sherpa-onnx-reverb-diarization-v1.tar.bz2" in dockerfile
+    assert "615761e980be1688da0ef81618c056134d63aa55ea0a5f1494c47393b9398eab" in dockerfile
+    assert "speaker-recongition-models/3dspeaker_speech_eres2net_base_sv_zh-cn_3dspeaker_16k.onnx" in dockerfile
+    assert "1a331345f04805badbb495c775a6ddffcdd1a732567d5ec8b3d5749e3c7a5e4b" in dockerfile
+    assert "sha256sum -c" in dockerfile
+    # models land at the paths the ENV contract advertises
+    assert "/opt/models/sherpa-onnx-reverb-diarization-v1.onnx" in dockerfile
+    assert "/opt/models/3dspeaker_speech_eres2net_base_sv_zh-cn_3dspeaker_16k.onnx" in dockerfile
+    # wrapper installed at exactly the SHERPA_BIN default (compose + ENV)
+    assert "COPY scripts/sherpa-diarization-wrapper.sh /opt/sherpa/sherpa-diarization-wrapper" in dockerfile
+    assert "chmod +x /opt/sherpa/sherpa-diarization-wrapper" in dockerfile
+    # build-time wrapper self-check (planner review 3): proves LD_LIBRARY_PATH
+    # resolution and the injected flag against the vendored CLI at build time
+    assert "/opt/sherpa/sherpa-diarization-wrapper --help" in dockerfile
+    assert "clustering.cluster-threshold" in dockerfile
+    # include/ cleanup targets the extraction dir, not /tmp (planner review 1)
+    assert "rm -rf /opt/sherpa/include" in dockerfile
+    assert "SHERPA_BIN=/opt/sherpa/sherpa-diarization-wrapper" in dockerfile
+    assert "SHERPA_CLUSTER_THRESHOLD=0.40" in dockerfile
+    # AC5: the diarization layers run on CPU onnxruntime -- they must not
+    # reference the CUDA engine assets, so the Vulkan build-arg variant
+    # (t_f82ad22a) can share them unchanged.
+    diar_block = dockerfile[dockerfile.index("--- diarization stack"):]
+    assert "crispasr-linux" not in diar_block
+    assert "cuda-cudart" not in diar_block
+    assert "libcublas" not in diar_block
 
 
 def test_compose_pins_gpu_backend_and_persists_crispasr_state() -> None:
@@ -103,7 +143,13 @@ def test_compose_pins_gpu_backend_and_persists_crispasr_state() -> None:
     assert "driver: nvidia" in compose
     assert "count: all" in compose
     assert "CRISPASR_GPU_BACKEND: cuda" in compose
-    assert "DIAR_METHOD: foxnose" in compose
+    assert "DIAR_METHOD: sherpa" in compose
+    # t_5a287979: the sherpa method must ship its model wiring in compose,
+    # same defaults on CUDA and Vulkan images (AC5).
+    assert "SHERPA_SEGMENT_MODEL" in compose
+    assert "SHERPA_EMBEDDING_MODEL" in compose
+    assert "SHERPA_BIN" in compose
+    assert "SHERPA_CLUSTER_THRESHOLD" in compose
     assert "VRAM_LIMIT_MIB: 3584" in compose
     assert "CRISPASR_TIMEOUT_SECONDS: 1800" in compose
     assert "crispasr-cache:/var/cache/crispasr" in compose
