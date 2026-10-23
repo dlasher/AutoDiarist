@@ -661,11 +661,49 @@ container-asset-swap recipe, and a "convert a row to verified" checklist
 | `crispasr-linux-x86_64.tar.gz` (plain) | none (CPU-only build); AVX2 baseline — "it fails fast with an explanatory error on older CPUs since #380/#405" (upstream install.md) | plain binary; `--gpu-backend cpu` | CPU-only standalone asset; the asset GitHub-release installers default to | no — NOT verified on this project's hardware (as a separate asset) |
 | `crispasr-linux-x86_64-cpu-legacy.tar.gz` | none (CPU-only); generic x86-64/SSE2 baseline (upstream install.md table) | `--gpu-backend cpu` | CPU-only; targets pre-AVX2 hosts | no — NOT verified on this project's hardware (as a separate asset) |
 | `crispasr-linux-x86_64-avx512.tar.gz` | none (CPU-only); AVX-512-capable CPU (upstream install.md table) | `--gpu-backend cpu` | CPU-only; AVX-512 vectorized build | no — NOT verified on this project's hardware (as a separate asset) |
-| `crispasr-linux-x86_64-vulkan.tar.gz` | Vulkan-capable GPU plus its vendor ICD/runtime — upstream: the tarball "require[s] their respective runtimes at link time (no CPU fallback)" | **packaged AMD target (t_f82ad22a):** built via `docker-compose.amd.yml` (`GPU_BACKEND=vulkan` + `CRISPASR_GPU_BACKEND: vulkan` pinned literal, `--gpu-backend vulkan` at the engine; `-dev N` picks the device) | statically linked: **no** CPU fallback — fails loudly without the runtime; entrypoint pins the RADV/amdgpu ICD | GPU path proven on 10.4.10.55 via amd-bringup v3; zero-edit compose contract runs on the host per the AMD Quickstart |
+| `crispasr-linux-x86_64-vulkan.tar.gz` | Vulkan-capable GPU plus its vendor ICD/runtime — upstream: the tarball "require[s] their respective runtimes at link time (no CPU fallback)" | **packaged AMD target (t_f82ad22a):** built via `docker-compose.amd.yml` (`GPU_BACKEND=vulkan` + `CRISPASR_GPU_BACKEND: vulkan` pinned literal, `--gpu-backend vulkan` at the engine; `-dev N` picks the device) | statically linked: **no** CPU fallback — fails loudly without the runtime; entrypoint pins the RADV/amdgpu ICD | **yes — measured.** AMD target: Radeon 8060S iGPU (Ryzen AI Max+ 395, gfx1151, Mesa RADV) on host 10.4.10.55; NVIDIA reference: T400 4GB (Turing CC 7.5). Same image, same `DIAR_METHOD=sherpa`, same model bytes — only the engine build and the GPU differ. **AMD is ~2.2x FASTER** end-to-end (see the A/B table below); it also produced *identical* segment and speaker counts to the T400 on the same audio. Built from a fresh clone with `docker compose -f docker-compose.amd.yml up --build` — no hand-edited files, no `.env`. |
 | `crispasr-linux-x86_64-hip.tar.gz` | AMD GPU + ROCm runtime (same upstream sentence as Vulkan) | the asset *is* the ROCm build; upstream documents no `--gpu-backend hip` example — and there is **no service-side path**: `CRISPASR_GPU_BACKEND` accepts only `cuda`/`cpu`/`metal`/`vulkan` (CONFIG.md) | statically linked: **no** CPU fallback | no — NOT verified on this project's hardware |
 | Metal — `-DGGML_METAL=ON` source build on macOS/Apple Silicon (the v0.8.43 page also carries `crispasr-macos-arm64.tar.gz`; never opened here) | macOS on Apple Silicon (upstream marks `-DGGML_METAL=ON` as the Apple Silicon flag) | `--gpu-backend metal`; service-side `CRISPASR_GPU_BACKEND=metal` is accepted for the pip-install dev path, not the Linux container | there is no Metal release asset for Linux at all — this project's image is Linux | no — NOT verified on this project's hardware |
 | WASM — `crispasr-wasm.tar.gz` (prebuilt) or `build-wasm.sh` source build | browser with threading (upstream README: "Multithreaded, runs entirely client-side with COOP/COEP headers"); emsdk toolchain for source builds | n/a for the CLI/service — browser client-side artifact; this service spawns the native CLI | browser-oriented path, not a server deployment | no — NOT verified on this project's hardware |
 | CANN — `-DGGML_CANN=ON` source build via the manual workflow | Huawei Ascend NPU + CANN SDK; **no CANN release asset exists in v0.8.43** (checked against the release's asset list) | build with `-DGGML_CANN=ON`, then `--gpu-backend cann -dev N` | see the CANN caveat below: a green `cann-build.yml` run is compile proof only | no — NOT verified on this project's hardware |
+
+### AMD vs NVIDIA — measured A/B (2026-10-22, kanban t_97bbd597)
+
+Two deploys of the **same** image family, the **same** model bytes
+(Nemotron 3.5 ASR streaming 0.6B Q4_K GGUF, sha256 `22480dd2…`), the **same**
+`DIAR_METHOD=sherpa` and the **same** diarization models. Only the engine build
+and the GPU differ. Measured as a pure consumer over the HTTP API — no host
+access, no GPU tooling on either side.
+
+| host | GPU | engine build | cores / RAM |
+|---|---|---|---|
+| NVIDIA (10.4.10.58) | T400 4GB, Turing CC 7.5 (320 GB/s HBM2) | `crispasr-linux-x86_64-cuda13.tar.gz` | 4 / i9-13900H |
+| AMD (10.4.10.55) | Radeon 8060S iGPU (Ryzen AI Max+ 395, gfx1151, Mesa RADV) | `crispasr-linux-x86_64-vulkan.tar.gz` | many-core / 131 GB |
+
+| input | NVIDIA wall | NVIDIA RTF | AMD wall | AMD RTF | AMD lead |
+|---|---|---|---|---|---|
+| `whatIsNASASEWP_2026Update-CC` (249.0 s, 5-speaker panel) | 148.3 s | 1.68x | **68.1 s** | **3.66x** | **2.2x** |
+| `BestPractice_RFQ_CC` (137.5 s, single voice) | 80.4 s | 1.71x | **37.2 s** | **3.69x** | **2.2x** |
+
+RTF = audio seconds / wall seconds (higher is faster). Both backends returned
+**identical output shape** — 18 segments / 3 speakers on the panel file and
+8 / 2 on the single-speaker file — so the difference is throughput, not
+transcript content.
+
+Notes for anyone repeating this:
+
+- The sherpa diarization pass clusters on **CPU** (onnxruntime `provider=cpu`),
+  so total throughput depends on the host's core count as well as its GPU.
+  That is why the AMD lead holds (or widens) once `DIAR_METHOD=sherpa` is the
+  default: the GPU is no longer the only constraint.
+- `CRISPASR_TIMEOUT_SECONDS` (default 1800) is a hard wall-clock budget for
+  the whole job, not an idle timeout. Long inputs need it raised — e.g. a
+  140-minute file needs ~83 min on the 4-core T400 and ~38 min on the AMD host,
+  so run long jobs with `CRISPASR_TIMEOUT_SECONDS=10800`.
+- The AMD target is reached with `docker compose -f docker-compose.amd.yml up
+  --build` after `scripts/vulkan-host-setup.sh` (one host-side step granting the
+  container's uid 10001 access to `/dev/dri` + `/dev/kfd`).
+
 
 ### CPU execution — measured (v0.8.43, kanban t_18ee2e43)
 

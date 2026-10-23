@@ -94,6 +94,28 @@ label-less segments normalized into a fake single-speaker transcript.
   ever see it; the raw sherpa CLI's "Expect sample rate 16000" abort
   only affects bypassing calls. Not a service bug.
 
+- **AMD vs NVIDIA measured A/B** (2026-10-22, kanban t_97bbd597). Two deploys of
+  the same image family, same model bytes, same `DIAR_METHOD=sherpa`, same
+  diarization models; only the engine build and the GPU differ. Measured as a
+  pure consumer over the HTTP API.
+  - `whatIsNASASEWP_2026Update-CC` (249.0 s): NVIDIA 148.3 s (1.68x) |
+    AMD 68.1 s (**3.66x**) — AMD 2.2x faster
+  - `BestPractice_RFQ_CC` (137.5 s): NVIDIA 80.4 s (1.71x) |
+    AMD 37.2 s (**3.69x**) — AMD 2.2x faster
+  - Both backends returned identical output shape (18 seg / 3 spk and
+    8 seg / 2 spk) — the difference is throughput, not transcript content.
+  - The sherpa diarization pass clusters on CPU, so throughput depends on the
+    host's core count as well as its GPU — this is why the AMD lead holds
+    (and widens) once sherpa is the default method.
+- **README "Other backends" Vulkan row** no longer credits the retired
+  `amd-bringup.sh` operator script; it now carries the measured speed, the
+  hardware identity, and the fact that the AMD target is reached from a fresh
+  clone with `docker compose -f docker-compose.amd.yml up --build`.
+- **Operational note added to the README:** `CRISPASR_TIMEOUT_SECONDS` (default
+  1800) is a hard wall-clock budget for the whole job, not an idle timeout.
+  A 140-minute input needs ~83 min on the 4-core T400 and ~38 min on the AMD
+  host, so long jobs must raise it (e.g. `CRISPASR_TIMEOUT_SECONDS=10800`).
+
 ## [1.5.0] - 2026-10-21 — V1.5 wave: multi-user behaviour on one service (integrated by card t_f41ad4f2)
 
 One deployment shared by several people at once: every user gets a
