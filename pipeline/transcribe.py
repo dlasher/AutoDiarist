@@ -17,11 +17,16 @@ VRAM discipline inherited from card t_95726260:
   GPU memory allocated during the invocation; the run logs
   ``allocated=/peak=`` lines (INFO) and ``TranscriptionOOM`` is raised when
   the peak exceeds ``VRAM_LIMIT_MIB`` (default 3584 = 3.5 GiB).
-* per-chunk progress streaming (card t_1eb108e0) — the engine prints one
-  timestamped chunk line per completed ~30 s window; the adapter consumes
-  live stdout line-by-line and publishes ``("asr", done, total)`` reports on
-  those real boundaries, so the ``transcribing`` band refines during the run
-  without timers (mapping lives in ``api/main.py::_engine_progress``).
+* live progress streaming (cards t_1eb108e0, t_2e901945) — measured on the
+  pinned binary, the engine's diarized stdout transcript is APP-HELD until
+  the final merge (``stdbuf -oL`` and even a pty deliver nothing mid-run
+  on long inputs), so stdout chunk lines alone left the ``transcribing``
+  band frozen for hours on a 140-minute job. The in-run boundary source is
+  the engine's ``-pp`` stderr stream — one unbuffered line per completed
+  ~30 s slice ("crispasr: progress =  X% (k/N slices)") — which the adapter
+  tails from the stderr file and publishes as ``("asr", done, total)``
+  reports, so progress advances on real engine boundaries, never timers
+  (mapping lives in ``api/main.py::_engine_progress``).
 * the silent CPU fallback trap (missing libcudart/libcublas drops crispasr
   to CPU ~11x slower without error): the adapter pins ``--gpu-backend`` and
   probes ``crispasr --version`` for CUDA backend registration before
@@ -221,6 +226,14 @@ def build_crispasr_command(wav_path: str, out_base: str) -> list[str]:
         crispasr_bin() or "crispasr",
         "-f", str(wav_path),
         "--backend", ASR_BACKEND,
+        # Card t_2e901945: -pp makes the engine write one unbuffered
+        # "progress = X% (k/N slices)" line to STDERR per completed audio
+        # slice. Verified live on the pinned 0.8.43 binary (86/86 lines,
+        # real-time cadence over 39 min). This is the only in-run work-
+        # boundary channel the engine has: its diarized stdout transcript
+        # is held until the merge stage and stdbuf/PTY tricks change that
+        # (see _run_crispasr docstring).
+        "-pp",
     ]
     model = gguf_model_path()
     if model:
@@ -398,6 +411,27 @@ def _stream_chunk_end_seconds(line: str) -> float | None:
         return _parse_hms(match.group(1))
     except ValueError:
         return None
+
+
+# Slice-progress line the engine writes to stderr per completed audio
+# slice under -pp (card t_2e901945). Format captured verbatim from the
+# pinned crispasr 0.8.43 on the NV host; the percent field carries either
+# an int or one decimal and may be padded with multiple spaces.
+_SLICE_PROGRESS = re.compile(
+    r"progress = +\d+(?:\.\d+)?% \((\d+)/(\d+) slices\)")
+
+
+def _slice_progress_report(line: str) -> tuple[int, int] | None:
+    """``(slice_done, slice_total)`` from a -pp stderr line, else ``None``.
+
+    Only engine slice completions count as work boundaries here; noise
+    (banners, ggml backend lines, diarize chatter) returns ``None`` so the
+    progress stream can never advance on a non-event.
+    """
+    match = _SLICE_PROGRESS.search(line)
+    if not match:
+        return None
+    return int(match.group(1)), int(match.group(2))
 
 
 def _engine_chunk_total(duration: float,
@@ -633,6 +667,39 @@ def _stdout_pump(stream, sink: queue.Queue) -> None:
         sink.put(None)
 
 
+def _stderr_progress_pump(path: str, proc: subprocess.Popen, sink,
+                          stop: threading.Event) -> None:
+    """Follow the engine's stderr file, feeding every line to ``sink``.
+
+    Card t_2e901945: the diarized stdout transcript is held by the engine
+    until the merge stage, but stderr (a regular file here) is unbuffered,
+    so ``-pp`` slice lines land the moment a slice completes. Polling the
+    file is merely the read mechanism — progress values still come ONLY
+    from real engine output; a silent engine yields no reports and the
+    published progress stays frozen (an honest "no new work yet").
+    Terminates when the engine exits (draining the rest of the file) or
+    ``stop`` is set.
+    """
+    try:
+        handle = open(path, "r", errors="replace")
+    except OSError:
+        return
+    with handle:
+        while True:
+            line = handle.readline()
+            if line:
+                sink(line)
+                continue
+            if stop.is_set() or proc.poll() is not None:
+                # One exit path only: drain every remaining byte first, so
+                # the last slice lines of a finishing engine are never lost
+                # to a stop request that races the final writes.
+                for rest in handle:
+                    sink(rest)
+                return
+            stop.wait(0.05)
+
+
 def _kill_process_group(proc: subprocess.Popen) -> None:
     """Terminate the streamed engine's whole process group, TERM then KILL.
 
@@ -670,13 +737,21 @@ def _run_crispasr(wav_path: str, work_dir: str,
                   chunk_total: int = 0) -> list[dict[str, Any]]:
     """One whole-file crispasr invocation -> parsed Segment dicts.
 
-    Engine stdout is streamed line-by-line: each diarized chunk line is a
-    real work boundary and advances ``progress("asr", done, chunk_total)``
-    when the caller supplied a chunk total. stdout/stderr are never
-    accumulated in memory (an earlier fix banned ``capture_output`` due to
-    a pipe-buffer deadlock): stderr lands in ``work_dir`` and failure
-    paths read only its tail. ``CRISPASR_TIMEOUT_SECONDS`` keeps its wall-
-    clock semantics; on expiry the whole process group is killed.
+    Live progress needs TWO channels (card t_2e901945, measured on the
+    pinned 0.8.43 binary): the diarized stdout transcript is app-held by
+    the engine until the final merge — neither ``stdbuf -oL`` nor a pty
+    releases a single line earlier on a long input — so stdout chunk
+    lines only refine progress at the end of the run. The in-run signal
+    is the engine's ``-pp`` stderr stream (always passed by
+    ``build_crispasr_command``): one unbuffered line per completed audio
+    slice, tailed from the stderr file and reported as
+    ``progress("asr", done, total)`` real work boundaries. Short jobs,
+    whose stdout burst arrives promptly, behave exactly as before.
+    stdout/stderr are never accumulated in memory (an earlier fix banned
+    ``capture_output`` due to a pipe-buffer deadlock): stderr lands in
+    ``work_dir`` and failure paths read only its tail.
+    ``CRISPASR_TIMEOUT_SECONDS`` keeps its wall-clock semantics; on
+    expiry the whole process group is killed.
     """
     started = time.monotonic()
     out_base = os.path.join(work_dir, "crispasr_out")
@@ -715,6 +790,30 @@ def _run_crispasr(wav_path: str, work_dir: str,
         pump = threading.Thread(target=_stdout_pump, args=(proc.stdout, lines),
                                 daemon=True)
         pump.start()
+        # Card t_2e901945: tail the engine's stderr FILE for -pp slice
+        # completions — the only channel that delivers work boundaries
+        # DURING the run on long inputs (see _stderr_progress_pump).
+        stderr_done = 0
+        stderr_stop = threading.Event()
+
+        def _on_stderr_line(line: str) -> None:
+            nonlocal stderr_done
+            if progress is None or chunk_total <= 0:
+                return
+            report = _slice_progress_report(line)
+            if report is None:
+                return
+            slice_done, slice_total = report
+            if slice_done > stderr_done:  # monotone: never regress
+                stderr_done = slice_done
+                progress("asr", slice_done, slice_total)
+
+        stderr_pump = threading.Thread(
+            target=_stderr_progress_pump,
+            args=(stderr_path, proc, _on_stderr_line, stderr_stop),
+            daemon=True,
+        )
+        stderr_pump.start()
         timed_out = False
         try:
             while True:
@@ -740,6 +839,8 @@ def _run_crispasr(wav_path: str, work_dir: str,
             with contextlib.suppress(OSError, ValueError):
                 if proc.stdout is not None:
                     proc.stdout.close()
+            stderr_stop.set()
+            stderr_pump.join(timeout=2.0)
         if timed_out:
             raise CrispasrError(f"crispasr timed out after {timeout:.0f}s: {command[:1]}")
         returncode = proc.wait()

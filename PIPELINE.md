@@ -19,8 +19,9 @@ t_14ac6b49); bands are the `[start, end)` slice of `[0, 1]` each stage owns:
 
 Progress values in `status.json` are **monotonic non-decreasing** and
 published only at real work boundaries — never from timers. Within a band,
-engine-reported per-pass/per-chunk counts refine the value (card
-t_1eb108e0: the adapter streams the engine's stdout and maps `asr`/`diar`
+engine-reported per-pass/per-slice counts refine the value (card
+t_1eb108e0, and card t_2e901945: the adapter consumes the engine's `-pp`
+stderr slice stream plus its stdout chunk lines, mapping `asr`/`diar`
 reports onto the `transcribing`/`diarizing` bands via
 `api/main.py::_ENGINE_STAGES`); a requeue-then-reclaim never rewinds
 progress (monotonicity clamp, card t_14ac6b49 review rework).
@@ -51,7 +52,7 @@ longer uses (the engine auto-slices into ~30 s windows internally; measured
 `build_crispasr_command` composes:
 
 ```text
-crispasr -f <wav> --backend nemotron \
+crispasr -f <wav> --backend nemotron -pp \
          -m <GGUF_MODEL or 'auto' + --auto-download> \
          -l <CRISPASR_LANGUAGE, default en-US> \
          --gpu-backend <CRISPASR_GPU_BACKEND, default cuda> \
@@ -158,6 +159,33 @@ and raises `CrispasrError`.
 (Speaker 1 greeting + Speaker 2 reply, 0.0–7.2 s) without touching ffmpeg,
 the binary, or the GPU, so the full queue/render path is exercisable on
 GPU-free CI.
+
+### Live progress on long jobs (card t_2e901945)
+
+What moves `GET /v1/jobs/{token}` during a long transcription, and why it
+can be trusted:
+
+* **The engine's `-pp` stderr stream is the in-run signal.** The adapter
+  always passes `-pp`; crispasr then writes one line per completed audio
+  slice — `crispasr: progress =  X% (k/N slices)` — to stderr, which is
+  unbuffered at the C level and lands in the job's `crispasr_stderr.log`
+  the moment a slice finishes. The adapter tails that file during the run
+  and publishes `("asr", k, N)` reports, so a 39-minute input produced 86
+  distinct progress events at real cadence (measured live on the NV host
+  against the pinned 0.8.43 binary).
+* **Why not stdout, the previously documented signal.** The diarized
+  transcript crispasr prints to stdout is app-held until the final merge
+  stage. Measured against the pinned binary: a piped stdout yields zero
+  bytes for ~80% of the run, and NEITHER `stdbuf -oL` NOR a pty changes
+  that — the hold is not stdio buffering, so no shim can fix it. Stdout
+  chunk lines still refine progress when the burst finally arrives, which
+  is why short jobs always looked healthy before this fix.
+* **Never a timer.** No heartbeat, no wall-clock interpolation: a
+  progress value that moves without engine evidence is a lie, and a
+  progress value that lies about work done is worse than a frozen one.
+  Where the engine itself runs a silent blocking stage (the global sherpa
+  timeline pre-pass), progress honestly stays at the band floor until the
+  next real boundary.
 
 ## Spell check (`pipeline/spellcheck.py`)
 

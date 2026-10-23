@@ -1,5 +1,23 @@
 # Changelog
 
+## [Unreleased] — live job progress on long inputs (card t_2e901945)
+
+**`GET /v1/jobs/{token}` now moves during long transcriptions instead of
+freezing at 0.30.** Measured live: a 140-minute job published exactly
+three progress values over two hours of engine time, because crispasr's
+diarized stdout transcript is app-held until the final merge stage — a
+pipe received zero bytes for ~80% of the run and neither `stdbuf -oL` nor
+a pty released it earlier (the card's block-buffering diagnosis was
+tested against the pinned 0.8.43 binary and refuted). The adapter now
+passes `-pp` and tails the engine's unbuffered stderr stream, where
+crispasr reports one real work boundary per completed audio slice
+(`progress = X% (k/N slices)`), and publishes those as transcribing-band
+progress — 86 distinct advancing events over a 39-minute input, live on
+the NV host. The no-timer guarantee is unchanged: a silent engine still
+means honestly frozen progress, and short jobs behave exactly as before.
+(PIPELINE.md "Live progress on long jobs"; regression tests in
+tests/pipeline/test_engine_streaming.py.)
+
 ## [Unreleased] — one-command deploy packaging (card t_f82ad22a)
 
 **Contract: `git clone`, pick your compose file, `docker compose up` —
