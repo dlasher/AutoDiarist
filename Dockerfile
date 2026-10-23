@@ -75,6 +75,12 @@ ARG GPU_BACKEND=cuda
 #                           decides the speaker count)
 #   SHERPA_CLUSTER_THRESHOLD 0.40 default (NV-host calibration; larger ->
 #                           fewer clusters). Tunable at deploy time.
+#   DIARIZATION_MAX_SPEAKERS 8 default (card t_38e52d89): ceiling on
+#                           distinct diarization labels, enforced by the
+#                           wrapper's conditional second clustering pass
+#                           (only when the auto pass exceeds it — clean
+#                           audio replays byte-identical). 0 disables.
+#                           See autodiarist-speaker-count-ceiling.md.
 #   VRAM_LIMIT_MIB          3.5 GiB ceiling; spike measured 1085 MiB peak
 #                           over a 39-min file, engine auto-slices ~30 s
 #   CRISPASR_TIMEOUT_SECONDS 30 min per-job budget
@@ -93,6 +99,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
     SHERPA_EMBEDDING_MODEL=/opt/models/3dspeaker_speech_eres2net_base_sv_zh-cn_3dspeaker_16k.onnx \
     SHERPA_BIN=/opt/sherpa/sherpa-diarization-wrapper \
     SHERPA_CLUSTER_THRESHOLD=0.40 \
+    DIARIZATION_MAX_SPEAKERS=8 \
     VRAM_LIMIT_MIB=3584 \
     CRISPASR_TIMEOUT_SECONDS=1800
 

@@ -81,6 +81,7 @@ services:
       SHERPA_EMBEDDING_MODEL: ${SHERPA_EMBEDDING_MODEL:-/opt/models/3dspeaker_speech_eres2net_base_sv_zh-cn_3dspeaker_16k.onnx}
       SHERPA_BIN: ${SHERPA_BIN:-/opt/sherpa/sherpa-diarization-wrapper}
       SHERPA_CLUSTER_THRESHOLD: ${SHERPA_CLUSTER_THRESHOLD:-0.40}
+      DIARIZATION_MAX_SPEAKERS: ${DIARIZATION_MAX_SPEAKERS:-8}
       # 7 GiB ceiling: mirrors the proven amd-bringup VRAM pin on the 8 GB
       # RX 6600 (the CUDA file pins 3584 for the 4 GB T400 — per-host by
       # design, both are conservative ceilings, not hardware discovery).

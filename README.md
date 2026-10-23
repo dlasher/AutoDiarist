@@ -481,6 +481,9 @@ Honest limits: 0.40 yields 3 speakers on a 5-speaker panel (the exact 5
 needs 0.35 at the cost of 3 labels on single-speaker audio — engine-side
 limitation, no service-side knob achieves both; filed upstream against
 CrispASR), and marklex over-splits 2 -> 4 on the zh-trained embedding.
+Separately from threshold tuning, `DIARIZATION_MAX_SPEAKERS` (default 8)
+caps the label count on pathological audio — see
+`autodiarist-speaker-count-ceiling.md`.
 
 `DIAR_METHOD=foxnose` remains selectable and is faster; `none` is the
 documented escape (segments get one speaker by design). If `sherpa` or
@@ -756,6 +759,19 @@ not a transcription one.
 lower threshold can be set per deployment without rebuilding the image —
 raising it merges clusters, lowering it splits them. No single value is
 correct for every recording.
+
+`DIARIZATION_MAX_SPEAKERS` (default **8**, card t_38e52d89) bounds the
+explosion independently of the threshold: the wrapper counts the distinct
+labels of the auto pass and, **only when they exceed the ceiling**, re-runs
+clustering forcing that many clusters — stripping the engine's own
+`--clustering.num-clusters=0` first, since a bare appended flag is a silent
+no-op (sweep 1). Compliant audio (the panel, promo and marklex fixtures) is
+replayed byte-identical: a bare fixed cluster count over-splits cleanly
+separated speakers (measured: panel 2 -> 4 at NC=8). `0` disables the
+ceiling (DIARIZATION_MAX_SPEAKERS=0). The Q&A file drops from 100 labels
+to at most 8; the exact
+6–7-speaker reference needs upstream engine work, not more service knobs.
+Full rule, measurements and follow-ups: `autodiarist-speaker-count-ceiling.md`.
 
 Other long-input facts worth knowing:
 
