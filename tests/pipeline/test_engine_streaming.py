@@ -296,3 +296,125 @@ def test_engine_chunk_total_math():
     assert tr._engine_chunk_total(29.0) == 1
     assert tr._engine_chunk_total(0.0) == 0
     assert tr._engine_chunk_total(-5.0) == 0
+
+
+# ---------------------------------------------------------------------------
+# card t_2e901945 — live progress from the engine's -pp stderr stream
+#
+# Measured on the NV host against the pinned crispasr 0.8.43: in diarize
+# mode the engine app-holds its diarized stdout transcript until the merge
+# stage (stdbuf -oL AND a pty both deliver nothing until ~the last 20% of
+# the run), so stdout chunk lines cannot be the live signal. The engine
+# DOES write one unbuffered line per completed slice to stderr under
+# ``-pp`` ("crispasr: progress =  X% (k/N slices)") — verified live: all
+# 86/86 lines arrive in real time over a 39-minute input. The adapter must
+# therefore pass -pp and consume stderr slice completions as the real
+# work boundaries that advance progress DURING the run.
+# ---------------------------------------------------------------------------
+
+SLICE_LINE = "crispasr: progress =  {pct}% ({k}/{n} slices)"
+
+
+def _slicing_fake(tmp_path: Path, name: str, sentinel: Path,
+                  slices: int = 2) -> Path:
+    """Fake engine that mirrors the real -pp stderr cadence.
+
+    Emits per-slice progress lines to STDERR mid-run, then BLOCKS until the
+    test's progress callback creates ``sentinel`` (proving the adapter
+    consumed a stderr boundary while the engine was still running). On a
+    20 s timeout it gives up with exit 7 — the RED state. Only after the
+    sentinel appears does it write the JSON, like the real engine holding
+    its transcript to the very end. stdout stays silent (the diarized
+    transcript burst cannot be used in tests as the live signal).
+    """
+    script = f"""
+if [ "$1" = "--version" ]; then echo "ggml backends : cpu,cuda"; exit 0; fi
+OF=""
+while [ $# -gt 0 ]; do
+  if [ "$1" = "-of" ]; then OF="$2"; fi
+  shift
+done
+echo "crispasr: processing {slices} slice(s)" >&2
+echo "{SLICE_LINE.format(pct='50.0', k=1, n=slices)}" >&2
+i=0
+while [ "$i" -lt 200 ]; do
+  if [ -e {sentinel} ]; then break; fi
+  sleep 0.1
+  i=$((i + 1))
+done
+if [ ! -e {sentinel} ]; then
+  echo "fake engine: sentinel never created - adapter missed live boundaries" >&2
+  exit 7
+fi
+echo "{SLICE_LINE.format(pct='100.0', k=slices, n=slices)}" >&2
+cat > "$OF.json" <<'EOF'
+{json.dumps(OUTPUT_JSON)}
+EOF
+"""
+    return _fake_binary(tmp_path, name, script)
+
+
+def test_build_command_requests_engine_slice_progress():
+    # AC contract: the adapter must pass -pp, the pinned engine's only
+    # verified real-time boundary channel (stderr is unbuffered).
+    cmd = tr.build_crispasr_command("/tmp/in.wav", "/tmp/out_base")
+    assert "-pp" in cmd
+
+
+def test_stderr_slice_progress_advances_during_run(tmp_path, monkeypatch):
+    sentinel = tmp_path / "advance"
+    fake = _slicing_fake(tmp_path, "crispasr-slices", sentinel)
+    wav = _use(tmp_path, monkeypatch, fake)
+    monkeypatch.setattr(tr, "_probe_duration", lambda path: 90.0)
+    reports: list = []
+
+    def cb(stage, done, total):
+        reports.append((stage, done, total))
+        if stage == "asr" and done < total:
+            sentinel.touch()  # only reached if a LIVE boundary arrived
+
+    segments = tr.transcribe_and_diarize(wav, progress=cb)
+    asr = [r for r in reports if r[0] == "asr"]
+    # k=1 and k=2 arrive from stderr while the engine runs; (3,3) is the
+    # existing clean-exit completion guard (chunk_total from duration).
+    assert asr == [("asr", 1, 2), ("asr", 2, 2), ("asr", 3, 3)]
+    assert sentinel.exists()
+    assert segments  # json parsed: the run finished normally
+
+
+def test_no_interim_progress_without_engine_output(tmp_path, monkeypatch):
+    # AC3: a timer that fabricates movement while the engine is silent is
+    # banned. This engine emits ONLY non-boundary noise, sleeps, then
+    # finishes: interim reports (done < total) must be exactly zero.
+    script = """
+if [ "$1" = "--version" ]; then echo "ggml backends : cpu,cuda"; exit 0; fi
+OF=""
+while [ $# -gt 0 ]; do
+  if [ "$1" = "-of" ]; then OF="$2"; fi
+  shift
+done
+echo "crispasr 0.8.43 (git eb633d90, Release) [backends: cpu,cuda]" >&2
+echo "ggml_cuda_init: found 1 CUDA devices" >&2
+echo "crispasr: processing 3 slice(s)" >&2
+sleep 2
+cat > "$OF.json" <<'EOF'
+""" + json.dumps(OUTPUT_JSON) + """
+EOF
+"""
+    fake = _fake_binary(tmp_path, "crispasr-silent", script)
+    wav = _use(tmp_path, monkeypatch, fake)
+    monkeypatch.setattr(tr, "_probe_duration", lambda path: 90.0)
+    reports, cb = _collector()
+    tr.transcribe_and_diarize(wav, progress=cb)
+    interim = [r for r in reports if r[0] == "asr" and r[1] < r[2]]
+    assert interim == []
+
+
+def test_slice_progress_line_parsed():
+    parse = tr._slice_progress_report
+    assert parse("crispasr: progress =  90% (10/11 slices)") == (10, 11)
+    assert parse("crispasr: progress =  1.1% (1/86 slices)") == (1, 86)
+    assert parse("crispasr: progress = 100% (86/86 slices)") == (86, 86)
+    assert parse("crispasr: processing 86 slice(s)") is None
+    assert parse("[00:00:32.860 --> 00:00:56.540] (speaker 0) hi") is None
+    assert parse("") is None
