@@ -116,16 +116,20 @@ label-less segments normalized into a fake single-speaker transcript.
   the same image family, same model bytes, same `DIAR_METHOD=sherpa`, same
   diarization models; only the engine build and the GPU differ. Measured as a
   pure consumer over the HTTP API.
-  - `whatIsNASASEWP_2026Update-CC` (249.0 s): NVIDIA 148.3 s (1.68x) |
-    AMD 68.1 s (**3.66x**) — AMD 2.2x faster
-  - `BestPractice_RFQ_CC` (137.5 s): NVIDIA 80.4 s (1.71x) |
-    AMD 37.2 s (**3.69x**) — AMD 2.2x faster
+  - `whatIsNASASEWP_2026Update-CC` (249.0 s): NVIDIA 146.4 s (1.70x) |
+    AMD 19.5 s (**12.78x**) — AMD 7.5x faster
+  - `BestPractice_RFQ_CC` (137.5 s): NVIDIA 80.1 s (1.72x) |
+    AMD 37.1 s (**3.70x**) — AMD 2.2x faster
   - Both backends returned identical output shape (18 seg / 3 spk and
     8 seg / 2 spk) — the difference is throughput, not transcript content.
-  - CAVEAT: those wall times were measured with long jobs occupying the other
-    jobs in each host's queue (one GPU worker per host), so they are upper
-    bounds rather than clean single-job figures. An idle-queue measurement of
-    the same 137.5 s file on the AMD host came in at 24.5 s (5.60x).
+  - These are the job's OWN elapsed time (started_at to terminal status), so
+    they exclude queue wait. Earlier figures taken under load (AMD 3.66x /
+    3.69x) are superseded. With one GPU worker per host a submit-to-done wall
+    time includes the queue wait, which was measured at up to 3.5x the job's
+    real cost on a busy host.
+  - The AMD lead comes mostly from the CPU: diarization clusters on one core
+    while the GPU does ASR, and the AMD host has 12 cores / 112 GiB against
+    the NVIDIA host's 4 cores / 7.9 GiB.
   - The sherpa diarization pass clusters on CPU, so throughput depends on the
     host's core count as well as its GPU — this is why the AMD lead holds
     (and widens) once sherpa is the default method.

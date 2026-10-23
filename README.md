@@ -682,15 +682,24 @@ access, no GPU tooling on either side.
 
 | input | NVIDIA wall | NVIDIA RTF | AMD wall | AMD RTF | AMD lead |
 |---|---|---|---|---|---|
-| `whatIsNASASEWP_2026Update-CC` (249.0 s, 5-speaker panel) | 148.3 s | 1.68x | **68.1 s** | **3.66x** | **2.2x** |
-| `BestPractice_RFQ_CC` (137.5 s, single voice) | 80.4 s | 1.71x | **37.2 s** | **3.69x** | **2.2x** |
+| `whatIsNASASEWP_2026Update-CC` (249.0 s, 5-speaker panel) | 146.4 s | 1.70x | **19.5 s** | **12.78x** | **7.5x** |
+| `BestPractice_RFQ_CC` (137.5 s, single voice) | 80.1 s | 1.72x | **37.1 s** | **3.70x** | **2.2x** |
 
-> **These wall times were measured while long jobs occupied the other jobs in
-> each host's queue** (a single GPU worker per host). They are therefore
-> upper bounds, not clean single-job measurements. An idle-queue measurement of
-> the same file on the AMD host came in at **24.5 s (5.60x)** — so treat the
-> figures above as "measured under load", and re-measure on an idle queue
-> before quoting them as headline throughput.
+Both backends produced **identical output** for both files: 18 segments / 3
+speakers on the panel, 8 / 2 on the single-voice file. Only the time differs.
+
+These are the job's own elapsed time (`started_at` to terminal status), so they
+**exclude queue wait** — which matters: with one GPU worker per host, a
+submit-to-done wall time includes however long the job sat behind others, and
+on a busy host that was measured at 3.5x the job's real cost. To reproduce,
+read the job's `started_at` from the status payload rather than timing the
+POST. Earlier measurements taken under load were 3.66x / 3.69x on AMD — the
+numbers above supersede them.
+
+The AMD lead comes mostly from the **CPU**, not the GPU: the diarization pass
+clusters on one core (`onnxruntime` CPU provider) while the GPU handles ASR, and
+the AMD host has 12 cores and 112 GiB against the NVIDIA host's 4 cores and
+7.9 GiB.
 
 RTF = audio seconds / wall seconds (higher is faster). Both backends returned
 **identical output shape** — 18 segments / 3 speakers on the panel file and
