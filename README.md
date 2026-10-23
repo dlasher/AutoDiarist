@@ -712,6 +712,53 @@ Notes for anyone repeating this:
   container's uid 10001 access to `/dev/dri` + `/dev/kfd`).
 
 
+### Long-form inputs — measured (2026-10-22, kanban t_f01b2b89)
+
+Long inputs behave differently from short ones, in two separate ways.
+
+**Throughput.** A 140-minute input takes about as long as its own duration on
+the 4-core NVIDIA host, because the fixed per-invocation costs (the engine's
+first diarization call being handed the whole file, model loads, and the
+single-threaded diarization pass) amortize over a long file. Short inputs are
+setup-dominated and run much faster in relative terms.
+
+| input | host | wall | RTF |
+|---|---|---|---|
+| SEWP Training Day 1 (140 min) | NVIDIA T400 | 147 min | **0.78–0.95x** |
+| SEWP Q&A (118 min) | AMD 8060S | 32 min | **3.73x** |
+
+**Diarization accuracy.** The speaker count depends on the kind of audio, and
+the current threshold does not fit every kind:
+
+| input | reference speakers | found | direction |
+|---|---|---|---|
+| SEWP update (249 s, panel) | 5 | 3 | under-clustered |
+| SEWP Training Day 1 (140 min, training) | 10 | 7 | under-clustered |
+| SEWP Q&A (118 min, overlapping Q&A) | 6–7 | 100 | **over-clustered** |
+
+The Q&A result is a known limitation: on rapid overlapping exchanges with
+several people talking over each other, the clustering fragments the audio
+instead of grouping it — most of the 100 labels cover only one or two
+segments. The transcript itself is not fragmenting (2% of segments are ≤4
+words, against 10% in the reference), so this is a speaker-labelling problem,
+not a transcription one.
+
+`SHERPA_CLUSTER_THRESHOLD` is a deployment-level environment variable, so a
+lower threshold can be set per deployment without rebuilding the image —
+raising it merges clusters, lowering it splits them. No single value is
+correct for every recording.
+
+Other long-input facts worth knowing:
+
+- `CRISPASR_TIMEOUT_SECONDS` (default 1800) is a **hard wall-clock budget for
+  the whole job**, not an idle timeout. Long inputs need it raised — e.g.
+  `CRISPASR_TIMEOUT_SECONDS=10800`.
+- The progress endpoint does not currently advance during a long job: the
+  engine's stdout is block-buffered when it is a pipe, so its chunk-boundary
+  lines do not reach the service until the buffer fills. Use the job's
+  `started_at` to judge liveness on long inputs.
+
+
 ### CPU execution — measured (v0.8.43, kanban t_18ee2e43)
 
 Protocol: the pinned `crispasr-linux-x86_64-cuda13.tar.gz` (sha256
