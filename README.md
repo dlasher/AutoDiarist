@@ -685,6 +685,13 @@ access, no GPU tooling on either side.
 | `whatIsNASASEWP_2026Update-CC` (249.0 s, 5-speaker panel) | 148.3 s | 1.68x | **68.1 s** | **3.66x** | **2.2x** |
 | `BestPractice_RFQ_CC` (137.5 s, single voice) | 80.4 s | 1.71x | **37.2 s** | **3.69x** | **2.2x** |
 
+> **These wall times were measured while long jobs occupied the other jobs in
+> each host's queue** (a single GPU worker per host). They are therefore
+> upper bounds, not clean single-job measurements. An idle-queue measurement of
+> the same file on the AMD host came in at **24.5 s (5.60x)** — so treat the
+> figures above as "measured under load", and re-measure on an idle queue
+> before quoting them as headline throughput.
+
 RTF = audio seconds / wall seconds (higher is faster). Both backends returned
 **identical output shape** — 18 segments / 3 speakers on the panel file and
 8 / 2 on the single-speaker file — so the difference is throughput, not
