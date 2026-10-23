@@ -288,8 +288,11 @@ def test_compose_cuda_target_pins_backend_and_nvidia_reservation() -> None:
     assert "SHERPA_EMBEDDING_MODEL" in compose
     assert "SHERPA_BIN" in compose
     assert "SHERPA_CLUSTER_THRESHOLD" in compose
-    assert "VRAM_LIMIT_MIB: 3584" in compose
-    assert "CRISPASR_TIMEOUT_SECONDS: 1800" in compose
+    # Operator-tunable knobs: overridable from the host, with the documented
+    # default still shipped (see
+    # test_operator_tunable_knobs_are_interpolated_not_hardcoded).
+    assert "VRAM_LIMIT_MIB: ${VRAM_LIMIT_MIB:-3584}" in compose
+    assert "CRISPASR_TIMEOUT_SECONDS: ${CRISPASR_TIMEOUT_SECONDS:-1800}" in compose
     assert "crispasr-cache:/var/cache/crispasr" in compose
     assert "jobs-data:/data/jobs" in compose
     assert "MOCK_PIPELINE" in compose
@@ -451,3 +454,21 @@ def test_retention_and_disk_env_defaults() -> None:
         assert "RETENTION_DAYS: ${RETENTION_DAYS:-30}" in compose
         assert "DISK_MIN_FREE_MIB: ${DISK_MIN_FREE_MIB:-8192}" in compose
         assert "DISK_CHECK_INTERVAL_SECONDS: ${DISK_CHECK_INTERVAL_SECONDS:-300}" in compose
+
+
+def test_operator_tunable_knobs_are_interpolated_not_hardcoded() -> None:
+    """CRISPASR_TIMEOUT_SECONDS and VRAM_LIMIT_MIB must honour the environment.
+
+    They were hardcoded literals, so an operator could not raise the per-job
+    budget from the host: `CRISPASR_TIMEOUT_SECONDS=10800 docker compose up -d`
+    silently kept 1800, and a 140-minute input was killed at 30 minutes and
+    reported failed — which looks like a backend failure, not a config ceiling.
+    """
+    for name in ("docker-compose.yml", "docker-compose.amd.yml"):
+        compose = (ROOT / name).read_text()
+        for knob in ("CRISPASR_TIMEOUT_SECONDS", "VRAM_LIMIT_MIB"):
+            assert re.search(
+                rf"^\s+{knob}:\s*\$\{{{knob}:-",
+                compose,
+                re.M,
+            ), f"{name}: {knob} must be an overridable ${{{knob}:-default}}"

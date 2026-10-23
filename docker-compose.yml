@@ -52,8 +52,8 @@ services:
       # FastClustering emits). Override SHERPA_CLUSTER_THRESHOLD to tune.
       SHERPA_BIN: ${SHERPA_BIN:-/opt/sherpa/sherpa-diarization-wrapper}
       SHERPA_CLUSTER_THRESHOLD: ${SHERPA_CLUSTER_THRESHOLD:-0.40}
-      VRAM_LIMIT_MIB: 3584
-      CRISPASR_TIMEOUT_SECONDS: 1800
+      VRAM_LIMIT_MIB: ${VRAM_LIMIT_MIB:-3584}
+      CRISPASR_TIMEOUT_SECONDS: ${CRISPASR_TIMEOUT_SECONDS:-1800}
       # Retention + disk-pressure (card t_5e6200fc). Defaults match
       # api/main.py; the watermark must fit the volume backing /data/jobs.
       RETENTION_DAYS: ${RETENTION_DAYS:-30}
