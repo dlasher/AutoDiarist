@@ -20,3 +20,6 @@ _quarantine-mock-*/
 # Job output dirs (container writes /data/jobs; local runs may drop ./jobs)
 /jobs/
 /data/
+
+# Kanban worker worktrees (local only)
+.worktrees/
