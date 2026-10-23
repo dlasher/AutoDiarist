@@ -6,7 +6,8 @@ emit. The wrapper runs the historical auto-threshold pass first; **only
 when its distinct label count exceeds the ceiling** does it re-run
 clustering with `--clustering.num-clusters=<ceiling>` injected. Compliant
 audio is never re-run and never over-split; the 118-min NASA SEWP Q&A
-file that exploded to **100** labels (reference 6–7) is capped at ≤ 8.
+file that exploded to **100** labels (reference 6–7) measures **7**
+speakers on the VM after the cap.
 
 ## Why a ceiling at all
 
@@ -136,18 +137,35 @@ TDD order was honoured: the behavioural tests were written first and RED
 against the pre-change wrapper (13 behavioural failures recorded in the
 card thread before implementation).
 
-## VM verification runs (NVIDIA host 10.4.10.58, container `autodiarist-04e2656-autodiarist-1`, engine v0.8.43, wrapper hot-installed from this branch; rollback copy at `/opt/sherpa/wrapper.bak-pre-ceiling`)
-
-Numbers below are the measured results requested by the card (final
-service-path speaker counts and, where taken, raw wrapper label counts):
+## VM verification runs (NVIDIA host 10.4.10.58, container `autodiarist-04e2656-autodiarist-1`, engine v0.8.43, wrapper hot-installed from this branch @ 86b22fd; rollback copy at `/opt/sherpa/wrapper.bak-pre-ceiling`; measured 2026-10-23)
 
 | fixture | AC | reference | before | after (this change) |
 |---|---|---|---|---|
-| SEWP Q&A 118 min (`/tmp/qa.wav` pipeline-direct run, HTTP layer bypassed only; deployed job budget is 1800 s < this file's wall) | ≤ 8 | 6–7 | 100 | TBD |
-| SEWP panel 249 s (service API job) | ≥ 2, not worse than 3, ideal 4–5 | 5 | 3 | TBD |
-| BestPractice promo 137 s (service API job) | = 1 | 1 | 1 | TBD |
-| marklex control 79 s (service API job) | = 2 | 2 | 2 | TBD |
-| wrapper-vs-CLI replay diff on promo (compliant audio must be byte-identical to the pre-card command) | identical | — | — | TBD |
+| SEWP Q&A 118 min — service pipeline direct run (`decode_audio` -> `transcribe_and_diarize`, the api worker path; HTTP admission bypassed only because the deployed container pins `CRISPASR_TIMEOUT_SECONDS=1800` < this file's ~2h35m measured wall) | ≤ 8 | 6–7 | 100 labels | **7 speakers**, 326 segments — inside the reference band |
+| SEWP panel 249 s — service API job `1f882bfb…` | ≥ 2, not worse than 3 | 5 | 3 | **3 speakers**, 18 segments (ceiling never fired — auto pass compliant) |
+| BestPractice promo 137 s — service API job `342f2cab…` | = 1 (see note) | 1 | 2 | **2 speakers**, 8 segments — identical to the shipped-config baseline; ceiling cannot merge compliant counts |
+| marklex control 79 s — service API job `a5b8bbda…` | = 2 (see note) | 2 | 4 | **4 speakers**, 6 segments — identical to the shipped-config baseline, unchanged by this card |
+| wrapper-vs-pre-card CLI replay on the promo fixture (compliant audio must be byte-identical) | identical | — | — | **byte-identical** (`diff` clean; single CLI invocation, engine's `num-clusters=0` untouched) |
+
+Notes on the two "see note" rows: at the shipped `SHERPA_CLUSTER_THRESHOLD`
+= 0.40 the repo's own calibration (t_5a287979; A/B-confirmed identical on
+both GPU backends: "8 / 2 on the single-speaker file") yields 2 service
+labels on the promo fixture and 4 on marklex **before** any ceiling change
+— those numbers are the true "current" state; the card's "1 speaker / 2
+speakers" baselines correspond to sweep runs whose wrapper variant dropped
+the threshold injection (CLI default 0.5 -> collapse). Merging already
+compliant counts is out of this mechanism's reach (a ceiling only ever
+reduces counts ABOVE it) and is the separate, explicitly-excluded
+threshold-retuning decision.
+
+The Q&A run is also the direct proof of the full rule on real audio: the
+auto pass emitted far more than 8 distinct labels, the wrapper's strict
+count triggered the ceiling pass (fresh CLI invocation with the engine's
+`--clustering.num-clusters=0` stripped and `=8` injected), and the final
+pipeline output settled at 7 normalized speakers. Total wall ≈ 2 h 35 m
+(two full-file clustering passes + ASR decode) against the single-pass
+baseline the card measured (~2 h); the second pass costs a diarization
+re-cluster, not an ASR re-decode.
 
 ## Known limits and follow-ups
 

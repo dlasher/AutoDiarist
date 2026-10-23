@@ -19,7 +19,9 @@ fixtures replay byte-identical and nothing re-runs for them.
 single shared layer, so the CUDA and Vulkan images carry the change
 identically; the knob is documented in README, CONFIG.md and
 `.env.example`. Rule, sweeps, measurements and follow-ups:
-`autodiarist-speaker-count-ceiling.md`. (Tests:
+`autodiarist-speaker-count-ceiling.md`. VM-measured: Q&A 100 -> **7**
+speakers (326 segments, inside the 6-7 reference band); panel stays 3;
+compliant fixtures replay byte-identical and never re-run. (Tests:
 tests/pipeline/test_speaker_count_ceiling.py.)
 
 ## [Unreleased] — live job progress on long inputs (card t_2e901945)

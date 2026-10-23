@@ -769,8 +769,8 @@ no-op (sweep 1). Compliant audio (the panel, promo and marklex fixtures) is
 replayed byte-identical: a bare fixed cluster count over-splits cleanly
 separated speakers (measured: panel 2 -> 4 at NC=8). `0` disables the
 ceiling (DIARIZATION_MAX_SPEAKERS=0). The Q&A file drops from 100 labels
-to at most 8; the exact
-6–7-speaker reference needs upstream engine work, not more service knobs.
+to a measured **7** — inside the 6–7-speaker reference band; finer
+accuracy than that needs upstream engine work, not more service knobs.
 Full rule, measurements and follow-ups: `autodiarist-speaker-count-ceiling.md`.
 
 Other long-input facts worth knowing:
