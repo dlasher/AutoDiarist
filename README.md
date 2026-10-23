@@ -753,10 +753,16 @@ Other long-input facts worth knowing:
 - `CRISPASR_TIMEOUT_SECONDS` (default 1800) is a **hard wall-clock budget for
   the whole job**, not an idle timeout. Long inputs need it raised — e.g.
   `CRISPASR_TIMEOUT_SECONDS=10800`.
-- The progress endpoint does not currently advance during a long job: the
-  engine's stdout is block-buffered when it is a pipe, so its chunk-boundary
-  lines do not reach the service until the buffer fills. Use the job's
-  `started_at` to judge liveness on long inputs.
+- The progress endpoint advances during a long job on real engine work
+  boundaries (card t_2e901945). The adapter runs the engine with `-pp`,
+  which writes one unbuffered line per completed ~30 s audio slice to
+  stderr (`crispasr: progress =  X% (k/N slices)`); the service tails that
+  stream and refines the `transcribing` band per slice — measured 28
+  distinct advancing values polling `GET /v1/jobs/{token}` every 10 s
+  through a 39-minute job. It is still not a timer: if the engine is
+  silent, progress honestly freezes (no synthetic heartbeat exists), and
+  a `started_at` check remains the fallback during the engine's silent
+  blocking stages (the global diarization pre-pass).
 
 
 ### CPU execution — measured (v0.8.43, kanban t_18ee2e43)
