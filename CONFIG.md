@@ -36,7 +36,7 @@ GPU-default values.
 | `JOBS_DIR` | `/tmp/autodiarist_jobs` | Job-state root. Created at import time; the compose file sets `/data/jobs` on a named volume. Holds `<token>/status.json` plus the decoded/transcribed artifacts. |
 | `MAX_UPLOAD_BYTES` | `524288000` (500 MiB) | Upload cap enforced while streaming; oversize uploads get `413` and leave no job dir. Parsed `int` at request time. |
 | `MOCK_PIPELINE` | unset | Exact `1` makes the worker short-circuit decode/ASR and write a deterministic mock result; admission, limits, cancellation, and download semantics are unchanged. |
-| `SPELL_CHECK` | unset | Exact `1` enables the spell-check stage in the worker. Note the two-way mismatch documented in PIPELINE.md: the API stage requires `==1`, while `pipeline.spellcheck` on its own defaults enabled unless the value is in `{0,false,no,off}`. |
+| `SPELL_CHECK` | unset (enabled) | Spell-check layer ON by default; the API seam and `pipeline.spellcheck` share `spell_check_enabled()` (`pipeline/spellcheck.py`), so unset → enabled, and `{0,false,no,off}` (case-insensitive) disables. The old API-only hard gate (`== "1"`) that meant the shipped service never ran the pass is retired (card t_72405565). Set `SPELL_CHECK=0` or `off` to opt out. |
 | `QUEUE_WORKER_ENABLED` | `1` | Exact `1` starts the in-process fair-share worker (round-robin across sessions) at startup; `0` admits jobs into `queued` and holds them (ops valve / tests). Jobs admitted while disabled are still claimed if the flag is flipped on later. |
 | `MAX_QUEUE_DEPTH` | `50` | System backpressure. At or beyond this many `queued` jobs, `POST /v1/jobs` answers `503` + `Retry-After` — the **only admission rejection** since V1.5 (card t_82bfbc15); the detail names both the depth and the Retry-After value. Accepted jobs are always queued, whatever the caller's session holds. |
 | `MAX_JOBS_PER_SESSION` | *(deprecated)* | **No effect** since V1.5 (card t_82bfbc15): a session may hold any number of active jobs. The variable is still accepted so existing `.env` files load unchanged; when set, startup logs `config: MAX_JOBS_PER_SESSION=... is DEPRECATED and IGNORED` and the value is omitted from the boot config summary. Remove it from your env. |
@@ -71,8 +71,8 @@ these no longer bound VRAM.
 
 | Variable | Default | Effect |
 | --- | --- | --- |
-| `SPELL_CHECK` | enabled | Line above shared with the API; read here via `_env_enabled`: absent → on, otherwise off only for `{0,false,no,off}` (case-insensitive). |
-| `VOCAB_PATH` | `vocab.txt` | Custom vocabulary file. Missing or unreadable files warn and degrade to no correction. |
+| `SPELL_CHECK` | enabled | Shared with the API seam above via `spell_check_enabled()`: absent → on, otherwise off only for `{0,false,no,off}` (case-insensitive). Both layers now agree (card t_72405565 retired the old exact-`1` API gate). |
+| `VOCAB_PATH` | `<repo>/vocab.txt` (absolute; `/app/vocab.txt` in the image) | Domain vocabulary the spell-check layer loads: NASA/SEWP terms (SEWP, NASA, GWAC, OMB, ITCAV, contract holder(s), soup contracts, exceptional) plus measured garble aliases (`sout, soupes => SEWP`, `soubcontracts => soup contracts`, `acceptional => exceptional`). One canonical term per line, `#` comments, optional `garble => Canonical` alias lines; extend by adding a line — the file is resolved by absolute path with no CWD dependence (card t_72405565). Missing or unreadable files warn and degrade to no correction. |
 
 ## Speaker self-identification — `pipeline/self_identification.py`
 

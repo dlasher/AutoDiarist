@@ -24,7 +24,8 @@ FastAPI + persistent fair-share job queue on disk
 worker stages per job (api/main.py process_job_background):
   decode (ffmpeg -> 16 kHz mono WAV; skipped in mock mode)
   transcribe + diarize (pipeline.transcribe -> crispasr subprocess, whole file)
-  spell check          (pipeline.spellcheck, only when SPELL_CHECK=1)
+  spell check          (pipeline.spellcheck, ON by default; SPELL_CHECK=0/off
+                        to disable; /app/vocab.txt domain vocabulary)
   llm cleanup          (pipeline.llm_cleanup, opt-in: only when an embedding
                         caller injects llm= — never from the HTTP/queue path)
   speaker self-ID      (pipeline.self_identification, weighted evidence)
@@ -217,7 +218,7 @@ of first appearance:
 | `decoding` | audio decode / resample to 16 kHz | 0.05 |
 | `transcribing` | ASR passes; engine-reported pass/chunk counts refine within the band (e.g. `Transcribing pass 2/4`) | 0.30–0.60 |
 | `diarizing` | diarized assembly, likewise refined per reported boundary | 0.60–0.75 |
-| `spellcheck` | optional; only runs when `SPELL_CHECK=1` | 0.75–0.80 |
+| `spellcheck` | ON by default; opt out `SPELL_CHECK=0/off` (domain vocab `/app/vocab.txt`) | 0.75–0.80 |
 | `llm_cleanup` | optional; only published when an embedding caller injects the LLM cleanup seam (`llm=`) — the HTTP/queue path never emits it | 0.80–0.85 |
 | `self_identification` | speaker-name suggestions | 0.85–0.92 |
 | `rendering` | Markdown report + result write-out | 0.92–1.00 |

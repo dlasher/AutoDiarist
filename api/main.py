@@ -17,7 +17,7 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel, ConfigDict
 
 from pipeline.transcribe import decode_audio, transcribe_and_diarize
-from pipeline.spellcheck import spell_check_segments
+from pipeline.spellcheck import spell_check_enabled, spell_check_segments
 from pipeline.llm_cleanup import CleanupSettings, run_llm_cleanup
 from pipeline.self_identification import suggest_speaker_names
 from pipeline.renderer import render_markdown
@@ -882,7 +882,11 @@ def process_job_background(token: str, audio_path: str, filename: str,
                      "Diarized assembly complete", stage="diarizing")
 
         suggestions: dict = {}
-        if os.environ.get("SPELL_CHECK") == "1" and not mock:
+        # Card t_72405565: the vocabulary pass is ON by default and shares the
+        # module's opt-out semantics (SPELL_CHECK in {0,false,no,off} disables
+        # it). The old hard gate on os.environ == "1" meant the shipped
+        # service never ran the pass at all.
+        if spell_check_enabled() and not mock:
             update_state("processing", STAGE_PROGRESS["spellcheck"],
                          "Spell-checking transcript...", stage="spellcheck")
             segments = spell_check_segments(segments).segments

@@ -55,6 +55,10 @@ services:
       DIARIZATION_MAX_SPEAKERS: ${DIARIZATION_MAX_SPEAKERS:-8}
       VRAM_LIMIT_MIB: ${VRAM_LIMIT_MIB:-3584}
       CRISPASR_TIMEOUT_SECONDS: ${CRISPASR_TIMEOUT_SECONDS:-1800}
+      # Domain vocabulary pass (card t_72405565). ON by default — the image
+      # bakes /app/vocab.txt with the NASA/SEWP terms measured mangled at
+      # Q4_K. SPELL_CHECK=0/off opts out; VOCAB_PATH overrides the vocabulary.
+      SPELL_CHECK: "1"
       # Retention + disk-pressure (card t_5e6200fc). Defaults match
       # api/main.py; the watermark must fit the volume backing /data/jobs.
       RETENTION_DAYS: ${RETENTION_DAYS:-30}

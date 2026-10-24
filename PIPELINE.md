@@ -11,7 +11,7 @@ t_14ac6b49); bands are the `[start, end)` slice of `[0, 1]` each stage owns:
 | `decoding` | `pipeline.transcribe.decode_audio` | 0.05–0.30 | skipped entirely in mock mode |
 | `transcribing` | `pipeline.transcribe` (CrispASR adapter) | 0.30–0.60 | always; refined per reported ASR chunk |
 | `diarizing` | same engine call, second pass | 0.60–0.75 | always; refined per diarized-chunk boundary |
-| `spellcheck` | `pipeline.spellcheck` | 0.75–0.80 | only when `SPELL_CHECK=1` (exact `1`) and not mock |
+| `spellcheck` | `pipeline.spellcheck` | 0.75–0.80 | ON by default (card t_72405565); skipped when `SPELL_CHECK` opts out (`0/false/no/off`) and in mock mode |
 | `llm_cleanup` | `pipeline.llm_cleanup` | 0.80–0.85 | only when the caller injects an `llm` callable into `process_job_background` (V2 seam; the HTTP path never does) |
 | `self_identification` | `pipeline.self_identification` | 0.85–0.92 | always (advisory; also folds in cleanup-pass name evidence when present) |
 | `rendering` | `pipeline.renderer` | 0.92–1.00 | always |
@@ -190,12 +190,32 @@ can be trusted:
 ## Spell check (`pipeline/spellcheck.py`)
 
 Vocabulary-only correction over Segment records; text absent from the
-vocabulary is never modified. Exact case-insensitive matches are canonicalized
-at every term length; for single-word vocabulary terms of six or more
-characters, a unique Damerau-Levenshtein distance-1 near miss is also
-canonicalized. Timing and speaker fields are preserved by construction. The
-worker runs this stage only when `SPELL_CHECK=1` exactly — see CONFIG.md for
-the module-level default difference.
+vocabulary is never modified. The shipped `vocab.txt` (baked at
+`/app/vocab.txt`; the module default resolves to it by absolute path, `VOCAB_PATH`
+overrides) carries the NASA/SEWP domain terms measured mangled at Q4_K —
+SEWP, NASA, NASA SEWP, GWAC, OMB, ITCAV, contract holder(s), soup contracts,
+exceptional — plus explicit garble-alias lines for the measured error forms
+(`sout, soupes => SEWP`, `soubcontracts => soup contracts`,
+`acceptional => exceptional`).
+
+Matching rules (all unique-match-only): exact case-insensitive phrases at
+every term length including aliases; single-word terms of four or more
+characters accept a distance-one near miss when the candidate is not an
+ordinary English word; term-boundary garbles are split
+('contractholders' -> 'contract holders') or joined ('its av' -> 'ITCAV')
+against the same concatenated term, distance-one joins restricted to
+same-length spans and refused when every window token is an ordinary word;
+runs of three or more identical single-character tokens (the measured
+`c c c c c c c c c cuture` hallucination) collapse. All-lowercase canonicals
+preserve source casing; acronyms are emitted as spelled. Corrections may
+change a segment's word count (join/split/collapse) but never segment count,
+order or timing — the word-count promise in the module docstring was
+revisited deliberately for the measured error classes (card t_72405565 AC5).
+
+The worker runs this stage ON by default; `SPELL_CHECK` in
+`{0,false,no,off}` opts out (shared `spell_check_enabled()` rule — the old
+API gate on exact `1` and the two-way default mismatch are retired;
+card t_72405565).
 
 ## Weighted-evidence speaker self-ID (`pipeline/self_identification.py`)
 

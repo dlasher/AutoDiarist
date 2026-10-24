@@ -254,6 +254,9 @@ RUN mkdir -p /var/cache/crispasr /data/jobs \
 WORKDIR /app
 COPY api ./api
 COPY pipeline ./pipeline
+# Domain vocabulary for the spell-check layer (card t_72405565): the module's
+# absolute default resolves to /app/vocab.txt here; VOCAB_PATH overrides it.
+COPY vocab.txt ./vocab.txt
 
 # Container entrypoint (card t_f82ad22a): auto-selects the AMD Vulkan ICD
 # (radeon|amdgpu glob under /usr/share/vulkan/icd.d — selecting ALL jsons
