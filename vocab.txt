@@ -1,0 +1,22 @@
+# AutoDiarist domain vocabulary (card t_72405565).
+# One canonical term per line. Optional explicit garble aliases use the form
+#   garble1, garble2 => Canonical term
+# Alias values are the MEASURED Q4_K renderings of the term (see
+# RESEARCH-precision-results.md); they are replaced exactly, case-insensitively.
+# This vocabulary is domain-only (NASA SEWP programme terms): the spell-check
+# layer never touches text absent from this file. Multi-word and dotted forms
+# that the line format cannot validate (e.g. 'sewp.nasa.gov') are intentionally
+# omitted rather than shipped malformed.
+SEWP
+NASA
+NASA SEWP
+GWAC
+OMB
+ITCAV
+contract holder
+contract holders
+soup contracts
+exceptional
+sout, soupes => SEWP
+soubcontracts => soup contracts
+acceptional => exceptional

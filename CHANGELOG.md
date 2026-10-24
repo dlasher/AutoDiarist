@@ -1,5 +1,31 @@
 # Changelog
 
+## [Unreleased] — domain lexicon that actually runs (card t_72405565)
+
+**The spell-check layer now runs in the shipped service and carries the
+measured NASA/SEWP vocabulary.** Four blockers made it inert: the API gate
+required `SPELL_CHECK` to be exactly `1` (no compose file set it, so the
+pass never ran), no `vocab.txt` existed, the default path was the relative
+`vocab.txt` (unresolvable against the service CWD), and the matching rules
+(>=6-character single words only) could not catch the measured Q4_K error
+classes. The API seam and the module now share one rule
+(`spell_check_enabled()`): ON by default, `{0,false,no,off}` opts out.
+`vocab.txt` ships in the repo and is baked to `/app/vocab.txt`; the module
+default is absolute (package-relative, no CWD dependence). New rules, all
+unique-match-only: near-miss floor lowered to 4 chars ('gwec'->'GWAC'),
+explicit measured-garble aliases ('sout, soupes => SEWP',
+'soubcontracts => soup contracts', 'acceptional => exceptional'),
+term-boundary split/join ('contractholders'->'contract holders',
+'its av'->'ITCAV') restricted against prose windows ('as a', 'it can' are
+never fused), and repeated single-character token runs collapse (the
+measured `c c c c c c c c c cuture` hallucination). Word count inside a
+segment may now change where the measured garbles changed it (docstring
+promise revisited); segment count, order and timing are untouched, and
+all-lowercase canonicals preserve source casing. Corpus probe across the
+four source transcripts: 40 corrections, all genuine domain fixes, zero
+prose damage. Both compose files set `SPELL_CHECK: "1"` explicitly.
+(Tests: tests/pipeline/test_spellcheck.py, tests/api/test_spellcheck_seam.py.)
+
 ## [Unreleased] — speaker-count ceiling (card t_38e52d89)
 
 **`DIARIZATION_MAX_SPEAKERS` (default 8) bounds the diarization label
