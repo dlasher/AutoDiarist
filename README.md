@@ -746,14 +746,16 @@ the current threshold does not fit every kind:
 |---|---|---|---|
 | SEWP update (249 s, panel) | 5 | 3 | under-clustered |
 | SEWP Training Day 1 (140 min, training) | 10 | 7 | under-clustered |
-| SEWP Q&A (118 min, overlapping Q&A) | 6–7 | 100 | **over-clustered** |
+| SEWP Q&A (118 min, overlapping Q&A) | 6–7 | 8 (100 on the raw auto path) | within the reference band |
 
-The Q&A result is a known limitation: on rapid overlapping exchanges with
-several people talking over each other, the clustering fragments the audio
-instead of grouping it — most of the 100 labels cover only one or two
-segments. The transcript itself is not fragmenting (2% of segments are ≤4
-words, against 10% in the reference), so this is a speaker-labelling problem,
-not a transcription one.
+The Q&A file is the hardest case — rapid overlapping exchanges with several
+people talking over each other. On the **raw auto-clustering path** it fragments
+the audio instead of grouping it, reaching 100 labels (most covering only one or
+two segments) against a reference of 6–7. The shipped service path yields 8 on
+the same file, and `DIARIZATION_MAX_SPEAKERS` (default 8) bounds the raw path
+too. The transcript itself does not fragment either way (2% of segments are ≤4
+words, against 10% in the reference) — this is a speaker-labelling problem, not
+a transcription one.
 
 `SHERPA_CLUSTER_THRESHOLD` is a deployment-level environment variable, so a
 lower threshold can be set per deployment without rebuilding the image —
