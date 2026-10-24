@@ -1,5 +1,29 @@
 # Changelog
 
+## [Unreleased] — speaker-count ceiling (card t_38e52d89)
+
+**`DIARIZATION_MAX_SPEAKERS` (default 8) bounds the diarization label
+count.** The NASA SEWP Q&A file (118 min, reference 6-7 speakers) exploded
+to 100 distinct labels through the auto-threshold clustering path. The
+sherpa wrapper now counts the distinct labels of the auto pass and, ONLY
+when they exceed the ceiling, re-runs clustering with
+`--clustering.num-clusters=<ceiling>` injected — after REMOVING the
+engine's own `--clustering.num-clusters=0` from the argv, because the CLI
+gives a positive num-clusters outright precedence over the threshold and
+an appended flag would be a silent no-op (measured: byte-identical output
+for every injected N until the strip was added). The ceiling is
+conditional on purpose: a bare fixed num-clusters over-splits
+cleanly-separated audio (measured: panel 2 -> 4 at NC=8), so compliant
+fixtures replay byte-identical and nothing re-runs for them.
+`0` disables the ceiling (pre-card behaviour). One wrapper script is the
+single shared layer, so the CUDA and Vulkan images carry the change
+identically; the knob is documented in README, CONFIG.md and
+`.env.example`. Rule, sweeps, measurements and follow-ups:
+`autodiarist-speaker-count-ceiling.md`. VM-measured: Q&A 100 -> **7**
+speakers (326 segments, inside the 6-7 reference band); panel stays 3;
+compliant fixtures replay byte-identical and never re-run. (Tests:
+tests/pipeline/test_speaker_count_ceiling.py.)
+
 ## [Unreleased] — live job progress on long inputs (card t_2e901945)
 
 **`GET /v1/jobs/{token}` now moves during long transcriptions instead of
