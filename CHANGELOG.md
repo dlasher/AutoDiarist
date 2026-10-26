@@ -1,5 +1,74 @@
 # Changelog
 
+## [Unreleased] — diarization thread cap corrected 8 -> 4 + measured curves (card t_71a5768f)
+
+**The default `SHERPA_MAX_THREADS` is now 4, the measured optimum on BOTH
+shipped hosts.** The AMD operator sweep (2026-10-26) discriminated between
+the planner's two candidate rules — "optimum == core count" and "optimum
+== a constant 4" — which make the SAME prediction on the 4-core NVIDIA box.
+On the 12-core AMD box the core-count rule predicted 12; the measurement
+says 4. The shipped default (cap 8) therefore resolved to 8 threads on the
+AMD host: 7% slower than the optimum and, with N=2 workers, 16 threads
+chasing 12 cores.
+
+Measured curves (isolated sherpa wall; absolute times are NOT comparable
+across hosts — different clips — so each row also gives seconds of
+diarization wall per second of audio):
+
+AMD host — 12 cores, 249 s panel clip → PLATEAU above the optimum:
+
+| threads | sherpa wall | vs 1 thread | s wall per s audio | speakers |
+|---|---|---|---|---|
+| 1 | 52.8 s | 1.00x | 0.212 | 5 |
+| 2 | 30.8 s | 1.72x | 0.124 | 5 |
+| **4** | **19.8 s** | **2.66x** | **0.080** | 5 | ← OPTIMUM |
+| 6 | 21.0 s | 2.52x | 0.084 | 5 |
+| 8 | 21.2 s | 2.49x | 0.085 | 5 |
+| 12 | 22.2 s | 2.38x | 0.089 | 5 |
+
+NVIDIA T400 host — 4 cores, 137.5 s clip → CLIFF above the optimum:
+
+| threads | sherpa wall | vs 1 thread | s wall per s audio | speakers |
+|---|---|---|---|---|
+| 1 | 58.3 s | 1.00x | 0.424 | 4 |
+| 2 | 32.3 s | 1.81x | 0.235 | 4 |
+| **4** | **20.4 s** | **2.85x** | **0.148** | 4 | ← OPTIMUM |
+| 6 | 53.4 s | 1.09x | 0.388 | 4 |
+| 8 | 69.3 s | 0.84x | 0.504 | 4 |
+| 12 | 110.4 s | 0.53x | 0.803 | 4 |
+
+THE SHAPES DIFFER AND THAT MATTERS: on the NVIDIA box 6+ threads on 4
+cores OVERSUBSCRIBES and diarization collapses to slower-than-one-thread;
+the AMD box has no oversubscription and stays FLAT above 4 — the
+diarization work appears to be MEMORY-BANDWIDTH bound and 4 threads
+already saturate it. Speakers was constant at every thread count on both
+sweeps: threading remains a performance knob, not a quality knob.
+
+* `scripts/sherpa-diarization-wrapper.sh`: default `thread_cap` 8 → 4;
+  the auto formula `cores // workers` is UNCHANGED (it is the safety rule
+  that bounds total demand N×T at the core count; a hardcoded 4 would put
+  16 threads on a 4-core box at N=4). The cap is still `min(cap, cores)`
+  and `SHERPA_MAX_THREADS` still raises it at runtime — on these two
+  hosts the sweep says there is nothing to gain.
+* Resolved default on the shipped hosts now: NVIDIA (4 cores, N=1) → 4
+  (unchanged); AMD (12 cores, N=1) → 4 (was 8); AMD at N=4 workers → 3.
+* The deployed AMD environment must set NOTHING: the shipped default 4 is
+  the measured optimum there. Any existing `SHERPA_MAX_THREADS=12`
+  override on the AMD box should be removed.
+* Docs (README.md "Diarization threading", CONFIG.md "Diarization
+  threading", this log) carry both measured tables, the two shapes, and
+  the per-second-of-audio normalisation; the earlier derived claims
+  ("optimum is the core count", "AMD lifts the cap to 12 pending the
+  sweep") are corrected here and in those sections.
+* Tests: `tests/pipeline/test_diarization_threads.py` now pins the two
+  sweep tables as data (`amd_sweep_2026-10-26` / `nv_sweep_2026-10-26`:
+  every row, internal speedup consistency, argmin == 4 per host, the
+  plateau/cliff shapes), asserts the AMD default resolution against the
+  swept optimum, asserts the never-oversubscribe invariant across both
+  host shapes × workers 1–4 × caps {auto,4,8,12}, and asserts the docs
+  carry the tables + normalisation. Suite collected 454 -> 496 (grows,
+  AC10-style count regression guard retained).
+
 ## [Unreleased] — diarization threading (card t_3cb8f97c)
 
 **The sherpa diarization phase now runs multi-threaded, by default, at a
@@ -15,21 +84,25 @@ Why nothing is hardcoded: measured on the 4-core NVIDIA T400 (137.5 s
 clip, isolated sherpa stage) 1 thread 58.3 s, 2 threads 32.3 s, 4 threads
 20.5 s (2.85x) with the SAME speaker count (4) at every count — but 6
 threads 53.4 s and 8 threads 68.0 s, i.e. WORSE than 1 thread: the
-optimum is the core count and oversubscription regresses. A fixed 8 would
-have made this host ~2x slower than today. The default is therefore
+optimum on this box is its core count and oversubscription regresses (the
+planner derived "optimum == core count" from this alone — corrected by
+card t_71a5768f below: the 12-core sweep discriminated, and the optimum
+is a constant 4 on both hosts). A fixed 8 would have
+made this host ~2x slower than today. The default is therefore
 computed per invocation (planner guidance on this card, after the
 core-count-only draft was shown to be catastrophic under concurrency):
 
     threads = min( max(1, cores // MAX_PROCESSING_GLOBAL),
-                   min(SHERPA_MAX_THREADS, cores) )   # cap default 8
+                   min(SHERPA_MAX_THREADS, cores) )   # cap 8 -> 4 (t_71a5768f)
 
 total diarization demand never exceeds the core count at any N — at the
 shipped `N=1` this is the measured optimum on the NVIDIA box (4), and at
 `N=3` on the same box it automatically drops to 1 thread per job, so the
 default can never be worse than the pre-card single-thread behaviour (the
 regression floor the card requires). N=1 72.3 s -> 34.5 s full-job
-equivalent is the expected win; AMD (12 cores) gets 8/capped until its
-thread sweep lands — `SHERPA_MAX_THREADS=12` lifts it with no rebuild.
+equivalent is the expected win; AMD (12 cores) got the cap — the sweep
+planned there LANDED (card t_71a5768f): the AMD optimum is 4, the default
+cap is now 4, and the deployed AMD box must set nothing.
 
 New env knobs (read by the wrapper per sherpa call; both listed in BOTH
 compose files so host overrides reach the container — the trap that made
@@ -42,9 +115,11 @@ README, PIPELINE.md and `.env.example`):
   explicit, with cores/workers/cap inputs) goes to the job stderr and is
   appended to `$JOBS_DIR/sherpa-threads.log` — the engine's stderr temp
   file is deleted on success, so the log file is the durable ops record.
-* `SHERPA_MAX_THREADS` (default 8): ceiling on the AUTO value only,
-  always `min(cap, cores)`; raises the default on big boxes without a
-  rebuild (pending AMD 8-vs-10-vs-12 sweep).
+* `SHERPA_MAX_THREADS` (default 4, corrected from 8 by card t_71a5768f):
+  ceiling on the AUTO value only,
+  always `min(cap, cores)`; an operator adjusts it on big boxes without a
+  rebuild — the AMD sweep landed and lifting it there buys nothing
+  (plateau above 4 threads).
 
 Hermetic tests (`tests/pipeline/test_diarization_threads.py`, 45 cases
 driving the real wrapper against a stub sherpa CLI with a stubbed core

@@ -13,9 +13,11 @@ the ONE place shared by the CUDA and Vulkan images):
   SHERPA_NUM_THREADS (default unset/0/negative/non-integer = AUTO):
       auto = floor(cores / MAX_PROCESSING_GLOBAL), clamped to >= 1 and
       <= min(SHERPA_MAX_THREADS, cores) with SHERPA_MAX_THREADS defaulting
-      to 8. With the shipped default N=1 that is the core count (the
-      measured optimum) capped at 8; at N=3 on the 4-core box it degrades
-      to 1 — never worse than today's single-thread behaviour.
+      to 4 (card t_71a5768f: the AMD sweep measured the optimum at 4
+      threads on BOTH shipped hosts, so 4 is the default cap, not 8).
+      At N=1 a 12-core box therefore resolves 4, not 8; at N=3 on the
+      4-core box it degrades to 1 — never worse than today's
+      single-thread behaviour.
       MAX_PROCESSING_GLOBAL that is unset, non-integer or <1 counts as 1
       (same parse rule as api/main.py).
       An explicit valid value is passed VERBATIM (only clamped down to the
@@ -203,10 +205,11 @@ def test_ac1_flags_on_ceiling_disabled_path(stub, tmp_path):
         (4, 5, 1),       # floor clamps at 1 — regression floor
         (2, 3, 1),
         (1, 3, 1),
-        (12, 1, 8),      # cap: "a sane range (e.g. 1..8)"; 8 on AMD's 12
-        (12, 2, 6),
-        (12, 4, 3),      # the planner's arithmetic table
-        (16, 1, 8),
+        (8, 1, 4),       # cap trims an 8-core box to the measured 4
+        (12, 1, 4),      # AC1/AC2: the AMD box resolves 4 by default
+        (12, 2, 4),      # 12//2 = 6 exceeds the cap -> 4
+        (12, 4, 3),      # AC3: 12 cores / 4 workers = 3 (card table)
+        (16, 1, 4),      # a bigger box still stops at the cap
         (8, 8, 1),
     ],
 )
@@ -219,8 +222,9 @@ def test_ac2_auto_default_is_cores_over_workers(stub, tmp_path, cores,
     flags = _thread_flags(argv)
     assert flags == {f"--segmentation.num-threads={expected}",
                      f"--embedding.num-threads={expected}"}, argv
-    # regression floor: never 0, never above the core count, never above 8
-    assert 1 <= expected <= min(cores, 8)
+    # regression floor: never 0, never above the core count, never above
+    # the measured default cap of 4 (card t_71a5768f)
+    assert 1 <= expected <= min(cores, 4)
 
 
 @pytest.mark.parametrize("bad", ["abc", "0", "-1", "", "2.5", "1x"])
@@ -357,15 +361,15 @@ def test_ac4_explicit_above_cap_allowed_up_to_cores(stub, tmp_path):
 
 
 # --------------------------------------------------------------------------
-# Planner note 14:45 — the cap. Option (c): SHERPA_MAX_THREADS (default 8)
-# so a big box can raise the auto ceiling WITHOUT a rebuild (pending the
-# AMD 8-vs-10-vs-12 sweep), but the resolved default can NEVER exceed the
-# core count: 8 on a 2-core host must become 2, not 8.
+# The cap — card t_71a5768f. The AMD sweep measured the optimum at 4
+# threads on BOTH shipped hosts, so the default thread_cap is 4, not 8.
+# SHERPA_MAX_THREADS must still RAISE it (an operator on a different-shape
+# box may want to) and it must still be clamped down to the core count.
 # --------------------------------------------------------------------------
 
-def test_cap_default_8_leaves_2_core_host_at_2_not_8(stub, tmp_path):
-    """A fixed 8 would violate the never-oversubscribe rule: the cap
-    applies as min(cap, cores)."""
+def test_cap_never_oversubscribes_a_2_core_host(stub, tmp_path):
+    """The cap applies as min(cap, cores): even 4 on a 2-core host must
+    become 2 — never oversubscribe by default."""
     real, log = stub
     _run(tmp_path, real, log, ENGINE_ARGS, cores=2)
     (argv,) = _calls(log)
@@ -373,16 +377,37 @@ def test_cap_default_8_leaves_2_core_host_at_2_not_8(stub, tmp_path):
         "--segmentation.num-threads=2", "--embedding.num-threads=2"}, argv
 
 
+def test_ac1_amd_default_cap_resolves_4_not_8(stub, tmp_path):
+    """AC-1: 12 cores, 1 worker, NO SHERPA_MAX_THREADS => threads == 4
+    (the shipped default must resolve to the measured optimum, not 8)."""
+    real, log = stub
+    _run(tmp_path, real, log, ENGINE_ARGS, cores=12)
+    (argv,) = _calls(log)
+    assert _thread_flags(argv) == {
+        "--segmentation.num-threads=4", "--embedding.num-threads=4"}, argv
+
+
 def test_cap_knob_raises_the_default_on_a_big_box(stub, tmp_path):
-    """AMD at N=1: auto stops at the cap (8) by default; the operator lifts
-    it to the core count via SHERPA_MAX_THREADS — runtime knob, no
-    rebuild (the option the planner note accepts for the pending sweep)."""
+    """AMD at N=1: auto stops at the measured cap (4) by default; the
+    operator lifts it via SHERPA_MAX_THREADS — runtime knob, no rebuild
+    (AC-7: 'SHERPA_MAX_THREADS must still be able to raise the cap')."""
     real, log = stub
     _run(tmp_path, real, log, ENGINE_ARGS, cores=12,
          env_extra={"SHERPA_MAX_THREADS": "12"})
     (argv,) = _calls(log)
     assert _thread_flags(argv) == {
         "--segmentation.num-threads=12", "--embedding.num-threads=12"}, argv
+
+
+def test_ac7_knob_still_raises_above_the_measured_default(stub, tmp_path):
+    """AC-7: SHERPA_MAX_THREADS=6 on the AMD box resolves
+    min(12 // 1, 6) = 6 — the knob raises above 4 when set."""
+    real, log = stub
+    _run(tmp_path, real, log, ENGINE_ARGS, cores=12,
+         env_extra={"SHERPA_MAX_THREADS": "6"})
+    (argv,) = _calls(log)
+    assert _thread_flags(argv) == {
+        "--segmentation.num-threads=6", "--embedding.num-threads=6"}, argv
 
 
 def test_cap_knob_is_itself_clamped_to_cores(stub, tmp_path):
@@ -395,13 +420,165 @@ def test_cap_knob_is_itself_clamped_to_cores(stub, tmp_path):
 
 
 @pytest.mark.parametrize("bad", ["0", "-2", "abc", ""])
-def test_cap_knob_invalid_falls_back_to_8(stub, tmp_path, bad):
+def test_cap_knob_invalid_falls_back_to_the_measured_default(stub, tmp_path,
+                                                             bad):
     real, log = stub
     _run(tmp_path, real, log, ENGINE_ARGS, cores=12,
          env_extra={"SHERPA_MAX_THREADS": bad})
     (argv,) = _calls(log)
     assert _thread_flags(argv) == {
-        "--segmentation.num-threads=8", "--embedding.num-threads=8"}, argv
+        "--segmentation.num-threads=4", "--embedding.num-threads=4"}, argv
+
+
+# --------------------------------------------------------------------------
+# AC6 — the invariant that holds at EVERY (cores, workers, cap) combination
+# on both host shapes: threads * workers <= cores, and 1 <= threads <=
+# cores. A job must never oversubscribe the machine it runs on.
+# --------------------------------------------------------------------------
+
+@pytest.mark.parametrize("cores", [4, 12])   # the two shipped host shapes
+@pytest.mark.parametrize("workers", [1, 2, 3, 4])
+@pytest.mark.parametrize("cap", [None, "4", "8", "12"])
+def test_ac6_never_oversubscribes_any_host_shape(stub, tmp_path, cores,
+                                                 workers, cap):
+    real, log = stub
+    env = {"MAX_PROCESSING_GLOBAL": str(workers)}
+    if cap is not None:
+        env["SHERPA_MAX_THREADS"] = cap
+    _run(tmp_path, real, log, ENGINE_ARGS, cores=cores, env_extra=env)
+    (argv,) = _calls(log)
+    flags = _thread_flags(argv)
+    (t,) = {int(f.rsplit("=", 1)[1]) for f in flags}
+    assert t >= 1, (cores, workers, cap, argv)
+    assert t <= cores, (cores, workers, cap, argv)
+    assert t * workers <= cores, (cores, workers, cap, argv)
+
+
+# --------------------------------------------------------------------------
+# AC3 — the pinned measured sweep tables (card t_71a5768f). These are the
+# numbers the cap change is derived from; they are DATA, not prose, and a
+# docs regression that drops or edits them fails here. Every row:
+#   threads -> (sherpa wall s, speedup vs 1 thread, speakers detected)
+# Both sweeps detected the SAME speaker count at every thread count:
+# threading is a performance knob, not a quality knob.
+# --------------------------------------------------------------------------
+
+AMD_SWEEP_2026_10_26 = {
+    "host": "AMD, 12 cores", "clip_seconds": 249.0,
+    # panel clip, isolated sherpa cost (operator-run sweep)
+    "rows": {1: (52.8, 1.00, 5), 2: (30.8, 1.72, 5), 4: (19.8, 2.66, 5),
+             6: (21.0, 2.52, 5), 8: (21.2, 2.49, 5), 12: (22.2, 2.38, 5)},
+}
+NV_SWEEP_2026_10_26 = {
+    "host": "NVIDIA T400 host, 4 cores", "clip_seconds": 137.5,
+    # 137.5 s clip, isolated sherpa cost
+    "rows": {1: (58.3, 1.00, 4), 2: (32.3, 1.81, 4), 4: (20.4, 2.85, 4),
+             6: (53.4, 1.09, 4), 8: (69.3, 0.84, 4),
+             12: (110.4, 0.53, 4)},
+}
+SWEEPS = (AMD_SWEEP_2026_10_26, NV_SWEEP_2026_10_26)
+
+
+def _optimum(sweep):
+    return min(sweep["rows"], key=lambda t: sweep["rows"][t][0])
+
+
+def test_sweeps_have_every_row_and_are_internally_consistent():
+    """AC3: every row present; speedup = wall(1)/wall(t); speakers constant
+    across rows (the thread count never changed the diarization result)."""
+    for sweep in SWEEPS:
+        rows = sweep["rows"]
+        assert sorted(rows) == [1, 2, 4, 6, 8, 12], sweep["host"]
+        assert len({sp for _, _, sp in rows.values()}) == 1, sweep["host"]
+        base = rows[1][0]
+        for t, (wall, speedup, _sp) in rows.items():
+            assert wall > 0 and t > 0
+            assert abs(base / wall - speedup) < 0.02, (sweep["host"], t)
+
+
+def test_sweeps_optimum_is_4_on_both_hosts():
+    """THE finding: the optimum is 4 threads on BOTH hosts — the planner's
+    'optimum == core count' derivation from the 4-core box alone was wrong
+    (on a 4-core box it predicts the same thing as 'constant 4'; the 12-core
+    sweep discriminated, and the constant wins)."""
+    for sweep in SWEEPS:
+        assert _optimum(sweep) == 4, sweep["host"]
+
+
+def test_sweep_shapes_amd_plateau_nv_cliff():
+    """AC3 shapes: AMD (12 cores) PLATEAUS above 4 (no oversubscription;
+    work is memory-bandwidth bound). NVIDIA (4 cores) CLIFFS (6 threads on
+    4 cores oversubscribes; 8 is worse than 1, 12 is half of 1)."""
+    amd = AMD_SWEEP_2026_10_26["rows"]
+    best = amd[4][0]
+    for t in (6, 8, 12):
+        assert amd[t][0] / best <= 1.15, ("AMD plateau broken", t)
+    nv = NV_SWEEP_2026_10_26["rows"]
+    assert nv[6][0] > 2 * nv[4][0]          # the cliff starts at 6
+    assert nv[8][0] > nv[1][0]              # 8t worse than 1 thread
+    assert nv[12][0] > 5 * nv[4][0]         # 12t: ~2% of 1t throughput
+    assert nv[12][1] < 1.0                  # speedup vs 1t under 1x
+
+
+def test_amd_resolved_default_is_the_swept_optimum(stub, tmp_path):
+    """The resulting thread count on the AMD host equals the swept
+    optimum: wrapper at 12 cores / 1 worker / no knobs -> 4 threads."""
+    real, log = stub
+    _run(tmp_path, real, log, ENGINE_ARGS, cores=12)
+    (argv,) = _calls(log)
+    assert _thread_flags(argv) == {
+        f"--segmentation.num-threads={_optimum(AMD_SWEEP_2026_10_26)}",
+        f"--embedding.num-threads={_optimum(AMD_SWEEP_2026_10_26)}"}, argv
+
+
+# --------------------------------------------------------------------------
+# AC10 — the docs carry BOTH measured tables, the two-shape explanation
+# (oversubscription cliff on the 4-core host, memory-bandwidth plateau on
+# the 12-core host) and the per-second-of-audio normalisation, in README.md,
+# CONFIG.md and CHANGELOG.md. Raw walls are NOT comparable across hosts
+# (different clips), so the normalisation column is mandatory.
+# --------------------------------------------------------------------------
+
+# 1-decimal wall values from the pinned sweep tables.
+_ALL_SWEEP_WALLS = [f"{wall:.1f}"
+                    for sweep in SWEEPS for wall, _x, _s in
+                    sweep["rows"].values()]
+# s of diarization wall per s of audio, 3 decimals (wall / clip):
+_ALL_SWEEP_NORMALISED = []
+for _sweep in SWEEPS:
+    for _wall, _x, _s in _sweep["rows"].values():
+        _ALL_SWEEP_NORMALISED.append(
+            f"{_wall / _sweep['clip_seconds']:.3f}")
+
+
+@pytest.mark.parametrize("doc", ["README.md", "CONFIG.md"])
+def test_ac10_docs_carry_both_measured_tables(doc):
+    text = (REPO / doc).read_text(encoding="utf-8")
+    for wall in _ALL_SWEEP_WALLS:
+        assert wall in text, f"{doc}: sweep wall {wall} missing"
+    for norm in _ALL_SWEEP_NORMALISED:
+        assert norm in text, f"{doc}: normalised {norm} s/s missing"
+    assert "249" in text, f"{doc}: AMD clip length missing"
+    assert "137.5" in text, f"{doc}: NV clip length missing"
+    # the two-shape story
+    lowered = text.lower()
+    assert "oversubscri" in lowered, f"{doc}: no oversubscription story"
+    assert "memory-bandwidth" in lowered or "memory bandwidth" in lowered, \
+        f"{doc}: no memory-bandwidth plateau explanation"
+    assert "plateau" in lowered and "cliff" in lowered, \
+        f"{doc}: the two curve shapes are not contrasted"
+    # the corrected headline
+    assert "4 threads" in text or "threads = 4" in text or "→ 4" in text \
+        or "-> 4" in text, f"{doc}: optimum-4 headline missing"
+
+
+def test_ac10_changelog_records_the_cap_correction():
+    text = (REPO / "CHANGELOG.md").read_text(encoding="utf-8")
+    assert "t_71a5768f" in text, "CHANGELOG: no entry for this card"
+    for wall in _ALL_SWEEP_WALLS:
+        assert wall in text, f"CHANGELOG: sweep wall {wall} missing"
+    for norm in _ALL_SWEEP_NORMALISED:
+        assert norm in text, f"CHANGELOG: normalised {norm} s/s missing"
 
 
 # --------------------------------------------------------------------------

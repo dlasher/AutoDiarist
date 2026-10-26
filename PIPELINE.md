@@ -73,10 +73,14 @@ collapses everything to a single speaker. For `sherpa`/`ecapa` the engine
 shells out to the sherpa-onnx CLI (`SHERPA_BIN`, a wrapper that injects
 `--clustering.cluster-threshold=<SHERPA_CLUSTER_THRESHOLD>` and threads
 both its networks with `--segmentation.num-threads`/`--embedding.num-threads`
-= `min(max(1, cores // MAX_PROCESSING_GLOBAL), SHERPA_MAX_THREADS default 8)` —
+= `min(max(1, cores // MAX_PROCESSING_GLOBAL), SHERPA_MAX_THREADS default 4)` —
 the CLI's own default is 1 thread and diarization is ~80% of a job's wall
-time; card t_3cb8f97c, measured 2.85x on the 4-core box with identical
-results at every thread count); if either
+time; cards t_3cb8f97c + t_71a5768f, measured on BOTH shipped hosts: the
+optimum is 4 threads everywhere — 2.85x on the 4-core NVIDIA box then a
+CLIFF (6+ threads oversubscribe 4 cores; 8 threads is worse than 1), and
+2.66x on the 12-core AMD box then a PLATEAU (memory-bandwidth bound;
+6-12 threads within ~12% of the optimum) — with identical results at every
+thread count); if either
 ONNX model is missing the engine emits speaker-less segments — the
 adapter refuses that at startup (`CrispasrConfigError`) and rejects it
 at runtime (`CrispasrError`) instead of normalizing to one fake speaker

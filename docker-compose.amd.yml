@@ -82,15 +82,17 @@ services:
       SHERPA_BIN: ${SHERPA_BIN:-/opt/sherpa/sherpa-diarization-wrapper}
       SHERPA_CLUSTER_THRESHOLD: ${SHERPA_CLUSTER_THRESHOLD:-0.40}
       DIARIZATION_MAX_SPEAKERS: ${DIARIZATION_MAX_SPEAKERS:-8}
-      # Diarization THREADING (card t_3cb8f97c) — identical wrapper, so
-      # identical knobs: empty default = AUTO, threads =
-      # min(max(1, cores // MAX_PROCESSING_GLOBAL), cap). On this 12-core
-      # box the auto default caps at 8 (total demand stays <= cores even
-      # at N=1); the AMD thread sweep (8 vs 10 vs 12) is pending, and
-      # SHERPA_MAX_THREADS=12 lifts the cap to the core count WITHOUT a
-      # rebuild. SHERPA_NUM_THREADS pins an explicit count instead
-      # (clamped to the core count; measured: above the core count sherpa
-      # REGRESSES, so there is no fixed constant default).
+      # Diarization THREADING (cards t_3cb8f97c + t_71a5768f) — identical
+      # wrapper, so identical knobs: empty default = AUTO, threads =
+      # min(max(1, cores // MAX_PROCESSING_GLOBAL), cap). The AMD sweep
+      # (2026-10-26) measured the optimum at 4 threads on this 12-core
+      # box too (19.8 s vs 52.8 s @1, 2.66x; plateau above 4: 6t 21.0,
+      # 8t 21.2, 12t 22.2 — memory-bandwidth bound), so the default cap
+      # is 4 and NOTHING must be set here — set SHERPA_MAX_THREADS only
+      # for a box with a different curve shape. SHERPA_NUM_THREADS pins an
+      # explicit count instead (clamped to the core count; measured: the
+      # 4-core host CLIFFS above 4, so no higher constant is safe on both
+      # shipped hosts).
       SHERPA_NUM_THREADS: ${SHERPA_NUM_THREADS:-}
       SHERPA_MAX_THREADS: ${SHERPA_MAX_THREADS:-}
       # 7 GiB ceiling: mirrors the proven amd-bringup VRAM pin on the 8 GB

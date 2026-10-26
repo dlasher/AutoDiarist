@@ -20,7 +20,7 @@ GPU-default values.
 | `SHERPA_CLUSTER_THRESHOLD` | `0.40` | Read by the wrapper at run time. sherpa-onnx FastClustering distance threshold: LOWER resolves more speakers, HIGHER merges. NV-host calibration table in README "Diarization models". |
 | `DIARIZATION_MAX_SPEAKERS` | `8` | Card t_38e52d89. Ceiling on distinct diarization speaker labels, enforced by the wrapper's CONDITIONAL second clustering pass: the auto pass runs first and is only rewritten when its label count exceeds the ceiling (the engine's own `--clustering.num-clusters=0` is stripped before injection, else the setting is a silent no-op). Compliant audio replays byte-identical; a bare fixed count over-splits (panel 2 -> 4 at NC=8). DIARIZATION_MAX_SPEAKERS=0 disables (pre-card behaviour). See `autodiarist-speaker-count-ceiling.md`. |
 | `SHERPA_NUM_THREADS` | empty = AUTO | Card t_3cb8f97c. Threads the wrapper passes as BOTH `--segmentation.num-threads` and `--embedding.num-threads` on every sherpa invocation (including the ceiling re-run pass). The CLI default is 1; diarization was ~80% of a job's wall time running on a single core. AUTO = `min(max(1, cores // MAX_PROCESSING_GLOBAL), SHERPA_MAX_THREADS)` where `cores` is the container-visible core count (nproc, else getconf; the containers see ALL host cores — no compose file sets CPU limits). Unset/`0`/negative/non-integer all mean AUTO; a valid explicit count is passed verbatim, clamped only down to the core count. The resolved value (and why) is logged to the job stderr AND appended to `$JOBS_DIR/sherpa-threads.log` — the service's engine-stderr temp file is deleted on success, so the log file is the record ops can actually read after a healthy run. Full mechanics and the measured curve: section "Diarization threading" below. |
-| `SHERPA_MAX_THREADS` | `8` | Card t_3cb8f97c. Ceiling on the AUTO value only (explicit `SHERPA_NUM_THREADS` is not capped by it; it is always `min(cap, cores)`). Invalid values (0/negative/non-integer) fall back to 8. Raises the auto ceiling on big boxes without a rebuild — the AMD host has 12 cores and its 8-vs-10-vs-12 thread sweep was pending when this shipped. |
+| `SHERPA_MAX_THREADS` | `4` | Cards t_3cb8f97c + t_71a5768f. Ceiling on the AUTO value only (explicit `SHERPA_NUM_THREADS` is not capped by it; it is always `min(cap, cores)`). Invalid values (0/negative/non-integer) fall back to 4. 4 is the MEASURED optimum on both shipped hosts — the AMD sweep (2026-10-26) corrected the previously derived default of 8; on either shipped host raising this knob buys nothing (AMD plateau), so it exists for boxes whose thread curve has a different shape. |
 | `CRISPASR_GPU_BACKEND` | `cuda` | Pinned via `--gpu-backend`. Accepted: `cuda`, `cpu`, `metal`, `vulkan`. The adapter probes `crispasr --version` once per binary per process and fails fast (typed `CrispasrError`) when this value is missing from the build's `ggml backends` list — this is the guard against the silent CPU fallback (see TROUBLESHOOTING.md). Setting it to `cpu` skips the assertion. Change only to force CPU debugging. |
 | `CRISPASR_LANGUAGE` | `en-US` | `-l` language qualifier. SPEC 08 fixes v1 to `en-US`; override is only for local per-locale experimentation. |
 | `CRISPASR_CACHE_DIR` | unset | Passed as `--cache-dir`. Holds the `--diarize-embedder auto` GGUF embedders (wespeaker/titanet) and any auto-downloaded artifacts; a named volume in compose. |
@@ -99,7 +99,7 @@ Operational notes:
   summary; the live in-flight count is on `GET /v1/jobs` as
   `processing_count`.
 
-## Diarization threading — `SHERPA_NUM_THREADS` (card t_3cb8f97c)
+## Diarization threading — `SHERPA_NUM_THREADS` (cards t_3cb8f97c + t_71a5768f)
 
 The engine invokes the sherpa-onnx diarization CLI through the
 `SHERPA_BIN` wrapper (the same wrapper that injects the clustering
@@ -114,17 +114,44 @@ ceiling-disabled exec path, pass 1, AND the ceiling re-run pass (the
 second clustering pass starts while the first pass's memory is still
 resident, which is why the auto cap stays conservative).
 
-**Measured curve** (NVIDIA T400 host, 4 cores, isolated sherpa stage on a
-137.5 s clip, planner measurement 2026-10-26; speakers detected = 4 at
-EVERY thread count — threading is a performance knob, not a quality knob):
+**Measured curves — BOTH shipped hosts** (isolated sherpa stage, operator
+sweeps 2026-10-26; speakers detected constant at EVERY thread count on
+both — threading is a performance knob, not a quality knob). Raw walls
+are NOT comparable across hosts (different clips), so each table also
+gives s of diarization wall per s of audio.
 
-| threads | sherpa wall | vs 1 thread |
-|---|---|---|
-| 1 | 58.3 s | 1.00x (the old behaviour) |
-| 2 | 32.3 s | 1.81x |
-| 4 | 20.5 s | 2.85x |
-| 6 | 53.4 s | 1.09x |
-| 8 | 68.0 s | 0.86x — WORSE than 1 |
+AMD host — 12 cores, 249 s panel clip. Above 4 threads the curve is a
+PLATEAU: no oversubscription on this box, and the work appears
+MEMORY-BANDWIDTH bound — 4 threads already saturate it, so more threads
+neither help (each row within ~12% of the optimum) nor hurt.
+
+| threads | sherpa wall | vs 1 thread | s wall / s audio | speakers |
+|---|---|---|---|---|
+| 1 | 52.8 s | 1.00x | 0.212 | 5 |
+| 2 | 30.8 s | 1.72x | 0.124 | 5 |
+| **4** | **19.8 s** | **2.66x** | **0.080** | 5 | ← OPTIMUM
+| 6 | 21.0 s | 2.52x | 0.084 | 5 |
+| 8 | 21.2 s | 2.49x | 0.085 | 5 |
+| 12 | 22.2 s | 2.38x | 0.089 | 5 |
+
+NVIDIA T400 host — 4 cores, 137.5 s clip. Above 4 threads the curve is a
+CLIFF: 6 threads on 4 cores OVERSUBSCRIBES — 8 threads is worse than one
+and 12 threads is half the one-thread throughput.
+
+| threads | sherpa wall | vs 1 thread | s wall / s audio | speakers |
+|---|---|---|---|---|
+| 1 | 58.3 s | 1.00x | 0.424 | 4 |
+| 2 | 32.3 s | 1.81x | 0.235 | 4 |
+| **4** | **20.4 s** | **2.85x** | **0.148** | 4 | ← OPTIMUM
+| 6 | 53.4 s | 1.09x | 0.388 | 4 |
+| 8 | 69.3 s | 0.84x — WORSE than 1 | 0.504 | 4 |
+| 12 | 110.4 s | 0.53x | 0.803 | 4 |
+
+**4 threads is the measured optimum on BOTH hosts.** On a 4-core box
+"optimum == core count" and "optimum == a constant 4" make the SAME
+prediction, so the NVIDIA sweep alone never discriminated; the 12-core
+AMD sweep did, and the constant won — the default cap is now 4 (card
+t_71a5768f), not the earlier derived 8.
 
 Live on the same host after the change (service path, same 137.45 s clip
 at threshold 0.40, raw CLI segment lines byte-identical at 1/2/4):
@@ -134,9 +161,12 @@ host override `SHERPA_NUM_THREADS=2` through compose -> 53.7 s and
 `threads=2 (explicit: cores=4 workers=1 cap=4 requested=2 max=unset)`
 recorded in `$JOBS_DIR/sherpa-threads.log` — knobs honored end-to-end.
 
-The regression above the core count is why no constant is the default
-(`8` would make this host ~2x slower than today). The auto default is
-computed per invocation:
+The NVIDIA CLIFF above 4 threads (6+ threads oversubscribe a 4-core box:
+8 threads there is WORSE than one) and the AMD PLATEAU above 4 (memory-
+bandwidth bound; extra threads buy nothing) are why the constant default
+is 4 — not 8, which would make the 4-core host ~2x slower than today and
+the 12-core host 7% slower than the optimum. The auto default is computed
+per invocation:
 
 ```
 T = min( max(1, floor(C / N)), min(SHERPA_MAX_THREADS, C) )
@@ -153,7 +183,7 @@ T = min( max(1, floor(C / N)), min(SHERPA_MAX_THREADS, C) )
 | host | C | N=1 (shipped) | N=2 | N=3 | N=4 |
 |---|---|---|---|---|---|
 | NVIDIA T400 | 4 | 4 (full 2.85x) | 2 | 1 | 1 |
-| AMD (RX 6600) | 12 | 8 (cap) | 6 | 4 | 3 |
+| AMD (RX 6600) | 12 | 4 (measured cap; was 8) | 4 (cap trims 6) | 4 | 3 |
 
 Two properties the card fixes as requirements:
 
@@ -176,10 +206,11 @@ Overrides (no rebuild for either):
   count (explicit `9999` on 4 cores -> 4) and never below 1. Unset/`0`/
   negative/non-integer = auto.
 * `SHERPA_MAX_THREADS=<n>` — raises/lowers the AUTO ceiling only (default
-  8, always `min(cap, C)`; invalid -> 8). Intended for the AMD box while
-  its 8-vs-10-vs-12 sweep is pending: `SHERPA_MAX_THREADS=12 docker
-  compose -f docker-compose.amd.yml up -d` once the sweep says the core
-  count is the optimum there too.
+  4, always `min(cap, C)`; invalid -> 4). The AMD sweep landed (card
+  t_71a5768f): 4 is the measured optimum on BOTH shipped hosts, the AMD
+  curve PLATEAUS above it and the NVIDIA curve CLIFFS, so set NOTHING on
+  either box — this knob is for hosts whose thread curve has a different
+  shape (set it via compose: `SHERPA_MAX_THREADS=6 docker compose up -d`).
 * Both work the same on a RUNNING container: `docker compose exec -e
   SHERPA_NUM_THREADS=2 autodiarist …` (the knob is read per sherpa
   invocation by the wrapper, so an exec-spawned job honors it without a

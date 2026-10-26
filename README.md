@@ -517,23 +517,59 @@ Separately from threshold tuning, `DIARIZATION_MAX_SPEAKERS` (default 8)
 caps the label count on pathological audio — see
 `autodiarist-speaker-count-ceiling.md`.
 
-**Diarization threading (card t_3cb8f97c).** The sherpa CLI defaults to ONE
-thread for both the segmentation and the embedding network, and diarization
-is ~80% of a job's wall time. Measured in isolation on the 4-core NVIDIA
-box (137.5 s clip): 58.3 s at 1 thread -> 32.3 s at 2 -> 20.5 s at 4
-(2.85x) with the SAME speaker count (4) at every count — threading is a
-performance knob, not a quality knob — and it REGRESSES above the core
-count (8 threads: 68 s, worse than 1). So there is no constant default:
-the wrapper computes `threads = min(max(1, cores // MAX_PROCESSING_GLOBAL),
-SHERPA_MAX_THREADS)` and passes the value as both flags on every sherpa
-call, ceiling re-run included. Shipped `N=1` -> the core count (the full
-measured win); `N=3` on this box -> 1 thread per job automatically — total
-CPU demand never exceeds the core count, and the default is never worse
-than the old single-thread behaviour. Override per host with compose
-(`SHERPA_NUM_THREADS=2 docker compose up -d`) or without restart
-(`docker compose exec -e SHERPA_NUM_THREADS=2 autodiarist …`) — both knobs
-are in both compose files. Mechanics + measured curve: CONFIG.md
-"Diarization threading".
+**Diarization threading (cards t_3cb8f97c + t_71a5768f).** The sherpa CLI
+defaults to ONE thread for both the segmentation and the embedding
+network, and diarization is ~80% of a job's wall time. Threaded per-box
+(measured sweeps on both shipped hosts; absolute walls are NOT comparable
+across hosts — different clips — so each row normalises to seconds of
+diarization wall per second of audio):
+
+AMD host — 12 cores, 249 s panel clip (PLATEAU above the optimum):
+
+| threads | sherpa wall | vs 1 thread | s wall / s audio | speakers |
+|---|---|---|---|---|
+| 1 | 52.8 s | 1.00x | 0.212 | 5 |
+| 2 | 30.8 s | 1.72x | 0.124 | 5 |
+| **4** | **19.8 s** | **2.66x** | **0.080** | 5 | ← optimum
+| 6 | 21.0 s | 2.52x | 0.084 | 5 |
+| 8 | 21.2 s | 2.49x | 0.085 | 5 |
+| 12 | 22.2 s | 2.38x | 0.089 | 5 |
+
+NVIDIA T400 host — 4 cores, 137.5 s clip (CLIFF above the optimum):
+
+| threads | sherpa wall | vs 1 thread | s wall / s audio | speakers |
+|---|---|---|---|---|
+| 1 | 58.3 s | 1.00x | 0.424 | 4 |
+| 2 | 32.3 s | 1.81x | 0.235 | 4 |
+| **4** | **20.4 s** | **2.85x** | **0.148** | 4 | ← optimum
+| 6 | 53.4 s | 1.09x | 0.388 | 4 |
+| 8 | 69.3 s | 0.84x | 0.504 | 4 |
+| 12 | 110.4 s | 0.53x | 0.803 | 4 |
+
+**4 threads is the measured optimum on BOTH hosts** — the speaker count
+was constant at every thread count, so threading is a performance knob,
+not a quality knob. The two curve SHAPES differ: on the 4-core NVIDIA box,
+6 threads OVERSUBSCRIBE and diarization falls off a cliff (8 threads is
+worse than 1); the 12-core AMD box has no oversubscription and stays on a
+flat plateau above 4 — the work appears to be MEMORY-BANDWIDTH bound and 4
+threads already saturate it. An earlier "optimum == core count" rule
+(derived on the 4-core box alone, where it predicts the same 4 as a
+constant) was corrected by the AMD sweep: the shipped default cap is now
+`SHERPA_MAX_THREADS=4`, not 8.
+
+The wrapper computes
+`threads = min(max(1, cores // MAX_PROCESSING_GLOBAL), SHERPA_MAX_THREADS)`
+and passes the value as both flags on every sherpa call, ceiling re-run
+included. The `cores // workers` divisor stays as the SAFETY rule (it
+bounds total demand at the core count: at N=4 on the 4-core box it yields
+1 thread per job; a hardcoded 4 would put 16 threads on 4 cores), and the
+cap then trims the N=1 default to the measured 4 on both boxes. The
+default is never worse than single-thread behaviour. Override per host
+with compose (`SHERPA_NUM_THREADS=2 docker compose up -d`) or without
+restart (`docker compose exec -e SHERPA_NUM_THREADS=2 autodiarist …`) —
+both knobs are in both compose files. On the AMD box: set nothing — the
+shipped default is the measured optimum there. Mechanics + both measured
+curves: CONFIG.md "Diarization threading".
 
 `DIAR_METHOD=foxnose` remains selectable and is faster; `none` is the
 documented escape (segments get one speaker by design). If `sherpa` or

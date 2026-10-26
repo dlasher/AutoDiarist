@@ -73,16 +73,24 @@ case "$DIARIZATION_MAX_SPEAKERS" in
     *) ceiling=$DIARIZATION_MAX_SPEAKERS ;;
 esac
 
-# --- diarization thread count (card t_3cb8f97c) ---------------------------
+# --- diarization thread count (cards t_3cb8f97c + t_71a5768f) -------------
 # The sherpa CLI defaults ONE thread for BOTH the segmentation and the
-# embedding network. Measured on the NVIDIA host (4 cores, 137.5 s clip):
-# the diarization phase runs 58.3 s at 1 thread and 20.5 s at 4 (2.85x),
-# speakers=4 at every count -- threading is a performance knob, NOT a
-# quality knob. It REGRESSES above the core count (8 threads = 68 s, worse
-# than 1), so no constant can be the default: a fixed 4 is right for this
-# 4-core box but wrong for every other one, and a fixed 8 would make the
-# NVIDIA host 2x SLOWER than today. The default is therefore computed,
-# deterministically:
+# embedding network. Measured thread sweeps on the two shipped hosts
+# (isolated sherpa wall; full tables + shapes in README.md and CONFIG.md):
+#   NVIDIA host (4 cores, 137.5 s clip): optimum 4t (20.4 s, 2.85x) with a
+#     CLIFF above it — 6t 53.4 s, 8t 69.3 s, 12t 110.4 s. Above 4 threads
+#     the box OVERSUBSCRIBES and runs slower than a single thread.
+#   AMD host (12 cores, 249 s clip): optimum 4t (19.8 s, 2.66x) with a
+#     PLATEAU above it — 6t 21.0 s, 8t 21.2 s, 12t 22.2 s. Extra threads
+#     neither help nor hurt: the work looks MEMORY-BANDWIDTH bound and 4
+#     threads already saturate it.
+# THE OPTIMUM IS 4 THREADS ON BOTH HOSTS (speakers was constant at every
+# thread count on both sweeps — threading is a performance knob, NOT a
+# quality knob). On a 4-core box "optimum == core count" and "optimum ==
+# a constant 4" make the SAME prediction; the 12-core sweep
+# discriminated, and the constant wins — so card t_71a5768f corrects the
+# cap from the earlier derived 8 to the measured 4. The default is still
+# computed, deterministically:
 #
 #   threads = min( max(1, floor(C / N)), CAP )
 #     C    = container core count (nproc, else getconf _NPROCESSORS_ONLN).
@@ -94,19 +102,23 @@ esac
 #            total CPU demand is N x T; C / N is the safe per-job share.
 #            Unset, non-integer or < 1 counts as 1 (same parse rule as
 #            api/main.py: the queue must never freeze on a bad value).
-#     CAP  = 8 by default (the card's sane range 1..8; and total demand
-#            stays <= cores at N=1 too), RAISABLE at runtime with
-#            SHERPA_MAX_THREADS (planner note 14:45, option (c): the AMD
-#            8-vs-10-vs-12 sweep is pending, so a big box can lift the
-#            auto ceiling to its own core count without a rebuild). The
-#            cap is ALWAYS min(cap, cores): a fixed 8 on a 2-core host
-#            must resolve to 2 — never oversubscribe by default.
-#            Invalid SHERPA_MAX_THREADS values (0/negative/non-integer/
-#            unset) fall back to 8, same parse rule as the other knobs.
+#     CAP  = 4 — the measured optimum on BOTH shipped hosts (card
+#            t_71a5768f, correcting the earlier derived 8). ADJUSTABLE at
+#            runtime with SHERPA_MAX_THREADS: an operator on a box whose
+#            curve has a different shape may lift or lower the auto
+#            ceiling without a rebuild; the sweep says lifting it on either
+#            shipped host buys nothing. The cap is ALWAYS min(cap, cores):
+#            4 on a 2-core host must resolve to 2 — never oversubscribe by
+#            default. Invalid SHERPA_MAX_THREADS values (0/negative/
+#            non-integer/unset) fall back to 4, same parse rule as the
+#            other knobs.
 #
-# With the shipped default N=1 this yields T=min(C, 8): on this 4-core box
-# that is the measured optimum, the full 2.85x. At N=3 on the 4-core box
-# it yields 1 -- NEVER worse than the
+# With the shipped default N=1 this yields T=min(C, 4): the measured 4 on
+# both the 4-core box and the 12-core AMD box (2.85x / 2.66x). The N
+# divisor stays — it is the SAFETY rule, not the optimum rule: at N=4 on a
+# 4-core box C/N = 1 thread per job (correct), while a hardcoded 4 would
+# put 16 threads on 4 cores. At N=3 on the 4-core box the rule yields 1 —
+# NEVER worse than the
 # current single-thread behaviour (the regression floor is a hard product
 # requirement; a default that speeds up N=1 but slows down N=3 must not
 # ship). Cores unknown -> auto resolves to 1 (identical to today's default;
@@ -150,7 +162,7 @@ case "$MAX_PROCESSING_GLOBAL" in
         ;;
 esac
 
-thread_cap=8
+thread_cap=4
 case "$SHERPA_MAX_THREADS" in
     ''|*[!0-9]*) ;;
     *)
