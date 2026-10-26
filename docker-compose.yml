@@ -53,6 +53,21 @@ services:
       SHERPA_BIN: ${SHERPA_BIN:-/opt/sherpa/sherpa-diarization-wrapper}
       SHERPA_CLUSTER_THRESHOLD: ${SHERPA_CLUSTER_THRESHOLD:-0.40}
       DIARIZATION_MAX_SPEAKERS: ${DIARIZATION_MAX_SPEAKERS:-8}
+      # Diarization THREADING (card t_3cb8f97c). The sherpa CLI runs its
+      # segmentation + embedding networks on ONE thread by default; the
+      # wrapper now passes --segmentation.num-threads/--embedding.num-threads.
+      # Measured on this 4-core box: 58.3 s -> 20.5 s at 4 threads (2.85x),
+      # and ABOVE the core count it regresses (8 threads = 68 s, worse than
+      # 1) — so the shipped default is empty = AUTO: the wrapper computes
+      # threads = min(max(1, cores // MAX_PROCESSING_GLOBAL), cap). N=1
+      # gives the core count (full win, total demand <= cores by
+      # construction); N=3 on this box gives 1 (never worse than today).
+      # SHERPA_NUM_THREADS pins the count explicitly instead (clamped to
+      # the core count); SHERPA_MAX_THREADS raises the AUTO cap (default 8)
+      # on bigger boxes without a rebuild (AMD: 12 cores; its thread sweep
+      # is pending). One line per job goes to stderr showing what resolved.
+      SHERPA_NUM_THREADS: ${SHERPA_NUM_THREADS:-}
+      SHERPA_MAX_THREADS: ${SHERPA_MAX_THREADS:-}
       VRAM_LIMIT_MIB: ${VRAM_LIMIT_MIB:-3584}
       CRISPASR_TIMEOUT_SECONDS: ${CRISPASR_TIMEOUT_SECONDS:-1800}
       # Global concurrency (card t_dbad2235): number of queue workers running

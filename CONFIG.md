@@ -19,6 +19,8 @@ GPU-default values.
 | `SHERPA_BIN` | `/opt/sherpa/sherpa-diarization-wrapper` | Executable the engine shells out to for `sherpa`/`ecapa`. Shipped as a wrapper that injects `--clustering.cluster-threshold` (the engine has no flag for it); validated executable-or-startup-error. Empty = PATH lookup of `sherpa-onnx-offline-speaker-diarization`. |
 | `SHERPA_CLUSTER_THRESHOLD` | `0.40` | Read by the wrapper at run time. sherpa-onnx FastClustering distance threshold: LOWER resolves more speakers, HIGHER merges. NV-host calibration table in README "Diarization models". |
 | `DIARIZATION_MAX_SPEAKERS` | `8` | Card t_38e52d89. Ceiling on distinct diarization speaker labels, enforced by the wrapper's CONDITIONAL second clustering pass: the auto pass runs first and is only rewritten when its label count exceeds the ceiling (the engine's own `--clustering.num-clusters=0` is stripped before injection, else the setting is a silent no-op). Compliant audio replays byte-identical; a bare fixed count over-splits (panel 2 -> 4 at NC=8). DIARIZATION_MAX_SPEAKERS=0 disables (pre-card behaviour). See `autodiarist-speaker-count-ceiling.md`. |
+| `SHERPA_NUM_THREADS` | empty = AUTO | Card t_3cb8f97c. Threads the wrapper passes as BOTH `--segmentation.num-threads` and `--embedding.num-threads` on every sherpa invocation (including the ceiling re-run pass). The CLI default is 1; diarization was ~80% of a job's wall time running on a single core. AUTO = `min(max(1, cores // MAX_PROCESSING_GLOBAL), SHERPA_MAX_THREADS)` where `cores` is the container-visible core count (nproc, else getconf; the containers see ALL host cores — no compose file sets CPU limits). Unset/`0`/negative/non-integer all mean AUTO; a valid explicit count is passed verbatim, clamped only down to the core count. The resolved value (and why) is logged to the job stderr. Full mechanics and the measured curve: section "Diarization threading" below. |
+| `SHERPA_MAX_THREADS` | `8` | Card t_3cb8f97c. Ceiling on the AUTO value only (explicit `SHERPA_NUM_THREADS` is not capped by it; it is always `min(cap, cores)`). Invalid values (0/negative/non-integer) fall back to 8. Raises the auto ceiling on big boxes without a rebuild — the AMD host has 12 cores and its 8-vs-10-vs-12 thread sweep was pending when this shipped. |
 | `CRISPASR_GPU_BACKEND` | `cuda` | Pinned via `--gpu-backend`. Accepted: `cuda`, `cpu`, `metal`, `vulkan`. The adapter probes `crispasr --version` once per binary per process and fails fast (typed `CrispasrError`) when this value is missing from the build's `ggml backends` list — this is the guard against the silent CPU fallback (see TROUBLESHOOTING.md). Setting it to `cpu` skips the assertion. Change only to force CPU debugging. |
 | `CRISPASR_LANGUAGE` | `en-US` | `-l` language qualifier. SPEC 08 fixes v1 to `en-US`; override is only for local per-locale experimentation. |
 | `CRISPASR_CACHE_DIR` | unset | Passed as `--cache-dir`. Holds the `--diarize-embedder auto` GGUF embedders (wespeaker/titanet) and any auto-downloaded artifacts; a named volume in compose. |
@@ -96,6 +98,85 @@ Operational notes:
   per-job executor width N`, plus the resolved value in the `config:`
   summary; the live in-flight count is on `GET /v1/jobs` as
   `processing_count`.
+
+## Diarization threading — `SHERPA_NUM_THREADS` (card t_3cb8f97c)
+
+The engine invokes the sherpa-onnx diarization CLI through the
+`SHERPA_BIN` wrapper (the same wrapper that injects the clustering
+threshold and enforces the speaker ceiling). The CLI runs BOTH the
+segmentation and the embedding network on ONE thread by default, and
+diarization is ~80% of a job's wall time (measured 72.3 s job: ASR 14.0 s
++ sherpa 58.3 s) while the GPU idles through the whole phase.
+
+The wrapper now passes `--segmentation.num-threads=T` and
+`--embedding.num-threads=T` on every sherpa invocation: the
+ceiling-disabled exec path, pass 1, AND the ceiling re-run pass (the
+second clustering pass starts while the first pass's memory is still
+resident, which is why the auto cap stays conservative).
+
+**Measured curve** (NVIDIA T400 host, 4 cores, isolated sherpa stage on a
+137.5 s clip, planner measurement 2026-10-26; speakers detected = 4 at
+EVERY thread count — threading is a performance knob, not a quality knob):
+
+| threads | sherpa wall | vs 1 thread |
+|---|---|---|
+| 1 | 58.3 s | 1.00x (the old behaviour) |
+| 2 | 32.3 s | 1.81x |
+| 4 | 20.5 s | 2.85x |
+| 6 | 53.4 s | 1.09x |
+| 8 | 68.0 s | 0.86x — WORSE than 1 |
+
+The regression above the core count is why no constant is the default
+(`8` would make this host ~2x slower than today). The auto default is
+computed per invocation:
+
+```
+T = min( max(1, floor(C / N)), min(SHERPA_MAX_THREADS, C) )
+    C = container core count (nproc, else getconf _NPROCESSORS_ONLN).
+        Neither compose file sets CPU limits (deploy.resources carries GPU
+        reservations only), so containers see ALL host cores: 4 on NVIDIA,
+        12 on AMD. Cores unreportable -> C unknown -> T = 1 (== today).
+    N = MAX_PROCESSING_GLOBAL (card t_dbad2235). N workers x T threads each
+        is the TOTAL demand; C // N keeps it <= C by construction.
+        Unset / non-integer / < 1 counts as 1 (same parse rule as
+        api/main.py — the queue must never freeze on a bad value).
+```
+
+| host | C | N=1 (shipped) | N=2 | N=3 | N=4 |
+|---|---|---|---|---|---|
+| NVIDIA T400 | 4 | 4 (full 2.85x) | 2 | 1 | 1 |
+| AMD (RX 6600) | 12 | 8 (cap) | 6 | 4 | 3 |
+
+Two properties the card fixes as requirements:
+
+* **Regression floor:** the default is NEVER worse than the old
+  single-thread behaviour — at any N, T >= 1 and N x T <= C, so a job
+  never oversubscribes the box. A default that sped up N=1 but slowed
+  N=3 would be a net loss and does not ship.
+* **Deterministic and logged:** the auto value goes to the job stderr
+  once per sherpa call (`sherpa-wrapper: diarization threads=T (auto:
+  cores=C / workers=N, cap=...)`), so ops can see what each box resolved
+  without rebuilding anything.
+
+Overrides (no rebuild for either):
+
+* `SHERPA_NUM_THREADS=<n>` — explicit count, wins over the auto formula
+  and ignores `MAX_PROCESSING_GLOBAL`; clamped only down to the core
+  count (explicit `9999` on 4 cores -> 4) and never below 1. Unset/`0`/
+  negative/non-integer = auto.
+* `SHERPA_MAX_THREADS=<n>` — raises/lowers the AUTO ceiling only (default
+  8, always `min(cap, C)`; invalid -> 8). Intended for the AMD box while
+  its 8-vs-10-vs-12 sweep is pending: `SHERPA_MAX_THREADS=12 docker
+  compose -f docker-compose.amd.yml up -d` once the sweep says the core
+  count is the optimum there too.
+* Both work the same on a RUNNING container: `docker compose exec -e
+  SHERPA_NUM_THREADS=2 autodiarist …` (the knob is read per sherpa
+  invocation by the wrapper, so an exec-spawned job honors it without a
+  restart; the service-spawned workers honor the compose-level value).
+
+With concurrency the per-job diarization share shrinks (C // N), while
+each of the N concurrent jobs still threads within its share — threading
+COMPOSES with card t_dbad2235 instead of fighting it.
 
 ## Job retention & disk pressure — `api/main.py`
 

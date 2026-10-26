@@ -71,7 +71,12 @@ crispasr -f <wav> --backend nemotron -pp \
 `DIAR_METHOD=none` omits the diarization flags; the segment mapping then
 collapses everything to a single speaker. For `sherpa`/`ecapa` the engine
 shells out to the sherpa-onnx CLI (`SHERPA_BIN`, a wrapper that injects
-`--clustering.cluster-threshold=<SHERPA_CLUSTER_THRESHOLD>`); if either
+`--clustering.cluster-threshold=<SHERPA_CLUSTER_THRESHOLD>` and threads
+both its networks with `--segmentation.num-threads`/`--embedding.num-threads`
+= `min(max(1, cores // MAX_PROCESSING_GLOBAL), SHERPA_MAX_THREADS default 8)` —
+the CLI's own default is 1 thread and diarization is ~80% of a job's wall
+time; card t_3cb8f97c, measured 2.85x on the 4-core box with identical
+results at every thread count); if either
 ONNX model is missing the engine emits speaker-less segments — the
 adapter refuses that at startup (`CrispasrConfigError`) and rejects it
 at runtime (`CrispasrError`) instead of normalizing to one fake speaker

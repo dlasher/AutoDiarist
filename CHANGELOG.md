@@ -1,5 +1,61 @@
 # Changelog
 
+## [Unreleased] — diarization threading (card t_3cb8f97c)
+
+**The sherpa diarization phase now runs multi-threaded, by default, at a
+computed safe thread count.** The phase (~80% of a job's wall time —
+measured 72.3 s job: ASR 14.0 s + sherpa 58.3 s) ran entirely on ONE core
+while the GPU idled: the engine's CLI invocation and the repo wrapper
+passed neither `--segmentation.num-threads` nor `--embedding.num-threads`,
+and the sherpa CLI defaults both networks to 1 thread. The wrapper now
+resolves a thread count and passes BOTH flags on every sherpa invocation —
+the ceiling-disabled exec path, pass 1, and the ceiling re-run.
+
+Why nothing is hardcoded: measured on the 4-core NVIDIA T400 (137.5 s
+clip, isolated sherpa stage) 1 thread 58.3 s, 2 threads 32.3 s, 4 threads
+20.5 s (2.85x) with the SAME speaker count (4) at every count — but 6
+threads 53.4 s and 8 threads 68.0 s, i.e. WORSE than 1 thread: the
+optimum is the core count and oversubscription regresses. A fixed 8 would
+have made this host ~2x slower than today. The default is therefore
+computed per invocation (planner guidance on this card, after the
+core-count-only draft was shown to be catastrophic under concurrency):
+
+    threads = min( max(1, cores // MAX_PROCESSING_GLOBAL),
+                   min(SHERPA_MAX_THREADS, cores) )   # cap default 8
+
+total diarization demand never exceeds the core count at any N — at the
+shipped `N=1` this is the measured optimum on the NVIDIA box (4), and at
+`N=3` on the same box it automatically drops to 1 thread per job, so the
+default can never be worse than the pre-card single-thread behaviour (the
+regression floor the card requires). N=1 72.3 s -> 34.5 s full-job
+equivalent is the expected win; AMD (12 cores) gets 8/capped until its
+thread sweep lands — `SHERPA_MAX_THREADS=12` lifts it with no rebuild.
+
+New env knobs (read by the wrapper per sherpa call; both listed in BOTH
+compose files so host overrides reach the container — the trap that made
+an earlier AMD rebuild a silent no-op; both documented in CONFIG.md,
+README, PIPELINE.md and `.env.example`):
+
+* `SHERPA_NUM_THREADS` (empty = auto): explicit count wins, is passed
+  verbatim to BOTH networks, and is clamped only down to the core count;
+  unset/0/negative/non-integer = auto. The resolved value is logged
+  deterministically to the job stderr.
+* `SHERPA_MAX_THREADS` (default 8): ceiling on the AUTO value only,
+  always `min(cap, cores)`; raises the default on big boxes without a
+  rebuild (pending AMD 8-vs-10-vs-12 sweep).
+
+Hermetic tests (`tests/pipeline/test_diarization_threads.py`, 42 cases
+driving the real wrapper against a stub sherpa CLI with a stubbed core
+count): flag injection incl. the exact argv, auto = C//N table incl. the
+planner's arithmetic (4/1->4, 4/3->1, 12/4->3, 12/1->8 capped), clamp
+matrix (0/-1/abc/9999), unknown-cores -> 1 (never 0), cap-never-above-
+cores (2-core box resolves 2, not 8), thread flags on BOTH ceiling passes,
+and output identity at 1/2/4 threads. Packaging: both knobs forwarded in
+both compose files with no hardcoded thread default above 4, and the
+suite-collected-count regression test (AC10: 405 -> 451). API contract,
+ASR invocation, `-pp` progress stream, models, threshold and ceiling
+semantics untouched (card SCOPE-OUT).
+
 ## [Unreleased] — global queue concurrency (card t_dbad2235)
 
 **The service can now process N jobs concurrently behind

@@ -82,6 +82,17 @@ services:
       SHERPA_BIN: ${SHERPA_BIN:-/opt/sherpa/sherpa-diarization-wrapper}
       SHERPA_CLUSTER_THRESHOLD: ${SHERPA_CLUSTER_THRESHOLD:-0.40}
       DIARIZATION_MAX_SPEAKERS: ${DIARIZATION_MAX_SPEAKERS:-8}
+      # Diarization THREADING (card t_3cb8f97c) — identical wrapper, so
+      # identical knobs: empty default = AUTO, threads =
+      # min(max(1, cores // MAX_PROCESSING_GLOBAL), cap). On this 12-core
+      # box the auto default caps at 8 (total demand stays <= cores even
+      # at N=1); the AMD thread sweep (8 vs 10 vs 12) is pending, and
+      # SHERPA_MAX_THREADS=12 lifts the cap to the core count WITHOUT a
+      # rebuild. SHERPA_NUM_THREADS pins an explicit count instead
+      # (clamped to the core count; measured: above the core count sherpa
+      # REGRESSES, so there is no fixed constant default).
+      SHERPA_NUM_THREADS: ${SHERPA_NUM_THREADS:-}
+      SHERPA_MAX_THREADS: ${SHERPA_MAX_THREADS:-}
       # 7 GiB ceiling: mirrors the proven amd-bringup VRAM pin on the 8 GB
       # RX 6600 (the CUDA file pins 3584 for the 4 GB T400 — per-host by
       # design, both are conservative ceilings, not hardware discovery).

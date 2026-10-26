@@ -505,3 +505,58 @@ def test_global_concurrency_default_is_one_never_hardcoded_above() -> None:
         # Guard against a future literal sneaking a host-tuned value in:
         assert not re.fullmatch(r"\d+", str(value)) or str(value) == "1", (
             f"{name}: concurrency default must never be hardcoded above 1")
+
+
+# --- diarization threading (card t_3cb8f97c) ------------------------------
+#
+# A host env var that is not listed in a compose file's environment: block
+# does NOT reach the container (the exact trap that made an earlier AMD
+# rebuild a silent no-op). Both knobs must therefore be listed on both
+# files with an EMPTY inline default (empty/unset = the wrapper's
+# auto-computed safe value; the point of the card is that no constant is
+# the shipped default), so `SHERPA_NUM_THREADS=2 docker compose up -d` and
+# `SHERPA_MAX_THREADS=12 docker compose -f docker-compose.amd.yml up -d`
+# are honored end-to-end with zero edits in the other direction.
+
+def _inline_default(name: str, text: str) -> str:
+    m = re.search(rf"{name}: \$\{{{name}:-([^}}]*)\}}", text)
+    assert m, (
+        f"{name} must be forwarded in the compose env block in the "
+        "${" + name + ":-default} shape (mirroring MAX_PROCESSING_GLOBAL); "
+        "missing or mis-shaped"
+    )
+    return m.group(1)
+
+
+@pytest.mark.parametrize("compose", [CUDA_COMPOSE, AMD_COMPOSE])
+def test_sherpa_threading_knobs_forwarded_like_other_env(compose):
+    """AC6: both knobs are listed on both compose files in the ${VAR:-}
+    pattern, and the wrapper actually reads them."""
+    env_map = yaml.safe_load(read(compose))["services"]["autodiarist"][
+        "environment"]
+    assert "SHERPA_NUM_THREADS" in env_map, compose
+    assert "SHERPA_MAX_THREADS" in env_map, compose
+    wrapper = (ROOT / "scripts"
+               / "sherpa-diarization-wrapper.sh").read_text(encoding="utf-8")
+    assert "${SHERPA_NUM_THREADS" in wrapper, compose
+    assert "${SHERPA_MAX_THREADS" in wrapper, compose
+    # MAX_PROCESSING_GLOBAL is the other input of the auto formula and is
+    # already shipped (t_dbad2235) — assert it still reaches the container.
+    assert "MAX_PROCESSING_GLOBAL" in env_map, compose
+
+
+@pytest.mark.parametrize("compose", [CUDA_COMPOSE, AMD_COMPOSE])
+def test_compose_never_hardcodes_diarization_threads_above_four(compose):
+    """AC7: the measured regression story on the 4-core box is that a
+    fixed 8 is WORSE than 1 thread. The compose files must carry no thread
+    default above 4 — in practice both stay empty = auto."""
+    text = read(compose)
+    for name in ("SHERPA_NUM_THREADS", "SHERPA_MAX_THREADS"):
+        default = _inline_default(name, text)
+        if default:
+            assert default.isdigit(), (compose, name, default)
+            assert 1 <= int(default) <= 4, (
+                f"{name} default {default!r} in {compose} hardcodes an "
+                "unsafe thread count (the 4-core box regresses above its "
+                "core count; keep the inline default empty = auto)"
+            )

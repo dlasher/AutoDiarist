@@ -73,9 +73,133 @@ case "$DIARIZATION_MAX_SPEAKERS" in
     *) ceiling=$DIARIZATION_MAX_SPEAKERS ;;
 esac
 
+# --- diarization thread count (card t_3cb8f97c) ---------------------------
+# The sherpa CLI defaults ONE thread for BOTH the segmentation and the
+# embedding network. Measured on the NVIDIA host (4 cores, 137.5 s clip):
+# the diarization phase runs 58.3 s at 1 thread and 20.5 s at 4 (2.85x),
+# speakers=4 at every count -- threading is a performance knob, NOT a
+# quality knob. It REGRESSES above the core count (8 threads = 68 s, worse
+# than 1), so no constant can be the default: a fixed 4 is right for this
+# 4-core box but wrong for every other one, and a fixed 8 would make the
+# NVIDIA host 2x SLOWER than today. The default is therefore computed,
+# deterministically:
+#
+#   threads = min( max(1, floor(C / N)), CAP )
+#     C    = container core count (nproc, else getconf _NPROCESSORS_ONLN).
+#            Neither compose file sets CPU limits (deploy.resources is
+#            GPU reservations only), so the container sees ALL host cores:
+#            4 on the NVIDIA T400, 12 on the AMD box.
+#     N    = MAX_PROCESSING_GLOBAL (concurrent queue workers, card
+#            t_dbad2235). Each worker diarizes with its own T threads, so
+#            total CPU demand is N x T; C / N is the safe per-job share.
+#            Unset, non-integer or < 1 counts as 1 (same parse rule as
+#            api/main.py: the queue must never freeze on a bad value).
+#     CAP  = 8 by default (the card's sane range 1..8; and total demand
+#            stays <= cores at N=1 too), RAISABLE at runtime with
+#            SHERPA_MAX_THREADS (planner note 14:45, option (c): the AMD
+#            8-vs-10-vs-12 sweep is pending, so a big box can lift the
+#            auto ceiling to its own core count without a rebuild). The
+#            cap is ALWAYS min(cap, cores): a fixed 8 on a 2-core host
+#            must resolve to 2 — never oversubscribe by default.
+#            Invalid SHERPA_MAX_THREADS values (0/negative/non-integer/
+#            unset) fall back to 8, same parse rule as the other knobs.
+#
+# With the shipped default N=1 this yields T=min(C, 8): on this 4-core box
+# that is the measured optimum, the full 2.85x. At N=3 on the 4-core box
+# it yields 1 -- NEVER worse than the
+# current single-thread behaviour (the regression floor is a hard product
+# requirement; a default that speeds up N=1 but slows down N=3 must not
+# ship). Cores unknown -> auto resolves to 1 (identical to today's default;
+# NEVER 0 -- 0 threads would hang or fail the CLI).
+#
+# SHERPA_NUM_THREADS is the operator override: a valid positive integer is
+# passed VERBATIM to both networks and takes precedence over the auto
+# formula (MAX_PROCESSING_GLOBAL then only matters if the operator also
+# raised it); the only clamp is down to the core count (explicit 9999 on 4
+# cores -> 4; explicit 12 on 12 cores -> 12, an informed choice the card's
+# measured curve already warned about). 0 / negative / non-integer / unset
+# = auto. More than 9 digits = absurd -> auto (keeps shell arithmetic safe).
+SHERPA_NUM_THREADS="${SHERPA_NUM_THREADS:-}"
+SHERPA_MAX_THREADS="${SHERPA_MAX_THREADS:-}"
+MAX_PROCESSING_GLOBAL="${MAX_PROCESSING_GLOBAL:-}"
+
+cores=""
+if command -v nproc >/dev/null 2>&1; then
+    cores=$(nproc 2>/dev/null || true)
+fi
+case "$cores" in
+    ''|*[!0-9]*) cores="" ;;
+esac
+if [ -z "$cores" ] && command -v getconf >/dev/null 2>&1; then
+    cores=$(getconf _NPROCESSORS_ONLN 2>/dev/null || true)
+fi
+case "$cores" in
+    ''|*[!0-9]*) cores="" ;;
+    *)
+        if [ "$cores" -lt 1 ]; then cores=""; fi
+        ;;
+esac
+
+workers=1
+case "$MAX_PROCESSING_GLOBAL" in
+    ''|*[!0-9]*) ;;
+    *)
+        if [ "$MAX_PROCESSING_GLOBAL" -ge 1 ]; then
+            workers=$MAX_PROCESSING_GLOBAL
+        fi
+        ;;
+esac
+
+thread_cap=8
+case "$SHERPA_MAX_THREADS" in
+    ''|*[!0-9]*) ;;
+    *)
+        if [ "${#SHERPA_MAX_THREADS}" -le 9 ] \
+           && [ "$SHERPA_MAX_THREADS" -ge 1 ]; then
+            thread_cap=$SHERPA_MAX_THREADS
+        fi
+        ;;
+esac
+# The cap can never oversubscribe: min(cap, reported core count).
+if [ -n "$cores" ] && [ "$thread_cap" -gt "$cores" ]; then
+    thread_cap=$cores
+fi
+threads=""
+requested=""
+case "$SHERPA_NUM_THREADS" in
+    ''|*[!0-9]*) ;;
+    *)
+        if [ "${#SHERPA_NUM_THREADS}" -le 9 ] \
+           && [ "$SHERPA_NUM_THREADS" -ge 1 ]; then
+            requested=$SHERPA_NUM_THREADS
+        fi
+        ;;
+esac
+
+if [ -n "$requested" ]; then
+    threads=$requested
+    if [ -n "$cores" ] && [ "$threads" -gt "$cores" ]; then
+        echo "sherpa-wrapper: SHERPA_NUM_THREADS=$requested exceeds the $cores core(s) reported by the container; clamping to $cores" >&2
+        threads=$cores
+    fi
+else
+    if [ -n "$cores" ]; then
+        threads=$((cores / workers))
+        if [ "$threads" -lt 1 ]; then threads=1; fi
+        if [ "$threads" -gt "$thread_cap" ]; then threads=$thread_cap; fi
+    else
+        threads=1
+    fi
+    # The auto value is deterministic and logged (ops must be able to see
+    # what each box resolved without rebuilding anything).
+    echo "sherpa-wrapper: diarization threads=$threads (auto: cores=${cores:-unknown} / workers=$workers, cap=$thread_cap)" >&2
+fi
+
 if [ "$ceiling" -le 0 ]; then
     exec "$SHERPA_REAL" \
         --clustering.cluster-threshold="$SHERPA_CLUSTER_THRESHOLD" \
+        --segmentation.num-threads="$threads" \
+        --embedding.num-threads="$threads" \
         "$@"
 fi
 
@@ -86,6 +210,8 @@ trap 'rm -f "$pass1"' EXIT HUP INT TERM
 set +e
 "$SHERPA_REAL" \
     --clustering.cluster-threshold="$SHERPA_CLUSTER_THRESHOLD" \
+    --segmentation.num-threads="$threads" \
+    --embedding.num-threads="$threads" \
     "$@" >"$pass1"
 rc=$?
 set -e
@@ -132,7 +258,12 @@ while [ "$n" -gt 0 ]; do
     esac
 done
 
+# Ceiling re-run pass: same thread flags as pass 1 (the planner note on
+# card t_3cb8f97c — the wrapper invokes sherpa TWICE on over-exploding
+# inputs and the thread count applies to BOTH passes).
 "$SHERPA_REAL" \
     --clustering.cluster-threshold="$SHERPA_CLUSTER_THRESHOLD" \
     --clustering.num-clusters="$ceiling" \
+    --segmentation.num-threads="$threads" \
+    --embedding.num-threads="$threads" \
     "$@"
