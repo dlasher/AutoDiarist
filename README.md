@@ -686,11 +686,16 @@ access, no GPU tooling on either side.
 
 | input | NVIDIA wall | NVIDIA RTF | AMD wall | AMD RTF | AMD lead |
 |---|---|---|---|---|---|
-| `whatIsNASASEWP_2026Update-CC` (249.0 s, 5-speaker panel) | 146.4 s | 1.70x | **19.5 s** | **12.78x** | **7.5x** |
-| `BestPractice_RFQ_CC` (137.5 s, single voice) | 80.1 s | 1.72x | **37.1 s** | **3.70x** | **2.2x** |
+| `whatIsNASASEWP_2026Update-CC` (249.0 s, 5-speaker panel) | 222.7 s | 1.12x | **105.4 s** | **2.36x** | **2.1x** |
+| `BestPractice_RFQ_CC` (137.5 s, single voice) | 78.4 s | 1.75x | **39.2 s** | **3.50x** | **2.0x** |
 
 Both backends produced **identical output** for both files: 18 segments / 3
 speakers on the panel, 8 / 2 on the single-voice file. Only the time differs.
+
+Measured on the **matched build** (`000bc2f` — speaker-count ceiling, domain
+lexicon and long-job progress), with both hosts on the same app layer, on an
+**idle queue**, using each job's own elapsed time so queue wait is excluded
+(an earlier measurement on a busy host overstated the AMD figure by 3.5x).
 
 These are the job's own elapsed time (`started_at` to terminal status), so they
 **exclude queue wait** — which matters: with one GPU worker per host, a

@@ -166,17 +166,22 @@ label-less segments normalized into a fake single-speaker transcript.
   the same image family, same model bytes, same `DIAR_METHOD=sherpa`, same
   diarization models; only the engine build and the GPU differ. Measured as a
   pure consumer over the HTTP API.
-  - `whatIsNASASEWP_2026Update-CC` (249.0 s): NVIDIA 146.4 s (1.70x) |
-    AMD 19.5 s (**12.78x**) — AMD 7.5x faster
-  - `BestPractice_RFQ_CC` (137.5 s): NVIDIA 80.1 s (1.72x) |
-    AMD 37.1 s (**3.70x**) — AMD 2.2x faster
+  - `whatIsNASASEWP_2026Update-CC` (249.0 s): NVIDIA 222.7 s (1.12x) |
+    AMD 105.4 s (**2.36x**) — AMD 2.1x faster
+  - `BestPractice_RFQ_CC` (137.5 s): NVIDIA 78.4 s (1.75x) |
+    AMD 39.2 s (**3.50x**) — AMD 2.0x faster
   - Both backends returned identical output shape (18 seg / 3 spk and
     8 seg / 2 spk) — the difference is throughput, not transcript content.
-  - These are the job's OWN elapsed time (started_at to terminal status), so
-    they exclude queue wait. Earlier figures taken under load (AMD 3.66x /
-    3.69x) are superseded. With one GPU worker per host a submit-to-done wall
-    time includes the queue wait, which was measured at up to 3.5x the job's
-    real cost on a busy host.
+  - RE-MEASURED on the MATCHED build (`000bc2f` — ceiling, lexicon, progress
+    fix), both hosts on the same app layer, on an IDLE queue, using each job's
+    OWN elapsed time (started_at to terminal status) so queue wait is excluded.
+    The earlier figures (AMD 12.78x / 3.70x) were measured on a busy host and
+    were inflated by up to 3.5x.
+  - Output shape is IDENTICAL on both hosts: 18 seg / 3 spk (panel) and
+    8 seg / 2 spk (single-voice). Only the time differs.
+  - The domain lexicon is verified live on BOTH hosts: GWAC, SEWP, ITCAV, NASA,
+    contract holders and soup contracts all present; the measured garbles
+    (gwec, sout, soupes, soubcontracts, acceptional, contractholders) absent.
   - The AMD lead comes mostly from the CPU: diarization clusters on one core
     while the GPU does ASR, and the AMD host has 12 cores / 112 GiB against
     the NVIDIA host's 4 cores / 7.9 GiB.
