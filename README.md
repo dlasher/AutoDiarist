@@ -340,8 +340,11 @@ service never starts a job it cannot run:
   N=4: `sched alloc encoder graph failed`) fails ONLY that job — the real
   stderr tail lands on its record — and every worker keeps serving.
 - Measured NVIDIA T400 operating point: N=3 sustains 3/3 engines at
-  3207 MiB of the 4096 MiB card. The AMD value is still to be measured, so
-  its shipped default stays 1 on both compose profiles.
+  3207 MiB of the 4096 MiB card. AMD has since been swept too (measured
+  safe at N=4, 12/12 jobs complete) — the full service-level curves for
+  BOTH hosts, with the per-host ceilings and causes, are published under
+  "Concurrency — measured service-level curve" in "Other backends" below.
+  Shipped defaults stay 1; opt in per host from that measurement.
 - The VRAM sampler reads the CARD TOTAL, so at N>1 the effective ceiling is
   the FLEET cap `VRAM_LIMIT_MIB × N`; `VRAM_LIMIT_MIB` itself remains the
   documented per-job share (approach (a), planner note on the card).
@@ -774,8 +777,12 @@ access, no GPU tooling on either side.
 | `whatIsNASASEWP_2026Update-CC` (249.0 s, 5-speaker panel) | 222.7 s | 1.12x | **105.4 s** | **2.36x** | **2.1x** |
 | `BestPractice_RFQ_CC` (137.5 s, single voice) | 78.4 s | 1.75x | **39.2 s** | **3.50x** | **2.0x** |
 
-Both backends produced **identical output** for both files: 18 segments / 3
-speakers on the panel, 8 / 2 on the single-voice file. Only the time differs.
+Both backends returned the same output SHAPE on both files — 18 segments /
+3 speakers on the panel, 8 / 2 on the single-voice file — and that first
+report said "identical". That word is now FALSIFIED at the text level by a
+directly matched-build re-run (see the correction below): the segment and
+speaker COUNTS agree everywhere measured, but the transcript TEXT is not
+the same — roughly 6% of the words differ.
 
 Measured on the **matched build** (`000bc2f` — speaker-count ceiling, domain
 lexicon and long-job progress), with both hosts on the same app layer, on an
@@ -796,9 +803,105 @@ the AMD host has 12 cores and 112 GiB against the NVIDIA host's 4 cores and
 7.9 GiB.
 
 RTF = audio seconds / wall seconds (higher is faster). Both backends returned
-**identical output shape** — 18 segments / 3 speakers on the panel file and
-8 / 2 on the single-speaker file — so the difference is throughput, not
-transcript content.
+the same output SHAPE — 18 segments / 3 speakers on the panel file and
+8 / 2 on the single-speaker file — so the difference is not structural.
+Shape agreement is not text agreement, though: on the later matched-build
+re-run (b0335f9, below) the two transcript TEXTS differ on ~6% of words
+(word similarity 0.9442) — the first pass here missed that. See the
+correction subsection below before quoting this table as evidence that the
+backends agree.
+
+#### The falsified claim: same COUNTS, different words (2026-10-26, card t_ee479fdf)
+
+Re-measured on the later **matched build `b0335f9`** — same 137.5 s clip
+(the single-voice `BestPractice_RFQ_CC`), same app layer, both hosts on the
+same commit, idle queue:
+
+| host | backend | text_sha | segments | speakers | chars |
+|---|---|---|---|---|---|
+| NVIDIA | CUDA | `811e0c9b8cc81ee0` | 8 | 2 | 2213 |
+| AMD | Vulkan | `11a24a7b2b728066` | 8 | 2 | 2220 |
+
+Word-level similarity: **0.9442** — the transcripts agree on ~94% of words.
+The differing runs:
+
+| NVIDIA (CUDA) | AMD (Vulkan) |
+|---|---|
+| `Soup? We` | `Soup, we` |
+| `holders` | `orders` |
+| `fine. Just` | `fine just` |
+| `it's` | `is` |
+| `to touch a justification` | `attach your justification` |
+| `does` / `order` | `went` / `holder` |
+| `eighty` | `eight and` |
+| `dotnasa` | `dotnanasa` |
+
+Nature of the difference: backend ASR variation between CUDA and Vulkan —
+same model bytes, same quantisation, different GPU arithmetic. The segment
+count and the speaker count are identical (8 / 2), so this is a WORDING
+difference, not a structural one, and not a diarization or spell-check
+difference. Raw data and the full wave logs:
+`~/CODE/autodiarist-planning/NOTES-2026-10-22.md` (section 69); harness
+`ab_hosts.py` beside it.
+
+### Concurrency — measured service-level curve (both hosts, 2026-10-26, card t_ee479fdf)
+
+Service-level sweep on the matched build `b0335f9`: the same 137.5 s clip on
+BOTH hosts, 3 waves per rung, **in-flight reached N at every rung** on both
+hosts — 30/30 jobs completed on AMD (N=1..4) and 12/12 on NVIDIA (N=1..3).
+Queue wait was ~4–7 ms at every rung on both hosts, so the
+wall time IS the processing time (no queue contamination).
+
+| N | host | wall / job | throughput | scaling efficiency | per-job degradation |
+|---|---|---|---|---|---|
+| 1 | AMD (12 cores, UMA, Vulkan) | 41.3 s | 0.024 jobs/s | — | — |
+| 2 | AMD | 47.9 s | 0.042 jobs/s | 88% | +16% |
+| 3 | AMD | 49.5 s | 0.061 jobs/s | 85% | +20% |
+| 4 | AMD | 57.2 s | 0.070 jobs/s | 73% | +38% |
+| 1 | NVIDIA (4 cores, 4 GB T400, CUDA) | 79.3 s | 0.013 jobs/s | — | — |
+| 2 | NVIDIA | 92.6 s | 0.022 jobs/s | 85% | +17% |
+| 3 | NVIDIA | 108.9 s | 0.028 jobs/s | 72% | +37% |
+
+Both curves have the same SHAPE: **throughput climbs with N while per-job
+latency rises** — concurrency buys service capacity, not faster single jobs.
+Head-to-head at the same build and clip, AMD runs 1.92x / 1.93x / 2.20x
+faster than NVIDIA at N=1/2/3 (throughput 1.85x / 1.91x / 2.18x).
+
+Safe worker count per host: AMD N=4 (measured, 12/12 jobs complete), NVIDIA
+N=3 (N=4 aborts the fourth engine — see the ceiling below).
+
+Why the two hosts stop in different places:
+
+- **NVIDIA (T400, 4 GB VRAM, 4 cores): safe ceiling N=3.** At N=4 the fourth
+  engine dies with the verbatim abort `nemotron: sched alloc encoder graph
+  failed` (measured 3/4 in EVERY wave; the other three jobs survive and
+  complete, and the service stays serving). It is a VRAM ceiling, not a CPU
+  one: the card holds 4096 MiB and the measured per-job peak is ~1069 MiB,
+  so three engines fit (3207 MiB observed at N=3) and four do not.
+- **AMD (Radeon 8060S iGPU, 12 cores, UMA): no VRAM ceiling** — the "VRAM"
+  is system RAM (112 GiB), so at these job sizes the engine never hits an
+  allocation wall; the first constraint seen is CPU-side, and the curve is
+  still climbing at N=4.
+
+AMD caveat: `VRAM_LIMIT_MIB` is INERT on the AMD image. The vulkan build
+ships without `nvidia-smi`, so the guard's sampler self-disables at startup
+(`VRAM sampling disabled`) and the check can never fire, at any N. The cap
+only has meaning on NVIDIA, where the sampler reads the CARD TOTAL — so at
+N>1 the effective ceiling is the fleet cap `VRAM_LIMIT_MIB × N` (see
+CONFIG.md).
+
+Threads × workers — the interaction that bites operators: the wrapper
+resolves `threads = min(max(1, cores // MAX_PROCESSING_GLOBAL),
+SHERPA_MAX_THREADS)` (default cap 4), so raising the worker count silently
+lowers every job's diarization threads. On the 4-core NVIDIA box at N=3 each
+job gets ONE thread and a solo job takes 78.7 s instead of the 43 s measured
+at N=1 with 4 threads. If a host is configured for more workers than its
+users need, the per-job latency penalty is real and unavoidable at that N;
+`SHERPA_NUM_THREADS` pins the count explicitly when the divisor rule is not
+what you want. The per-box thread curves behind those numbers are already
+documented in this README ("Diarization threading" above) and in CONFIG.md
+(card t_71a5768f — optimum 4 threads on BOTH hosts, NVIDIA cliff vs AMD
+plateau); they are deliberately not duplicated here.
 
 Notes for anyone repeating this:
 

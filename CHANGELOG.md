@@ -1,5 +1,32 @@
 # Changelog
 
+## [Unreleased] — falsified "identical output" A/B claim corrected; both hosts' service-level concurrency curves published (card t_ee479fdf)
+
+**Docs-only.** The README claimed "both backends produced identical output"
+twice in the AMD-vs-NVIDIA A/B section. That claim is FALSIFIED by direct
+measurement on the matched build `b0335f9` (same 137.5 s clip, same app
+layer, both hosts on the same commit): NV `text_sha 811e0c9b8cc81ee0`
+(8 seg / 2 spk / 2213 chars) vs AMD `11a24a7b2b728066` (8 / 2 / 2220), word
+similarity **0.9442**. The segment and speaker COUNTS are identical; the
+transcript TEXT is not — CUDA-vs-Vulkan backend ASR variation (same model,
+same quantisation, different GPU arithmetic), not a diarization or
+spell-check difference. Both passages are corrected and a new test file
+(`tests/test_readme_backend_claims.py`, 12 tests) now pins the wording so
+the claim cannot silently come back.
+
+Also published (was board-comment-only): the measured SERVICE-level
+concurrency curve for BOTH hosts on `b0335f9` — AMD N=1..4 (41.3/47.9/49.5/
+57.2 s wall per job; throughput 0.024 → 0.070 jobs/s; 30/30 jobs, in-flight
+reached N every rung), NVIDIA N=1..3 (79.3/92.6/108.9 s; 0.013 → 0.028
+jobs/s; 12/12). Safe worker counts: **AMD N=4, NVIDIA N=3** — NVIDIA stops
+at a VRAM ceiling (`nemotron: sched alloc encoder graph failed`, 3/4 in
+every wave at N=4; ~1069 MiB per-job peak on a 4096 MiB card), AMD has no
+VRAM ceiling (UMA) but `VRAM_LIMIT_MIB` is INERT there (no `nvidia-smi`,
+sampler self-disables). Thread-vs-worker interaction documented with the
+measured example (at N=3 the 4-core box gives every job 1 thread: a solo
+job takes 78.7 s instead of 43 s; `SHERPA_NUM_THREADS` pins it explicitly).
+No code, thresholds, models, or engine invocation touched.
+
 ## [Unreleased] — diarization thread cap corrected 8 -> 4 + measured curves (card t_71a5768f)
 
 **The default `SHERPA_MAX_THREADS` is now 4, the measured optimum on BOTH
