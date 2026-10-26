@@ -29,6 +29,15 @@ def _setup(tmp_path, monkeypatch, worker="0", cap=None, poll="0.02"):
     monkeypatch.setenv("QUEUE_POLL_SECONDS", poll)
     monkeypatch.setenv("MAX_UPLOAD_BYTES", str(10 * 10 * 1024))
     monkeypatch.setenv("MAX_QUEUE_DEPTH", "50")
+    # These unit-driven scheduler tests predate the V1.5.1 claim-time GLOBAL
+    # cap (card t_dbad2235): they simulate pools of concurrent claims by
+    # calling _claim_next_queued directly while seeded jobs stay
+    # 'processing' — a state the real single-worker service can never reach
+    # (the knob unset would make the claim gate return None and mask the
+    # per-session-cap and fairness semantics isolated here). Widen the gate;
+    # the concurrency contract itself is covered in
+    # tests/api/test_concurrency_global.py.
+    monkeypatch.setenv("MAX_PROCESSING_GLOBAL", "10")
     if cap is not None:
         monkeypatch.setenv("MAX_PROCESSING_PER_SESSION", str(cap))
     else:

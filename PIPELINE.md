@@ -1,7 +1,9 @@
 # Pipeline Reference
 
-Stage order inside the worker (`api/main.py process_job_background`, one job
-at a time, claimed fair-share: round-robin across sessions, FIFO by `seq`
+Stage order inside the worker (`api/main.py process_job_background`, each
+worker runs one job at a time; the pool size is `MAX_PROCESSING_GLOBAL`,
+default 1 — serial, card t_dbad2235; jobs are claimed fair-share:
+round-robin across sessions, FIFO by `seq`
 within a session — card t_4b40acfd). Stages are the public `stage` enum (V2, card
 t_14ac6b49); bands are the `[start, end)` slice of `[0, 1]` each stage owns:
 

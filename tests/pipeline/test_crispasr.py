@@ -21,6 +21,9 @@ CONFIG_ENVS = (
     "CRISPASR_TIMEOUT_SECONDS", "MIN_FRAGMENT_SECONDS", "VRAM_LIMIT_MIB",
     "MOCK_PIPELINE", "CHUNK_SECONDS", "OVERLAP_SECONDS",
     "SHERPA_SEGMENT_MODEL", "SHERPA_EMBEDDING_MODEL", "SHERPA_BIN",
+    # Concurrency knob (card t_dbad2235): scales the VRAM fleet cap, so it
+    # must never leak between pipeline tests.
+    "MAX_PROCESSING_GLOBAL",
 )
 
 
@@ -366,6 +369,59 @@ def test_vram_peak_logged(fake_crispasr, caplog, monkeypatch):
     with caplog.at_level(logging.INFO, logger="pipeline.transcribe"):
         tr.transcribe_and_diarize(str(fake_crispasr))
     assert "VRAM" in caplog.text and "peak=1085" in caplog.text
+
+
+# ---------------------------------------------------------------------------
+# VRAM cap under global concurrency (card t_dbad2235, planner addition):
+# nvidia-smi reports the CARD TOTAL, so with N concurrent jobs every job's
+# sampler observes the fleet aggregate. VRAM_LIMIT_MIB stays the documented
+# PER-JOB share; the effective ceiling is the fleet cap, limit x N
+# (approach (a)). On the serial default the multiplier is 1 and behaviour is
+# byte-for-byte what it was before concurrency existed.
+# ---------------------------------------------------------------------------
+
+
+def test_vram_fleet_cap_scales_effective_ceiling_with_concurrency(
+        fake_crispasr, monkeypatch):
+    monkeypatch.setenv("VRAM_LIMIT_MIB", "1000")
+    monkeypatch.setenv("MAX_PROCESSING_GLOBAL", "3")
+    fake = tr.VramSampler()
+    fake.observe(2500.0)  # the aggregate of 3 jobs at ~833 MiB each
+    monkeypatch.setattr(tr, "_make_vram_sampler", lambda: fake)
+    tr.transcribe_and_diarize(str(fake_crispasr))  # must NOT raise
+    assert tr.LAST_RUN_STATS["vram_fleet_multiplier"] == 3
+    assert tr.LAST_RUN_STATS["vram_fleet_cap_mib"] == 3000.0
+    assert tr.LAST_RUN_STATS["vram_limit_mib"] == 1000.0  # per-job meaning kept
+    # A peak above the FLEET cap still fails, and says so with the math:
+    fake2 = tr.VramSampler()
+    fake2.observe(3500.0)
+    monkeypatch.setattr(tr, "_make_vram_sampler", lambda: fake2)
+    with pytest.raises(tr.TranscriptionOOM) as exc:
+        tr.transcribe_and_diarize(str(fake_crispasr))
+    assert "fleet cap 3000" in str(exc.value)
+    assert "per-job 1000 MiB x 3" in str(exc.value)
+
+
+def test_vram_serial_default_cap_is_byte_identical(fake_crispasr, monkeypatch):
+    """Knob unset: multiplier 1, per-job cap == fleet cap, same raise as before."""
+    monkeypatch.setenv("VRAM_LIMIT_MIB", "1000")
+    assert tr._vram_fleet_multiplier() == 1
+    fake = tr.VramSampler()
+    fake.observe(1500.0)
+    monkeypatch.setattr(tr, "_make_vram_sampler", lambda: fake)
+    with pytest.raises(tr.TranscriptionOOM):
+        tr.transcribe_and_diarize(str(fake_crispasr))
+
+
+@pytest.mark.parametrize("bad", ["0", "-2", "abc"])
+def test_vram_fleet_multiplier_invalid_falls_back_to_1x(bad, caplog, monkeypatch):
+    """Never silently honour a broken multiplier: fall back to the serial
+    semantics (1x) with a warning, exactly like every other knob."""
+    import logging
+    monkeypatch.setenv("MAX_PROCESSING_GLOBAL", bad)
+    with caplog.at_level(logging.WARNING, logger="pipeline.transcribe"):
+        assert tr._vram_fleet_multiplier() == 1
+    assert any("MAX_PROCESSING_GLOBAL" in r.getMessage() for r in caplog.records)
 
 
 # ---------------------------------------------------------------------------

@@ -16,7 +16,10 @@ VRAM discipline inherited from card t_95726260:
 * per-stage VRAM instrumentation — an ``nvidia-smi`` sampler thread records
   GPU memory allocated during the invocation; the run logs
   ``allocated=/peak=`` lines (INFO) and ``TranscriptionOOM`` is raised when
-  the peak exceeds ``VRAM_LIMIT_MIB`` (default 3584 = 3.5 GiB).
+  the peak exceeds the FLEET cap — ``VRAM_LIMIT_MIB`` (default 3584 = 3.5
+  GiB) x ``MAX_PROCESSING_GLOBAL``. The sampler reads the CARD TOTAL, so
+  under global concurrency (card t_dbad2235) the per-job share is scaled by
+  the worker count; unset/invalid N is 1 and the serial math is unchanged.
 * live progress streaming (cards t_1eb108e0, t_2e901945) — measured on the
   pinned binary, the engine's diarized stdout transcript is APP-HELD until
   the final merge (``stdbuf -oL`` and even a pty deliver nothing mid-run
@@ -652,6 +655,39 @@ def _make_vram_sampler() -> VramSampler:
     return VramSampler()
 
 
+def _vram_fleet_multiplier() -> int:
+    """Service-wide worker count N configured for this deployment
+    (card t_dbad2235, planner addition on the concurrency card).
+
+    The ``nvidia-smi`` sampler reads the CARD TOTAL — with N concurrent jobs,
+    every job's sampler observes the aggregate of all N. VRAM_LIMIT_MIB keeps
+    its documented meaning (a PER-JOB share); the ceiling a check actually
+    compares against is the fleet cap, ``limit x N`` (approach (a)). Unset or
+    invalid input falls back to 1 with a warning — the serial default — so
+    the CLI path (which never sets the knob) and every existing deployment
+    behave byte-for-byte as before. The env var name must match api/main.py's
+    exactly (compose env keys are read by both surfaces).
+    """
+    raw = (os.environ.get("MAX_PROCESSING_GLOBAL") or "").strip()
+    if not raw:
+        return 1
+    try:
+        value = int(raw)
+    except ValueError:
+        logger.warning(
+            "config: MAX_PROCESSING_GLOBAL=%r is not an integer; VRAM fleet "
+            "cap uses 1x (serial semantics)", raw,
+        )
+        return 1
+    if value < 1:
+        logger.warning(
+            "config: MAX_PROCESSING_GLOBAL=%d is invalid; VRAM fleet cap "
+            "uses 1x (serial semantics)", value,
+        )
+        return 1
+    return value
+
+
 # ---------------------------------------------------------------------------
 # Backend invocation
 # ---------------------------------------------------------------------------
@@ -758,6 +794,12 @@ def _run_crispasr(wav_path: str, work_dir: str,
     command = build_crispasr_command(wav_path, out_base)
     timeout = _env_float("CRISPASR_TIMEOUT_SECONDS", DEFAULT_TIMEOUT_SECONDS)
     limit = _env_float("VRAM_LIMIT_MIB", DEFAULT_VRAM_LIMIT_MIB)
+    # The sampled quantity is the CARD TOTAL, so under global concurrency the
+    # effective ceiling is the fleet cap (per-job share x N, card t_dbad2235
+    # planner note): without this, N-1 sibling jobs could each fail a job for
+    # memory that is not its own. Serial default (N=1) keeps the old math.
+    fleet_mult = _vram_fleet_multiplier()
+    fleet_cap = limit * fleet_mult if limit > 0 else 0.0
     sampler = _make_vram_sampler()
     sampler.start()
     stderr_path = os.path.join(work_dir, "crispasr_stderr.log")
@@ -865,17 +907,22 @@ def _run_crispasr(wav_path: str, work_dir: str,
     except (json.JSONDecodeError, OSError) as exc:
         raise CrispasrError(f"cannot parse crispasr JSON at {json_path!r}: {exc}") from exc
     segments = parse_crispasr_output(payload)
-    sampler.log_summary("crispasr_diarized_asr", limit)
+    sampler.log_summary("crispasr_diarized_asr", fleet_cap)
     LAST_RUN_STATS.update({
         "engine_seconds": round(engine_seconds, 2),
         "vram_peak_mib": round(sampler.peak_mib, 1),
         "vram_samples": sampler.samples,
         "vram_limit_mib": limit,
+        "vram_fleet_multiplier": fleet_mult,
+        "vram_fleet_cap_mib": round(fleet_cap, 1),
         "segments": len(segments),
     })
-    if sampler.samples and limit > 0 and sampler.peak_mib > limit:
+    if sampler.samples and fleet_cap > 0 and sampler.peak_mib > fleet_cap:
         raise TranscriptionOOM(
-            f"peak VRAM {sampler.peak_mib:.0f} MiB exceeded cap {limit:.0f} MiB"
+            f"peak VRAM {sampler.peak_mib:.0f} MiB exceeded fleet cap "
+            f"{fleet_cap:.0f} MiB (per-job {limit:.0f} MiB x {fleet_mult} "
+            "concurrent workers; the nvidia-smi sampler reads the card "
+            "total, not this job's share)"
         )
     logger.info(
         "crispasr run ok: %.1fs (%.1fx realtime) segments=%d",

@@ -24,7 +24,7 @@ GPU-default values.
 | `CRISPASR_CACHE_DIR` | unset | Passed as `--cache-dir`. Holds the `--diarize-embedder auto` GGUF embedders (wespeaker/titanet) and any auto-downloaded artifacts; a named volume in compose. |
 | `CRISPASR_LIB_DIR` | unset | Directory containing `libcudart.so.13` / `libcublas.so.13` (image: `/usr/local/cuda-13.0/targets/x86_64-linux/lib`, apt `cuda-cudart-13-0` + `libcublas-13-0`). Prepended to the subprocess `LD_LIBRARY_PATH`. Without it the engine silently drops to CPU. |
 | `MIN_FRAGMENT_SECONDS` | `2.0` | Sub-second fragment merge threshold (spike: ~94% of sub-2 s fragments mis-cluster). Fragments shorter than this join the previous turn. `0` disables. |
-| `VRAM_LIMIT_MIB` | `3584` (3.5 GiB) | Per-job GPU-allocated ceiling enforced by the sampler thread. Breaching it kills the engine process and fails the job with `TranscriptionOOM`. `0` disables the guard. |
+| `VRAM_LIMIT_MIB` | `3584` (3.5 GiB) | Per-job GPU-allocated ceiling enforced by the sampler thread. Breaching it kills the engine process and fails the job with `TranscriptionOOM`. `0` disables the guard. The `nvidia-smi` sampler reads the CARD TOTAL, so under global concurrency (`MAX_PROCESSING_GLOBAL=N`) the effective ceiling is the FLEET cap `VRAM_LIMIT_MIB x N` (card t_dbad2235 planner note): one job is never failed for its siblings' memory, and the per-job meaning of this knob is preserved. On the AMD image there is no `nvidia-smi` at all — the sampler self-disables (`VRAM sampling disabled`) and this cap is inert, at any N. |
 | `CRISPASR_TIMEOUT_SECONDS` | `1800` | Wall-clock budget per engine invocation; overrun kills the process and fails the job. |
 | `CRISPASR_VRAM_SAMPLE_SECONDS` | `1.0` | `nvidia-smi` sampler period (floor 0.1 s). |
 | `MOCK_PIPELINE` | unset | Exact `1` returns two deterministic synthetic segments from `transcribe_and_diarize` without touching the binary. Also read by `api.main` (see below). |
@@ -37,16 +37,65 @@ GPU-default values.
 | `MAX_UPLOAD_BYTES` | `524288000` (500 MiB) | Upload cap enforced while streaming; oversize uploads get `413` and leave no job dir. Parsed `int` at request time. |
 | `MOCK_PIPELINE` | unset | Exact `1` makes the worker short-circuit decode/ASR and write a deterministic mock result; admission, limits, cancellation, and download semantics are unchanged. |
 | `SPELL_CHECK` | unset (enabled) | Spell-check layer ON by default; the API seam and `pipeline.spellcheck` share `spell_check_enabled()` (`pipeline/spellcheck.py`), so unset → enabled, and `{0,false,no,off}` (case-insensitive) disables. The old API-only hard gate (`== "1"`) that meant the shipped service never ran the pass is retired (card t_72405565). Set `SPELL_CHECK=0` or `off` to opt out. |
-| `QUEUE_WORKER_ENABLED` | `1` | Exact `1` starts the in-process fair-share worker (round-robin across sessions) at startup; `0` admits jobs into `queued` and holds them (ops valve / tests). Jobs admitted while disabled are still claimed if the flag is flipped on later. |
+| `QUEUE_WORKER_ENABLED` | `1` | Exact `1` starts the in-process queue worker POOL (fair-share round-robin across sessions; pool size = `MAX_PROCESSING_GLOBAL`, default 1 — serial) at startup; `0` admits jobs into `queued` and holds them (ops valve / tests). Jobs admitted while disabled are still claimed if the flag is flipped on later. |
 | `MAX_QUEUE_DEPTH` | `50` | System backpressure. At or beyond this many `queued` jobs, `POST /v1/jobs` answers `503` + `Retry-After` — the **only admission rejection** since V1.5 (card t_82bfbc15); the detail names both the depth and the Retry-After value. Accepted jobs are always queued, whatever the caller's session holds. |
 | `MAX_JOBS_PER_SESSION` | *(deprecated)* | **No effect** since V1.5 (card t_82bfbc15): a session may hold any number of active jobs. The variable is still accepted so existing `.env` files load unchanged; when set, startup logs `config: MAX_JOBS_PER_SESSION=... is DEPRECATED and IGNORED` and the value is omitted from the boot config summary. Remove it from your env. |
 | `MAX_PROCESSING_PER_SESSION` | `1` | Fair-share scheduling cap (V1.5, card t_4b40acfd): maximum jobs of ONE session that may be `processing` concurrently. Enforced by the scheduler at claim time — a session at the cap is skipped even when its queued jobs sit at the head of the queue, so the cap survives a future multi-worker scale-up. Read at every claim; values `< 1` or unparseable log a warning and clamp to 1 (a zero cap would freeze the queue). Sessions are served round-robin (FIFO within a session) using a persistent pointer in `JOBS_DIR/_scheduler.json`; `queue_position` reports the rank in that fair execution order. |
+| `MAX_PROCESSING_GLOBAL` | `1` | Global concurrency (V1.5.1, card t_dbad2235): number of queue workers processing jobs SIMULTANEOUSLY. The loop was serial by construction (one task awaiting each job to completion); this spawns N workers running the same claim/process/wake cycle. The claim stays atomic under `_queue_lock` (N workers cannot double-claim) and the cap is enforced AT CLAIM TIME — `_select_next_queued` blocks every claim while total in-flight ≥ N, so the service never starts a job it cannot run. Read once at startup (pool size + dedicated per-job executor width) and again at every claim: lowering it acts immediately, raising it above the live worker count needs a restart. Unset/invalid/`< 1` warn and clamp to 1 — never freeze the queue. Default 1 keeps existing deployments byte-for-byte unchanged; opt in per host from MEASUREMENT (see below). Under N>1 the VRAM guard becomes a FLEET cap (`VRAM_LIMIT_MIB` × N — the `nvidia-smi` sampler reads the card total); fair-share selection and the per-session cap above are untouched at any N. `GET /v1/jobs` reports the live `processing_count`. |
 | `RETRY_AFTER_SECONDS` | `30` | Value of the `Retry-After` header on `503` admissions (repeated in the detail body). |
 | `PROCESSING_SECONDS_PER_AUDIO_SECOND` | `0.185` | Queue-aware wait-estimate rate (V1.5, card t_b3ae9366): estimated GPU seconds per second of audio. The default is **hardware-specific**, measured on the T400 4 GB integration rig: a 39-minute meeting (2340 s audio) ran 423–434 s wall on CUDA — 434/2340 ≈ 0.185. **Re-derive it on your own GPU** with `docker exec autodiarist-api ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 <job>/audio_source.wav` for a representative recording, time the job from `started_at` to `done` in its `status.json`, and set the quotient (wall_s ÷ audio_s); the CPU fallback path runs ~11x slower, so a CPU box needs roughly an order of magnitude larger value. Exact `0` disables `estimated_wait_seconds`/`estimated_completion_at` emission entirely. Negative or non-numeric values log a boot warning and fall back to `0.185`. Estimates are linear-model ESTIMATES — never guarantees (diarization variance and chunk overhead are not modeled). |
 | `AUDIO_DURATION_FALLBACK_SECONDS` | `300` | Duration substituted into the ETA prefix sum for a queued job AHEAD whose admission ffprobe failed (`duration_seconds: null`) — one unprobeable file must not poison the estimates behind it. The polled job itself still shows no ETA when its own duration is unknown; the API never fabricates a duration at request time. |
 | `QUEUE_POLL_SECONDS` | `0.2` | Worker idle-poll period (float; invalid values fall back to the default). |
 | `SESSION_HEADER` | `X-Session` | Header carrying a client-supplied session identity; highest precedence in the identity chain. `Authorization` remains honored when set here explicitly. With no header, the server-issued `autodiarist_session` cookie (returned on `POST /v1/jobs` body + Set-Cookie) identifies the session; then client IP; then a shared `anonymous` bucket. All identities persist as SHA-256 digests (first 32 hex chars, domain-separated); raw values never hit disk. The issued id is additionally hashed under the job-state key `session_ident`. |
-| `SESSION_COOKIE_NAME` | `autodiarist_session` | Name of the server-issued session cookie. Overridable for proxies that reserve the default name; an invalid (non-HTTP-token) value warns at boot and falls back to the default. Effective values of both session knobs, `MAX_QUEUE_DEPTH`, `MAX_PROCESSING_PER_SESSION`, `RETENTION_DAYS` and `PROCESSING_SECONDS_PER_AUDIO_SECOND` are validated and printed once at boot (`config: session header=... cookie=... max_queue_depth=... max_processing_per_session=... retention_days=... eta_rate=... eta=on|OFF`); a set-but-deprecated `MAX_JOBS_PER_SESSION` warns that it is ignored instead. |
+| `SESSION_COOKIE_NAME` | `autodiarist_session` | Name of the server-issued session cookie. Overridable for proxies that reserve the default name; an invalid (non-HTTP-token) value warns at boot and falls back to the default. Effective values of both session knobs, `MAX_QUEUE_DEPTH`, `MAX_PROCESSING_PER_SESSION`, `RETENTION_DAYS` and `PROCESSING_SECONDS_PER_AUDIO_SECOND` are validated and printed once at boot (`config: session header=... cookie=... max_queue_depth=... max_processing_per_session=... max_processing_global=... retention_days=... eta_rate=... eta=on|OFF`); a set-but-deprecated `MAX_JOBS_PER_SESSION` warns that it is ignored instead. |
+
+## Global concurrency — `MAX_PROCESSING_GLOBAL` (V1.5.1, card t_dbad2235)
+
+Until V1.5.1 the queue was serial BY CONSTRUCTION: one worker task awaited
+each job to completion before claiming the next. `MAX_PROCESSING_GLOBAL=N`
+spawns N workers over the same atomic claim; the cap is additionally checked
+AT CLAIM TIME, so the service never starts a job it cannot run. Default 1 —
+byte-for-byte today's behaviour until an operator opts in.
+
+| Run (137.5 s clip, 3 waves, NVIDIA T400 4 GiB) | wall / wave | throughput | engines alive |
+| --- | --- | --- | --- |
+| N=1 (serial) | 72.7 s | 0.014 jobs/s | 1/1 |
+| N=2 | 82.8 s | 0.024 jobs/s | 2/2 |
+| N=3 | 94.1 s | 0.032 jobs/s | 3/3 at 3207 MiB of 4096 |
+| N=4 | — | — | 3/4 every wave: the 4th aborts with `nemotron: sched alloc encoder graph failed`, the other 3 SURVIVE |
+
+N=3 is the measured operating point on the T400 (the card ceiling is 4096
+MiB; the per-job peak is ~1069 MiB). **The AMD RX 6600 value must come from
+a MEASUREMENT of the same shape, never from these NVIDIA numbers** — until
+then its shipped default stays 1.
+
+Failure mode under oversubscription: a hard child-process abort, not a
+Python exception. The service marks only that job `failed` with the real
+stderr tail and every worker keeps serving. The VRAM guard scales with the
+fleet: the `nvidia-smi` sampler reads the CARD TOTAL, so with N workers each
+job is checked against `VRAM_LIMIT_MIB × N` (`VRAM_LIMIT_MIB` itself stays
+the documented per-job share). On the AMD image the sampler has no
+`nvidia-smi` and `VRAM_LIMIT_MIB` is inert at any N.
+
+Operational notes:
+
+* The knob must be interpolated inside the compose `environment:` block
+  (`MAX_PROCESSING_GLOBAL: ${MAX_PROCESSING_GLOBAL:-1}`) — Docker Compose
+  does NOT pass arbitrary host env vars into a container, so
+  `MAX_PROCESSING_GLOBAL=3 docker compose up -d` only works because that
+  line ships in both profiles.
+* Lowering the cap at runtime acts on the next claim; raising it above the
+  live worker count requires a restart (the pool and the dedicated per-job
+  executor are sized once at boot; the executor is NOT asyncio's default
+  `min(32, cpu+4)` pool, so the cap is never silently under-delivered by
+  thread starvation).
+* Fair-share round-robin and `MAX_PROCESSING_PER_SESSION` are unchanged at
+  any N: 3 workers with 3 jobs of one session and cap 1 still run them one
+  at a time, while three different sessions are each served immediately.
+* Boot log: `concurrency: MAX_PROCESSING_GLOBAL=N — N worker(s) spawned,
+  per-job executor width N`, plus the resolved value in the `config:`
+  summary; the live in-flight count is on `GET /v1/jobs` as
+  `processing_count`.
 
 ## Job retention & disk pressure — `api/main.py`
 

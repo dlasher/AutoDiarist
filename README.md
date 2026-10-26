@@ -19,7 +19,9 @@ FastAPI + persistent fair-share job queue on disk
   JOBS_DIR/<token>/status_journal.jsonl   append-only publish history (stage audit)
   JOBS_DIR/<token>/audio_source.<ext>
   |
-  | single in-process worker (GPU concurrency = 1), QUEUE_WORKER_ENABLED=1
+  | in-process worker POOL: N = MAX_PROCESSING_GLOBAL (default 1 = the old
+  | serial behaviour); atomic claim under a lock, cap enforced at claim time;
+  | QUEUE_WORKER_ENABLED=1
   v
 worker stages per job (api/main.py process_job_background):
   decode (ffmpeg -> 16 kHz mono WAV; skipped in mock mode)
@@ -31,7 +33,7 @@ worker stages per job (api/main.py process_job_background):
   speaker self-ID      (pipeline.self_identification, weighted evidence)
   render               (pipeline.renderer -> markdown_report.md)
   v
-GET    /v1/jobs                  -> list MY jobs (session-scoped; newest first; ?limit=1..200, default 50; + ETA for queued)
+GET    /v1/jobs                  -> list MY jobs (session-scoped; newest first; ?limit=1..200, default 50; + ETA for queued; + processing_count = service-wide in-flight)
 GET    /v1/jobs/{token}          -> status (+ queue_position and queue-aware ETA while queued; stage + monotonic progress)
 DELETE /v1/jobs/{token}          -> cancel a queued job (409 while processing)
 GET    /v1/jobs/{token}/download -> output_result.json (default) or ?format=md
@@ -321,6 +323,35 @@ starve another that submitted one. Selection at claim time:
   priority and preemption of a running job. Fairness applies at selection
   only — a long job holds the GPU to its end, then the overdue session gets
   the next turn.
+
+#### Global concurrency (`MAX_PROCESSING_GLOBAL`, V1.5.1, card t_dbad2235)
+
+The fair-share claim above used to run behind ONE serial-by-construction
+worker. `MAX_PROCESSING_GLOBAL=N` starts N workers over the same atomic
+claim, and the claim itself enforces a service-wide in-flight cap so the
+service never starts a job it cannot run:
+
+- Default **1** — an existing deployment is byte-for-byte unchanged until it
+  opts in; opt in per host from MEASUREMENT, not a guess.
+- Selection stays the fair round-robin above and the per-session cap keeps
+  working exactly as before at any N: 3 workers with 3 jobs of ONE session
+  and cap 1 still run them one at a time.
+- A hard engine abort under GPU oversubscription (measured on the T400 at
+  N=4: `sched alloc encoder graph failed`) fails ONLY that job — the real
+  stderr tail lands on its record — and every worker keeps serving.
+- Measured NVIDIA T400 operating point: N=3 sustains 3/3 engines at
+  3207 MiB of the 4096 MiB card. The AMD value is still to be measured, so
+  its shipped default stays 1 on both compose profiles.
+- The VRAM sampler reads the CARD TOTAL, so at N>1 the effective ceiling is
+  the FLEET cap `VRAM_LIMIT_MIB × N`; `VRAM_LIMIT_MIB` itself remains the
+  documented per-job share (approach (a), planner note on the card).
+- Override it from the host: `MAX_PROCESSING_GLOBAL=3 docker compose up -d`
+  works because the knob ships interpolated inside both compose
+  `environment:` blocks (Docker Compose does not pass arbitrary host env
+  vars into containers). The live in-flight count is exposed on
+  `GET /v1/jobs` as `processing_count`; the pool size is logged at boot.
+
+Full table and cross-check procedure: `CONFIG.md`.
 
 **Retention:** `RETENTION_DAYS` (default **30**) is live. Finished jobs
 (`done`/`failed`/`cancelled`) whose `status.json` mtime is older than the

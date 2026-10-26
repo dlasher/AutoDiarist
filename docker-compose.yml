@@ -55,6 +55,12 @@ services:
       DIARIZATION_MAX_SPEAKERS: ${DIARIZATION_MAX_SPEAKERS:-8}
       VRAM_LIMIT_MIB: ${VRAM_LIMIT_MIB:-3584}
       CRISPASR_TIMEOUT_SECONDS: ${CRISPASR_TIMEOUT_SECONDS:-1800}
+      # Global concurrency (card t_dbad2235): number of queue workers running
+      # jobs simultaneously; enforced at claim time. Measured on the T400:
+      # N=3 sustains 3/3 engines at 3207/4096 MiB — but the SHIPPED default
+      # stays 1 (serial, byte-for-byte today's behaviour) and operators opt
+      # in per host: `MAX_PROCESSING_GLOBAL=3 docker compose up -d`.
+      MAX_PROCESSING_GLOBAL: ${MAX_PROCESSING_GLOBAL:-1}
       # Domain vocabulary pass (card t_72405565). ON by default — the image
       # bakes /app/vocab.txt with the NASA/SEWP terms measured mangled at
       # Q4_K. SPELL_CHECK=0/off opts out; VOCAB_PATH overrides the vocabulary.

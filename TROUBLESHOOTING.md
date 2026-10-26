@@ -43,17 +43,21 @@ deliberately — slow but useful for offline testing. Do not ship it.
 | `crispasr exited with code N: …` | Engine-side failure; the tail of stderr/stdout is embedded. Common on the VM: GPU busy, unsupported audio, corrupt WAV. |
 | `crispasr exited 0 but wrote no … crispasr_out.json; refusing silent fallback` | Engine produced no artifact; treat as engine bug/version drift. The adapter never substitutes an empty transcript. |
 | `crispasr produced no usable segments from N rows` | All rows lacked times or became empty after `<en-US>` tag stripping; inspect with `DIAR_METHOD=none` or another model. |
-| `crispasr timed out after 1800s` | Raise `CRISPASR_TIMEOUT_SECONDS` for long files, or check for GPU contention (single worker assumes exclusive card). |
+| `crispasr timed out after 1800s` | Raise `CRISPASR_TIMEOUT_SECONDS` for long files, or check for GPU contention (at `MAX_PROCESSING_GLOBAL>1` the card is deliberately shared; the timeout budget is PER JOB, so concurrent jobs each get the full window). |
 
 ## TranscriptionOOM
 
-`peak VRAM NNNN MiB exceeded cap 3584 MiB` (raised as `TranscriptionOOM`
-after the run) means the `nvidia-smi` sampler caught the engine crossing
-`VRAM_LIMIT_MIB`; the job is failed rather than thrashing the card — the
-matching `VRAM stage=crispasr_diarized_asr … status=EXCEEDED` INFO line
-carries the numbers. On a 4GB Turing card the Q4_K model normally peaks
-~1085 MiB (39-minute fixture), so hitting the limit usually means
-**something else is using the GPU** — check `nvidia-smi` for co-tenants.
+`peak VRAM NNNN MiB exceeded fleet cap MMMM MiB (per-job LLLL MiB x N
+concurrent workers…)` (raised as `TranscriptionOOM` after the run) means the
+`nvidia-smi` sampler caught the CARD TOTAL crossing the fleet cap —
+`VRAM_LIMIT_MIB` scaled by `MAX_PROCESSING_GLOBAL` (card t_dbad2235: the
+sampler reads the whole card, so at N>1 the per-job share is multiplied by
+N; at the serial default the math is exactly the old `exceeded cap LLLL
+MiB`). The job is failed rather than thrashing the card — the matching
+`VRAM stage=crispasr_diarized_asr … status=EXCEEDED` INFO line carries the
+numbers. On a 4GB Turing card the Q4_K model normally peaks ~1085 MiB
+(39-minute fixture), so exceeding the FLEET cap usually means **something
+else is using the GPU** — check `nvidia-smi` for co-tenants.
 `VRAM_LIMIT_MIB=0` disables the guard (revokes the OOM protection; not
 recommended).
 
@@ -73,7 +77,7 @@ sampling (no OOM protection).
 | `503` + `Retry-After` on POST | Queue at/above `MAX_QUEUE_DEPTH` (default 50) queued jobs — the **only** admission rejection since V1.5 (card t_82bfbc15): the detail names both the depth and the Retry-After value. | Retry after the header delay; raise `MAX_QUEUE_DEPTH` if the load is real. A second job from the same session is no longer rejected (the old `429` session quota is gone). |
 | Startup log: `MAX_JOBS_PER_SESSION=... is DEPRECATED and IGNORED` | The variable is still accepted so old `.env` files load, but it has no effect (card t_82bfbc15). | Delete the line from your env. Admission is queue-depth only. |
 | Many clients sharing one identity bucket | Session identity falls back to client IP, then to a shared `anonymous` bucket, when neither the `SESSION_HEADER` (default `X-Session`) nor the server-issued `autodiarist_session` cookie is present. Bucketing no longer gates admission (V1.5) but still groups jobs per person for listing and scheduling. | Let the issued cookie flow (browser default; `curl -b jar`), send a per-client `X-Session` value, or set `SESSION_HEADER` to a header you already control (e.g. `Authorization`). |
-| Jobs accepted but never start | `QUEUE_WORKER_ENABLED=0` ops valve, or the worker died (`worker crashed processing` in logs). | Flip the valve back to `1`; check job-specific errors. |
+| Jobs accepted but never start | `QUEUE_WORKER_ENABLED=0` ops valve, the global concurrency cap already saturated (`processing_count` on `GET /v1/jobs` equals `MAX_PROCESSING_GLOBAL` — with the default 1 one straggler job holds the only slot), or the worker died (`worker ... crashed processing` in logs). | Flip the valve back to `1`; watch `processing_count` against the startup log line `concurrency: MAX_PROCESSING_GLOBAL=N`; check job-specific errors. Raising `MAX_PROCESSING_GLOBAL` (compose-interpolated, host-overridable) adds real parallel workers on the next boot. |
 
 ## Cancelling and deleting jobs
 

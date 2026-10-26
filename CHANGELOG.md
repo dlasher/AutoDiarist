@@ -1,5 +1,39 @@
 # Changelog
 
+## [Unreleased] — global queue concurrency (card t_dbad2235)
+
+**The service can now process N jobs concurrently behind
+`MAX_PROCESSING_GLOBAL` (default 1).** `_queue_worker_loop` was serial by
+construction — one task awaiting each job to completion before claiming the
+next; `MAX_PROCESSING_PER_SESSION` only capped fair-share SELECTION, never
+created parallelism. The lifespan now spawns a worker POOL sized from the
+knob at boot (plus a dedicated per-job executor of the same width, so the
+cap is never silently under-delivered by the default `min(32, cpu+4)`
+thread pool), each worker running the same claim/process/wake cycle over the
+already-atomic `_claim_next_queued`. The cap is enforced AT CLAIM TIME —
+`_select_next_queued` blocks every claim while total in-flight ≥ N — so the
+service never starts a job it cannot run, and a job whose engine hard-aborts
+(measured at N=4 on the T400: `sched alloc encoder graph failed`) fails ONLY
+that job with the real stderr tail while every worker keeps serving. The
+single shared wake `asyncio.Event` (whose `clear()` one worker could steal
+from another waiter) is replaced by `_WakeHub`: per-worker events, `set()`
+fans out to all, nobody can strand anybody. Fair-share round-robin, the
+per-session cap and `VRAM_LIMIT_MIB` semantics are untouched at any N.
+Planner addition on this card: the nvidia-smi sampler reads the CARD TOTAL,
+so under concurrency the VRAM guard compares against the FLEET cap
+`VRAM_LIMIT_MIB × N` (per-job share x workers) — a job is no longer failed
+for its siblings' memory; unset/invalid N keeps the old serial math, and on
+the AMD image the sampler is inert either way. Default stays 1 on BOTH
+compose profiles (`MAX_PROCESSING_GLOBAL: ${MAX_PROCESSING_GLOBAL:-1}`) —
+the NVIDIA operating point is measured (T400: N=3 sustains 3/3 engines at
+3207/4096 MiB; throughput 0.014 -> 0.032 jobs/s) but the AMD value must come
+from measurement, and the rebuild of the AMD image follows this merge.
+`validate_config()`, the boot log and `GET /v1/jobs`
+(`processing_count`) all expose the knob and the live in-flight count.
+(Tests: tests/api/test_concurrency_global.py, VRAM fleet-cap cases in
+tests/pipeline/test_crispasr.py, compose asserts in
+tests/test_docker_packaging.py.)
+
 ## [Unreleased] — domain lexicon that actually runs (card t_72405565)
 
 **The spell-check layer now runs in the shipped service and carries the

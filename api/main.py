@@ -8,6 +8,7 @@ import asyncio
 import hashlib
 import logging
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager, suppress
 from datetime import datetime, timezone
 from pathlib import Path
@@ -57,6 +58,16 @@ SESSION_COOKIE_NAME_DEFAULT = "autodiarist_session"
 # The round-robin pointer persists to JOBS_DIR/<SCHEDULER_STATE_NAME> so
 # fairness survives a restart.
 DEFAULT_MAX_PROCESSING_PER_SESSION = 1
+# Global concurrency (V1.5.1, card t_dbad2235): the queue used to be serial
+# BY CONSTRUCTION — one worker task awaiting each job to completion before
+# claiming the next. MAX_PROCESSING_GLOBAL spawns N concurrent workers and
+# enforces N in-flight jobs AT CLAIM TIME (the atomic _claim_next_queued
+# check is what prevents double-claim; the per-session cap is untouched).
+# Default MUST remain 1 so an existing deployment is byte-for-byte unchanged
+# until it opts in; per-host values come from MEASUREMENT (measured on the
+# T400: N=3 sustains 3/3 engines at 3207/4096 MiB — see CONFIG.md), never
+# from a guess.
+DEFAULT_MAX_PROCESSING_GLOBAL = 1
 SCHEDULER_STATE_NAME = "_scheduler.json"
 # Session-scoped job listing (V1.5, card t_f97d12a8): default page size and
 # hard max for GET /v1/jobs. Deliberately constants, not env knobs (scope 8:
@@ -137,6 +148,39 @@ def _max_processing_per_session() -> int:
             value, DEFAULT_MAX_PROCESSING_PER_SESSION,
         )
         return DEFAULT_MAX_PROCESSING_PER_SESSION
+    return value
+
+
+def _max_processing_global() -> int:
+    """Cap on concurrently-PROCESSING jobs across the WHOLE service
+    (V1.5.1, card t_dbad2235).
+
+    Read at every claim so the service never starts a job it cannot run, and
+    once at startup to size the worker pool. Lowering the env at runtime
+    tightens the cap immediately; RAISING it above the live worker count only
+    takes effect after a restart (the pool is fixed at boot). Values < 1 or
+    unparseable input warn and clamp to the default, exactly like
+    _max_processing_per_session(): a zero worker count would freeze the queue
+    entirely. Default 1 preserves today's serial behaviour for every existing
+    deployment until an operator opts in.
+    """
+    raw = (os.environ.get("MAX_PROCESSING_GLOBAL") or "").strip()
+    if not raw:
+        return DEFAULT_MAX_PROCESSING_GLOBAL
+    try:
+        value = int(raw)
+    except ValueError:
+        logger.warning(
+            "config: MAX_PROCESSING_GLOBAL=%r is not an integer; using %d",
+            raw, DEFAULT_MAX_PROCESSING_GLOBAL,
+        )
+        return DEFAULT_MAX_PROCESSING_GLOBAL
+    if value < 1:
+        logger.warning(
+            "config: MAX_PROCESSING_GLOBAL=%d would freeze the queue; clamped to %d",
+            value, DEFAULT_MAX_PROCESSING_GLOBAL,
+        )
+        return DEFAULT_MAX_PROCESSING_GLOBAL
     return value
 
 
@@ -704,16 +748,24 @@ def _iso_utc(ts: float) -> str:
 
 
 def _select_next_queued(
-    states: list[dict], sched: dict, cap: int
+    states: list[dict], sched: dict, cap: int,
+    global_cap: int | None = None,
 ) -> tuple[dict | None, dict]:
     """Pick the next claimable job: round-robin across sessions, FIFO inside
     a session, sessions at the processing cap skipped. Returns (job, new
-    scheduler state); (None, sched) when nothing may be claimed."""
+    scheduler state); (None, sched) when nothing may be claimed.
+
+    ``global_cap`` (V1.5.1, card t_dbad2235) is the service-wide in-flight
+    ceiling: when the TOTAL number of processing jobs has reached it, nothing
+    is claimable regardless of sessions — enforced here so the claim path can
+    never start a job the service cannot run."""
     inflight: dict[str, int] = {}
     for st in states:
         if st.get("status") == "processing":
             key = _session_key(st)
             inflight[key] = inflight.get(key, 0) + 1
+    if global_cap is not None and sum(inflight.values()) >= global_cap:
+        return None, sched
     groups = _queued_groups(states)
     eligible = {k: g for k, g in groups.items() if inflight.get(k, 0) < cap}
     if not eligible:
@@ -957,7 +1009,13 @@ def _claim_next_queued() -> dict | None:
     """
     cap = _max_processing_per_session()
     with _queue_lock:
-        job, sched = _select_next_queued(_iter_states(), _load_scheduler_state(), cap)
+        # MAX_PROCESSING_GLOBAL is read INSIDE the lock next to the selection
+        # so the effective cap cannot change between the in-flight count and
+        # the claim. Raising it at runtime is still bounded by the fixed
+        # startup worker pool; lowering it takes effect on the next claim.
+        global_cap = _max_processing_global()
+        job, sched = _select_next_queued(
+            _iter_states(), _load_scheduler_state(), cap, global_cap)
         if job is None:
             return None
         _save_scheduler_state(sched)
@@ -976,44 +1034,108 @@ def _claim_next_queued() -> dict | None:
         job["started_at"] = time.time()
         _write_state(job)
         logger.info(
-            "queue: claimed job token=%s session=%s serve_counter=%d cap=%d",
+            "queue: claimed job token=%s session=%s serve_counter=%d cap=%d "
+            "global_cap=%d",
             job.get("token"), _session_key(job), sched["serve_counter"], cap,
+            global_cap,
         )
         return job
 
 
-async def _queue_worker_loop() -> None:
-    """Single-GPU worker: one job at a time, fair round-robin across sessions.
+class _WakeHub:
+    """Fan-out wake for N queue workers (V1.5.1, card t_dbad2235).
 
-    The pipeline is CPU/GPU-bound synchronous code, so it runs in the default
-    executor and the event loop stays responsive for admissions and polls.
+    The single shared `asyncio.Event` was safe with exactly ONE waiter: the
+    worker that found nothing called `clear()` immediately before waiting, so
+    a set() could never be consumed by anyone else. With N workers that
+    breaks — one worker's `clear()` can erase the notification another worker
+    has not reached its `wait()` on yet, stranding it until the poll timeout.
+    The hub hands every worker its own event; `set()` fans out to all of them
+    and each worker clears only its own, so no worker can eat another's
+    wake-up. A set() landing while a worker is mid-job stays pending: the
+    worker's next wait returns instantly, clears, and re-claims.
+    """
+
+    def __init__(self) -> None:
+        self._events: set[asyncio.Event] = set()
+
+    def register(self) -> asyncio.Event:
+        ev = asyncio.Event()
+        self._events.add(ev)
+        return ev
+
+    def unregister(self, ev: asyncio.Event) -> None:
+        self._events.discard(ev)
+
+    def set(self) -> None:
+        # Called from POST admission (same loop); wakes every waiting worker.
+        for ev in self._events:
+            ev.set()
+
+    async def wait(self, ev: asyncio.Event, timeout: float) -> None:
+        try:
+            await asyncio.wait_for(ev.wait(), timeout)
+        except asyncio.TimeoutError:
+            pass
+        finally:
+            ev.clear()
+
+
+async def _queue_worker_loop(worker_index: int = 0) -> None:
+    """One fair-share queue worker: claim, process, repeat.
+
+    N of these run concurrently behind the claim-time MAX_PROCESSING_GLOBAL
+    cap (V1.5.1, card t_dbad2235); each worker still processes ONE job at a
+    time and never claims while busy, so total concurrency is bounded by the
+    pool size AND by the cap checked inside the atomic claim. The pipeline is
+    CPU/GPU-bound synchronous code, so it runs in the dedicated per-job
+    executor (sized to the worker count at boot — falls back to the loop
+    default when no pool was created) and the event loop stays responsive.
+    A job that raises is logged and skipped, never fatal to this worker.
     """
     loop = asyncio.get_running_loop()
-    while True:
-        job = _claim_next_queued()
-        if job is not None:
-            try:
-                await loop.run_in_executor(
-                    None,
-                    process_job_background,
-                    job["token"],
-                    job.get("audio_path", str(JOBS_DIR / job["token"] / "audio_source.wav")),
-                    job.get("filename", "unknown"),
-                )
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                logger.exception("worker crashed processing %s", job["token"])
-            continue
-        wake = getattr(app.state, "wake", None)
-        if wake is not None:
-            wake.clear()
-            try:
-                await asyncio.wait_for(wake.wait(), timeout=_env_float("QUEUE_POLL_SECONDS", DEFAULT_QUEUE_POLL_SECONDS))
-            except asyncio.TimeoutError:
-                pass
-        else:
-            await asyncio.sleep(_env_float("QUEUE_POLL_SECONDS", DEFAULT_QUEUE_POLL_SECONDS))
+    executor = getattr(app.state, "job_executor", None)
+    wake = getattr(app.state, "wake", None)
+    hub = wake if isinstance(wake, _WakeHub) else None
+    gate = hub.register() if hub is not None else None
+    try:
+        while True:
+            job = _claim_next_queued()
+            if job is not None:
+                try:
+                    await loop.run_in_executor(
+                        executor,
+                        process_job_background,
+                        job["token"],
+                        job.get("audio_path", str(JOBS_DIR / job["token"] / "audio_source.wav")),
+                        job.get("filename", "unknown"),
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    logger.exception(
+                        "worker %d crashed processing %s", worker_index,
+                        job["token"])
+                continue
+            poll = _env_float("QUEUE_POLL_SECONDS", DEFAULT_QUEUE_POLL_SECONDS)
+            if hub is not None and gate is not None:
+                # No job claimable: wait for the next admission fan-out, with
+                # the short poll as the safety net that makes any lost notify
+                # harmless (it cannot happen through the hub, by design).
+                await hub.wait(gate, poll)
+            elif isinstance(wake, asyncio.Event):
+                # Legacy single-event path (app.state.wake set outside the
+                # lifespan); safe only with one waiter, kept for compatibility.
+                wake.clear()
+                try:
+                    await asyncio.wait_for(wake.wait(), timeout=poll)
+                except asyncio.TimeoutError:
+                    pass
+            else:
+                await asyncio.sleep(poll)
+    finally:
+        if hub is not None and gate is not None:
+            hub.unregister(gate)
 
 
 def validate_config() -> str:
@@ -1055,7 +1177,9 @@ def validate_config() -> str:
     summary = (
         f"config: session header={header} cookie={cookie} "
         f"max_queue_depth={depth} max_processing_per_session="
-        f"{_max_processing_per_session()} retention_days={days} "
+        f"{_max_processing_per_session()} "
+        f"max_processing_global={_max_processing_global()} "
+        f"retention_days={days} "
         f"eta_rate={rate} eta={'on' if rate > 0 else 'OFF'}"
     )
     logger.info(summary)
@@ -1080,11 +1204,32 @@ async def lifespan(app: FastAPI):
     if reclaimed:
         logger.info("requeued %d orphaned processing job(s) on boot", reclaimed)
 
-    app.state.wake = asyncio.Event()
+    app.state.wake = _WakeHub()
     worker_enabled = os.environ.get("QUEUE_WORKER_ENABLED", "1") == "1"
-    worker_task = None
+    worker_tasks: list[asyncio.Task] = []
+    app.state.job_executor = None
     if worker_enabled:
-        worker_task = asyncio.create_task(_queue_worker_loop(), name="asr-queue-worker")
+        # N concurrent workers behind the claim-time MAX_PROCESSING_GLOBAL cap
+        # (V1.5.1, card t_dbad2235; the pool size is read once at boot — the
+        # cap itself is re-read at every claim). The per-job executor is sized
+        # to the worker count on purpose: asyncio's default ThreadPoolExecutor
+        # is min(32, cpu_count + 4) wide, so on a small host (the T400 has 4
+        # cores -> default width 8) a larger cap could otherwise be silently
+        # under-delivered by thread starvation.
+        n_workers = _max_processing_global()
+        app.state.job_executor = ThreadPoolExecutor(
+            max_workers=n_workers, thread_name_prefix="asr-job",
+        )
+        worker_tasks = [
+            asyncio.create_task(_queue_worker_loop(i),
+                                name=f"asr-queue-worker-{i}")
+            for i in range(n_workers)
+        ]
+        logger.info(
+            "concurrency: MAX_PROCESSING_GLOBAL=%d — %d worker(s) spawned, "
+            "per-job executor width %d",
+            n_workers, len(worker_tasks), n_workers,
+        )
 
     # Retention + disk-pressure wiring (card t_5e6200fc): the boot pass runs
     # synchronously here — deliberately AFTER the boot requeue above, so
@@ -1105,10 +1250,14 @@ async def lifespan(app: FastAPI):
     try:
         yield
     finally:
-        if worker_task is not None:
+        for worker_task in worker_tasks:
             worker_task.cancel()
             with suppress(asyncio.CancelledError):
                 await worker_task
+        if app.state.job_executor is not None:
+            # Do not block shutdown on a straggler thread; the queue state on
+            # disk is already 'processing' and the boot requeue reclaims it.
+            app.state.job_executor.shutdown(wait=False)
         for loop_task in (retention_task, disk_task):
             loop_task.cancel()
             with suppress(asyncio.CancelledError):
@@ -1347,6 +1496,12 @@ async def list_jobs(request: Request, response: Response, limit: int = DEFAULT_L
     page = max(1, min(limit, MAX_LIST_LIMIT))
     with _queue_lock:
         states = _iter_states()
+        # Service-wide in-flight count (V1.5.1, card t_dbad2235): a test
+        # harness or operator watching real concurrency reads it here instead
+        # of inferring it from poll deltas. Computed from the SAME snapshot the
+        # claim path uses, under the same lock.
+        processing_count = sum(1 for st in states
+                               if st.get("status") == "processing")
         sched = _load_scheduler_state()
         queued_order = _fair_queued_order(states, sched)
         # One live queue snapshot drives rank AND ETA (card t_b3ae9366):
@@ -1370,7 +1525,8 @@ async def list_jobs(request: Request, response: Response, limit: int = DEFAULT_L
     )
     if not request.headers.get(_session_header_name(), "").strip():
         response.headers[_session_header_name()] = session_id
-    return {"jobs": entries, "count": len(entries), "total": total, "limit": page}
+    return {"jobs": entries, "count": len(entries), "total": total,
+            "limit": page, "processing_count": processing_count}
 
 
 @app.get("/v1/jobs/{token}")

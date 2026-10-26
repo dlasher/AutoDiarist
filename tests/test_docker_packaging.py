@@ -421,6 +421,7 @@ def test_env_example_exposes_documented_runtime_configuration() -> None:
         "SPELL_CHECK=",
         "SELF_ID_PATTERNS=",
         "RETENTION_DAYS=",
+        "MAX_PROCESSING_GLOBAL=",
     ):
         assert f"{name}" in env_example
     assert "DEVICE_DTYPE" not in env_example
@@ -472,3 +473,35 @@ def test_operator_tunable_knobs_are_interpolated_not_hardcoded() -> None:
                 compose,
                 re.M,
             ), f"{name}: {knob} must be an overridable ${{{knob}:-default}}"
+
+
+def test_global_concurrency_knob_is_interpolated_in_both_profiles() -> None:
+    """AC7 (card t_dbad2235): MAX_PROCESSING_GLOBAL must be overridable from
+    the host in BOTH profiles using the same ${VAR:-default} form as the other
+    operator knobs. Docker Compose does NOT pass arbitrary host env vars into
+    a container — without this line inside the service `environment:` block,
+    `MAX_PROCESSING_GLOBAL=3 docker compose up -d` on the AMD host would
+    change nothing at all."""
+    for name in (CUDA_COMPOSE, AMD_COMPOSE):
+        compose = read(name)
+        assert "MAX_PROCESSING_GLOBAL: ${MAX_PROCESSING_GLOBAL:-1}" in compose, (
+            f"{name}: knob must ship as an overridable interpolation, not a literal"
+        )
+
+
+def test_global_concurrency_default_is_one_never_hardcoded_above() -> None:
+    """AC9 (card t_dbad2235): the SHIPPED default is 1 on both profiles —
+    NVIDIA keeps today's serial behaviour until an operator opts in, and the
+    AMD safe value must come from MEASUREMENT, never from a guess baked into
+    the file. A literal `MAX_PROCESSING_GLOBAL: 3` (or any value != 1) is a
+    regression of that contract. Mirrors
+    test_operator_tunable_knobs_are_interpolated_not_hardcoded."""
+    for name in (CUDA_COMPOSE, AMD_COMPOSE):
+        env = compose_doc(name)["services"]["autodiarist"]["environment"]
+        assert "MAX_PROCESSING_GLOBAL" in env, name
+        value = env["MAX_PROCESSING_GLOBAL"]
+        assert value == "${MAX_PROCESSING_GLOBAL:-1}", (
+            f"{name}: expected the interpolable default 1, got {value!r}")
+        # Guard against a future literal sneaking a host-tuned value in:
+        assert not re.fullmatch(r"\d+", str(value)) or str(value) == "1", (
+            f"{name}: concurrency default must never be hardcoded above 1")
