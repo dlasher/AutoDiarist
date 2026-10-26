@@ -46,17 +46,41 @@ README, PIPELINE.md and `.env.example`):
   always `min(cap, cores)`; raises the default on big boxes without a
   rebuild (pending AMD 8-vs-10-vs-12 sweep).
 
-Hermetic tests (`tests/pipeline/test_diarization_threads.py`, 42 cases
+Hermetic tests (`tests/pipeline/test_diarization_threads.py`, 45 cases
 driving the real wrapper against a stub sherpa CLI with a stubbed core
-count): flag injection incl. the exact argv, auto = C//N table incl. the
-planner's arithmetic (4/1->4, 4/3->1, 12/4->3, 12/1->8 capped), clamp
+count: exact argv, C//N table incl. the planner's arithmetic, clamp
 matrix (0/-1/abc/9999), unknown-cores -> 1 (never 0), cap-never-above-
-cores (2-core box resolves 2, not 8), thread flags on BOTH ceiling passes,
-and output identity at 1/2/4 threads. Packaging: both knobs forwarded in
-both compose files with no hardcoded thread default above 4, and the
-suite-collected-count regression test (AC10: 405 -> 451). API contract,
-ASR invocation, `-pp` progress stream, models, threshold and ceiling
+cores (2-core box resolves 2, not 8), explicit-knob-beats-workers,
+thread flags on BOTH ceiling passes, resolution recorded to
+$JOBS_DIR/sherpa-threads.log, output identity at 1/2/4 threads, and the
+AC10 suite-count regression test 405 -> 454); packaging: both knobs forwarded
+in both compose files with no thread default hardcoded above 4.
+Full suite green; the 19 speaker-ceiling tests keep passing
+byte-identically (stdout behaviour unchanged). API contract, ASR
+invocation, `-pp` progress stream, models, threshold and ceiling
 semantics untouched (card SCOPE-OUT).
+
+LIVE on the NVIDIA T400 host (2026-10-26, same 137.5 s clip
+/tmp/single.wav = the 2-speaker SEWP promo, threshold 0.40):
+
+* real sherpa CLI, both flags passed directly: 1T 58.6 s / 2T 32.3 s /
+  4T 23.4 s (2.50x) — the planner's curve reproduced — segment lines
+  BYTE-IDENTICAL at 1/2/4 threads (2 speakers everywhere; the planner's
+  table said 4 — count attribution noted for QA, identity is the claim
+  under test).
+* service path A/B in isolated compose projects (production untouched,
+  GPU never shared, sequential): OLD image (75e231e, 1 thread) engine
+  stage 80.6 s / job wall 85.4 s -> NEW image (this card, auto T=4)
+  engine stage 41.9 s / job wall 45.3 s — beats the 72.3 s baseline,
+  1.88x end-to-end. Output payload (segments, timestamps, speakers,
+  text) identical between OLD and NEW modulo the per-job token.
+* host override honored end-to-end (AC6): `SHERPA_NUM_THREADS=2` through
+  compose -> wrapper recorded `threads=2 (explicit: cores=4 workers=1
+  cap=4 requested=2 max=unset)` in the jobs volume and the engine stage
+  landed between the two (53.7 s) — explicit overrides are live-visible,
+  no rebuild.
+* auto resolution record on a healthy box:
+  `threads=4 (auto: cores=4 workers=1 cap=4 requested=unset max=unset)`.
 
 ## [Unreleased] — global queue concurrency (card t_dbad2235)
 

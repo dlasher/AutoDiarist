@@ -126,6 +126,14 @@ EVERY thread count — threading is a performance knob, not a quality knob):
 | 6 | 53.4 s | 1.09x |
 | 8 | 68.0 s | 0.86x — WORSE than 1 |
 
+Live on the same host after the change (service path, same 137.45 s clip
+at threshold 0.40, raw CLI segment lines byte-identical at 1/2/4):
+OLD build engine stage 80.6 s / job wall 85.4 s -> NEW build auto T=4
+41.9 s / 45.3 s (output payload identical modulo the per-job token);
+host override `SHERPA_NUM_THREADS=2` through compose -> 53.7 s and
+`threads=2 (explicit: cores=4 workers=1 cap=4 requested=2 max=unset)`
+recorded in `$JOBS_DIR/sherpa-threads.log` — knobs honored end-to-end.
+
 The regression above the core count is why no constant is the default
 (`8` would make this host ~2x slower than today). The auto default is
 computed per invocation:
