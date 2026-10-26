@@ -19,7 +19,7 @@ GPU-default values.
 | `SHERPA_BIN` | `/opt/sherpa/sherpa-diarization-wrapper` | Executable the engine shells out to for `sherpa`/`ecapa`. Shipped as a wrapper that injects `--clustering.cluster-threshold` (the engine has no flag for it); validated executable-or-startup-error. Empty = PATH lookup of `sherpa-onnx-offline-speaker-diarization`. |
 | `SHERPA_CLUSTER_THRESHOLD` | `0.40` | Read by the wrapper at run time. sherpa-onnx FastClustering distance threshold: LOWER resolves more speakers, HIGHER merges. NV-host calibration table in README "Diarization models". |
 | `DIARIZATION_MAX_SPEAKERS` | `8` | Card t_38e52d89. Ceiling on distinct diarization speaker labels, enforced by the wrapper's CONDITIONAL second clustering pass: the auto pass runs first and is only rewritten when its label count exceeds the ceiling (the engine's own `--clustering.num-clusters=0` is stripped before injection, else the setting is a silent no-op). Compliant audio replays byte-identical; a bare fixed count over-splits (panel 2 -> 4 at NC=8). DIARIZATION_MAX_SPEAKERS=0 disables (pre-card behaviour). See `autodiarist-speaker-count-ceiling.md`. |
-| `SHERPA_NUM_THREADS` | empty = AUTO | Card t_3cb8f97c. Threads the wrapper passes as BOTH `--segmentation.num-threads` and `--embedding.num-threads` on every sherpa invocation (including the ceiling re-run pass). The CLI default is 1; diarization was ~80% of a job's wall time running on a single core. AUTO = `min(max(1, cores // MAX_PROCESSING_GLOBAL), SHERPA_MAX_THREADS)` where `cores` is the container-visible core count (nproc, else getconf; the containers see ALL host cores — no compose file sets CPU limits). Unset/`0`/negative/non-integer all mean AUTO; a valid explicit count is passed verbatim, clamped only down to the core count. The resolved value (and why) is logged to the job stderr. Full mechanics and the measured curve: section "Diarization threading" below. |
+| `SHERPA_NUM_THREADS` | empty = AUTO | Card t_3cb8f97c. Threads the wrapper passes as BOTH `--segmentation.num-threads` and `--embedding.num-threads` on every sherpa invocation (including the ceiling re-run pass). The CLI default is 1; diarization was ~80% of a job's wall time running on a single core. AUTO = `min(max(1, cores // MAX_PROCESSING_GLOBAL), SHERPA_MAX_THREADS)` where `cores` is the container-visible core count (nproc, else getconf; the containers see ALL host cores — no compose file sets CPU limits). Unset/`0`/negative/non-integer all mean AUTO; a valid explicit count is passed verbatim, clamped only down to the core count. The resolved value (and why) is logged to the job stderr AND appended to `$JOBS_DIR/sherpa-threads.log` — the service's engine-stderr temp file is deleted on success, so the log file is the record ops can actually read after a healthy run. Full mechanics and the measured curve: section "Diarization threading" below. |
 | `SHERPA_MAX_THREADS` | `8` | Card t_3cb8f97c. Ceiling on the AUTO value only (explicit `SHERPA_NUM_THREADS` is not capped by it; it is always `min(cap, cores)`). Invalid values (0/negative/non-integer) fall back to 8. Raises the auto ceiling on big boxes without a rebuild — the AMD host has 12 cores and its 8-vs-10-vs-12 thread sweep was pending when this shipped. |
 | `CRISPASR_GPU_BACKEND` | `cuda` | Pinned via `--gpu-backend`. Accepted: `cuda`, `cpu`, `metal`, `vulkan`. The adapter probes `crispasr --version` once per binary per process and fails fast (typed `CrispasrError`) when this value is missing from the build's `ggml backends` list — this is the guard against the silent CPU fallback (see TROUBLESHOOTING.md). Setting it to `cpu` skips the assertion. Change only to force CPU debugging. |
 | `CRISPASR_LANGUAGE` | `en-US` | `-l` language qualifier. SPEC 08 fixes v1 to `en-US`; override is only for local per-locale experimentation. |
@@ -153,10 +153,13 @@ Two properties the card fixes as requirements:
   single-thread behaviour — at any N, T >= 1 and N x T <= C, so a job
   never oversubscribes the box. A default that sped up N=1 but slowed
   N=3 would be a net loss and does not ship.
-* **Deterministic and logged:** the auto value goes to the job stderr
-  once per sherpa call (`sherpa-wrapper: diarization threads=T (auto:
-  cores=C / workers=N, cap=...)`), so ops can see what each box resolved
-  without rebuilding anything.
+* **Deterministic and logged:** the auto value is announced once per sherpa
+  call — on the job stderr (`sherpa-wrapper: diarization threads=T (auto:
+  cores=C workers=N cap=...)`) and appended to `$JOBS_DIR/sherpa-threads.log`
+  (the engine's stderr temp file is deleted on successful runs, so the log
+  file inside the jobs volume — next to the pre-existing `_scheduler.json` —
+  is the durable per-box record of what resolved, including explicit
+  overrides). Ops never need a rebuild to check it.
 
 Overrides (no rebuild for either):
 

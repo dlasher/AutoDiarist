@@ -177,12 +177,14 @@ case "$SHERPA_NUM_THREADS" in
 esac
 
 if [ -n "$requested" ]; then
+    mode=explicit
     threads=$requested
     if [ -n "$cores" ] && [ "$threads" -gt "$cores" ]; then
         echo "sherpa-wrapper: SHERPA_NUM_THREADS=$requested exceeds the $cores core(s) reported by the container; clamping to $cores" >&2
         threads=$cores
     fi
 else
+    mode=auto
     if [ -n "$cores" ]; then
         threads=$((cores / workers))
         if [ "$threads" -lt 1 ]; then threads=1; fi
@@ -190,9 +192,24 @@ else
     else
         threads=1
     fi
-    # The auto value is deterministic and logged (ops must be able to see
-    # what each box resolved without rebuilding anything).
-    echo "sherpa-wrapper: diarization threads=$threads (auto: cores=${cores:-unknown} / workers=$workers, cap=$thread_cap)" >&2
+fi
+
+# Deterministic and logged, twice: (1) one line to stderr (the card's
+# prescribed channel; lands in the engine's stderr file and in the job
+# error tail when the run fails), and (2) an append to
+# $JOBS_DIR/sherpa-threads.log, because the service DELETES the engine
+# stderr temp file on success — without this second record ops could
+# never see what the box resolved on a healthy run. Same volume that
+# already holds the pre-existing _scheduler.json file. Skipped silently
+# when JOBS_DIR is unset or not a writable directory (host-side probes
+# and standalone runs must never fail over an ops log).
+summary="threads=$threads ($mode: cores=${cores:-unknown} workers=$workers cap=$thread_cap requested=${SHERPA_NUM_THREADS:-unset} max=${SHERPA_MAX_THREADS:-unset})"
+echo "sherpa-wrapper: diarization $summary" >&2
+if [ -n "${JOBS_DIR:-}" ] && [ -d "${JOBS_DIR:-/nonexistent}" ] \
+   && [ -w "${JOBS_DIR:-/nonexistent}" ]; then
+    printf '%s %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" \
+        "sherpa-wrapper: diarization $summary" \
+        >> "$JOBS_DIR/sherpa-threads.log" 2>/dev/null || true
 fi
 
 if [ "$ceiling" -le 0 ]; then

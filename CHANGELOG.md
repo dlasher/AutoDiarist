@@ -38,8 +38,10 @@ README, PIPELINE.md and `.env.example`):
 
 * `SHERPA_NUM_THREADS` (empty = auto): explicit count wins, is passed
   verbatim to BOTH networks, and is clamped only down to the core count;
-  unset/0/negative/non-integer = auto. The resolved value is logged
-  deterministically to the job stderr.
+  unset/`0`/negative/non-integer = auto. Every resolution (auto or
+  explicit, with cores/workers/cap inputs) goes to the job stderr and is
+  appended to `$JOBS_DIR/sherpa-threads.log` — the engine's stderr temp
+  file is deleted on success, so the log file is the durable ops record.
 * `SHERPA_MAX_THREADS` (default 8): ceiling on the AUTO value only,
   always `min(cap, cores)`; raises the default on big boxes without a
   rebuild (pending AMD 8-vs-10-vs-12 sweep).

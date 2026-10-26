@@ -234,7 +234,7 @@ def test_ac2_invalid_workers_count_as_one(stub, tmp_path, bad):
 
 def test_ac2_auto_resolution_is_logged_to_stderr(stub, tmp_path):
     """The planner note: an automatically computed default is deterministic
-    and LOGGED (ops must be able to see what the box resolved to)."""
+    and LOGGED (ops must be able to see what the box resolved)."""
     real, log = stub
     proc = _run(tmp_path, real, log, ENGINE_ARGS, cores=4,
                 env_extra={"MAX_PROCESSING_GLOBAL": "3"})
@@ -242,6 +242,45 @@ def test_ac2_auto_resolution_is_logged_to_stderr(stub, tmp_path):
     assert re.search(r"cores=4", err), err
     assert re.search(r"workers=3", err), err
     assert re.search(r"threads=1\b", err), err
+
+
+def test_ac2_resolution_survives_in_the_jobs_volume(stub, tmp_path):
+    """The service path discards the engine's stderr temp file on success,
+    so the wrapper ALSO records each resolved thread count into
+    $JOBS_DIR/sherpa-threads.log (a sibling of the pre-existing
+    _scheduler.json file in the same volume) — that is where ops can
+    actually see what the box resolved. Skipped silently when JOBS_DIR is
+    unset/not writable (standalone/host runs must not fail over a log)."""
+    real, log = stub
+    jobs = tmp_path / "jobs"
+    jobs.mkdir()
+    _run(tmp_path, real, log, ENGINE_ARGS, cores=4,
+         env_extra={"JOBS_DIR": str(jobs), "MAX_PROCESSING_GLOBAL": "3"})
+    record = (jobs / "sherpa-threads.log").read_text(encoding="utf-8")
+    assert "threads=1" in record, record
+    assert "cores=4" in record and "workers=3" in record, record
+
+
+def test_ac2_explicit_resolution_is_recorded_too(stub, tmp_path):
+    """Every job's EFFECTIVE config must be visible, not just auto ones."""
+    real, log = stub
+    jobs = tmp_path / "jobs2"
+    jobs.mkdir()
+    _run(tmp_path, real, log, ENGINE_ARGS, cores=4,
+         env_extra={"JOBS_DIR": str(jobs), "SHERPA_NUM_THREADS": "2"})
+    record = (jobs / "sherpa-threads.log").read_text(encoding="utf-8")
+    assert "threads=2" in record, record
+    assert "explicit" in record, record
+
+
+def test_ac2_no_jobs_dir_is_not_an_error(stub, tmp_path):
+    """JOBS_DIR pointing nowhere must never fail the wrapper (the diarizer
+    runs before any job directory may exist on host-side probes)."""
+    real, log = stub
+    _run(tmp_path, real, log, ENGINE_ARGS, cores=4,
+         env_extra={"JOBS_DIR": str(tmp_path / "does-not-exist")})
+    (argv,) = _calls(log)
+    assert "--embedding.num-threads=4" in argv, argv
 
 
 def test_ac2_unknown_cores_resolves_to_one_not_zero(stub, tmp_path):
