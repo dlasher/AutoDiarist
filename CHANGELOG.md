@@ -1,5 +1,68 @@
 # Changelog
 
+## [Unreleased] — cancel a RUNNING job: client-facing engine kill wired to DELETE (card t_fef54150)
+
+`DELETE /v1/jobs/{token}` no longer 409s on `processing` — a running job is
+now genuinely cancellable, reusing the machinery the timeout path has always
+had. The contract:
+
+* **The signalling path is process-local by construction.** Each in-flight
+  attempt registers a `CancelControl` (new in `pipeline/transcribe.py`) in
+  `_cancel_registry` (api/main.py) between worker-thread start and the
+  terminal publish. The DELETE handler marks `cancel_requested: true` +
+  `cancel_requested_at` in `status.json` under the SAME `_queue_lock` the
+  worker uses for every state write, then hands the live control to
+  `request()`: the cancel event is set (every stage boundary polls it) AND
+  the engine's whole process group is TERMed then KILLed through the
+  already-tested `_kill_process_group` — the engine spawns with
+  `start_new_session=True`, so the group is exactly the one invocation and
+  grandchildren are captured too. The kill runs in the threadpool OUTSIDE
+  `_queue_lock` (a 7-12 s graceful teardown must not freeze every state
+  write in the service). `attach()` closes the spawn race: a cancel landing
+  between claim and spawn kills the engine the moment it appears.
+* **The terminal is honest.** For a live attempt only the WORKER writes
+  `cancelled` (`except JobCancelled` -> one `update_state("cancelled")`),
+  after the engine subprocess was actually terminated — the handler's 202
+  says `{"status": "cancelling"}` and never claims a terminal it did not
+  produce. The journal records `cancel_request -> cancelled` in that order;
+  `cancelled` is last and never moves backwards (progress/stage keep their
+  monotonic positions). A cancel-requested job can never be resurrected:
+  the engine adapter raises `JobCancelled` — distinct from both
+  `CrispasrError` and the timeout class — so a signal-killed exit 15 can
+  never be misread as a generic engine failure or trigger a re-spawn, and
+  the stage-boundary polls at every pass (decode -> transcribe -> diarize
+  -> spellcheck -> llm_cleanup -> self_id -> render -> done-publish) mean
+  a cancelled job never continues downstream.
+* **Crash windows are closed.** The boot reclaim (`_requeue_orphans_locked`)
+  finalises `processing` jobs that carry `cancel_requested` as `cancelled`
+  instead of re-queueing them — a retry can never resurrect them onto the
+  GPU — and a DELETE landing on a `processing` state with no live control
+  (dead attempt) finalises `cancelled` directly under the queue lock rather
+  than faking a kill of something that is not ours.
+* **Concurrency safety:** the queue lock and the control's internal lock are
+  never held in reverse order (the worker's registry teardown takes only
+  the registry lock), every transition writes atomically through
+  `_write_state`/`update_state`, double DELETEs are idempotent, and the
+  straggler guard in `update_state` makes a post-terminal write a no-op —
+  no double writers, no lock leaks (the queue serves later jobs normally
+  after a cancel storm).
+* **Verification:** new `tests/pipeline/test_cancel_running.py` (6 tests:
+  group kill via fake engine, kill-on-attach race, cancel-wins
+  classification, no respawn, pre-spawn short-circuit, mock parking) and
+  new `tests/api/test_cancel_running_job.py` (8 tests end-to-end over the
+  real queue worker: 202+cancelling, terminal cancelled with journal
+  ordering, live-handle kill through the registry, orphan finalisation,
+  `cancel_requested` observable on GET and the listing, double/concurrent
+  DELETE idempotence with a follow-up job proving the queue survives, boot
+  reclaim). The stale 409 pin in `tests/api/test_queue_hardening.py` is
+  updated to the new contract (409 now only for done/failed/scanned).
+  `scripts/smoke-test.sh` gains check (f): a SECOND live upload is
+  DELETEd while `processing` and must land `cancelled` with
+  `cancel_requested=true` — the stub server grew per-token state machines
+  and a DELETE route to exercise it GPU-free. README, CONFIG.md (new
+  `MOCK_TRANSCRIBE_SECONDS` test-seam knob) and TROUBLESHOOTING.md updated
+  for the cancel semantics.
+
 ## [Unreleased] — falsified "identical output" A/B claim corrected; both hosts' service-level concurrency curves published (card t_ee479fdf)
 
 **Docs-only.** The README claimed "both backends produced identical output"

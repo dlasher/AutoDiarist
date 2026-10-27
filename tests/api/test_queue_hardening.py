@@ -218,8 +218,12 @@ def test_ac3_worker_never_claims_cancelled_job(tmp_path, monkeypatch):
 # AC4 -------------------------------------------------------------------------
 
 
-def test_ac4_delete_running_job_returns_409(tmp_path, monkeypatch):
-    """GIVEN processing job WHEN DELETE THEN 409, job untouched."""
+def test_ac4_delete_running_job_is_cancellable(tmp_path, monkeypatch):
+    """Contract UPDATED by card t_fef54150: DELETE no longer 409s on
+    processing. With the worker OFF this processing state is a dead
+    attempt — no live engine to kill — so the handler finalises
+    ``cancelled`` itself (202), journals the transition and flags the
+    state. Unknown/bad tokens keep the GET-parity contract."""
     root = _setup(tmp_path, monkeypatch, depth=50, per_session=10)
     with TestClient(main.app) as client:
         tok = _post(client, "alice").json()["token"]
@@ -229,11 +233,12 @@ def test_ac4_delete_running_job_returns_409(tmp_path, monkeypatch):
         _write_state(root, tok, st)
 
         r = client.delete(f"/v1/jobs/{tok}")
-        assert r.status_code == 409, r.text
+        assert r.status_code == 202, r.text
+        assert r.json()["status"] == "cancelled"
 
         after = _state(root, tok)
-        assert after["status"] == "processing"
-        assert (root / tok / "audio_source.wav").exists()
+        assert after["status"] == "cancelled"
+        assert after["cancel_requested"] is True
 
         # Unknown token -> 404; bad format -> 422 (same contract as GET).
         assert client.delete(

@@ -17,7 +17,9 @@ from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, ConfigDict
 
-from pipeline.transcribe import decode_audio, transcribe_and_diarize
+from pipeline.transcribe import (
+    CancelControl, JobCancelled, decode_audio, transcribe_and_diarize,
+)
 from pipeline.spellcheck import spell_check_enabled, spell_check_segments
 from pipeline.llm_cleanup import CleanupSettings, run_llm_cleanup
 from pipeline.self_identification import suggest_speaker_names
@@ -475,6 +477,18 @@ def _stage_progress(stage: str, fraction: float = 0.0) -> float:
 
 _queue_lock = threading.Lock()
 
+# --- Running-job cancellation registry (card t_fef54150) ----------------------
+# Process-local map token -> CancelControl for the CURRENT in-flight attempt.
+# The engine subprocess lives in a job-worker thread while the DELETE handler
+# runs on the event loop of the SAME process (single uvicorn worker — the
+# Dockerfile CMD starts exactly one), so this registry plus the control's own
+# internal lock is the entire signalling path: no IPC, no signal-based
+# cross-thread wakeups, nothing beyond this dict. Entries exist only between
+# the worker-thread start and the attempt's terminal publish; the startup
+# reclaim cannot find stale ones (workers start after it).
+_cancel_registry: dict[str, CancelControl] = {}
+_cancel_registry_lock = threading.Lock()
+
 TOKEN_REGEX = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
 
 def validate_token(token: str):
@@ -554,6 +568,53 @@ def _queued_states(states: list[dict] | None = None) -> list[dict]:
 # Per-session FIFO sub-queues served round-robin. The pointer (which session
 # was served when) persists under JOBS_DIR so a restart continues the same
 # round instead of letting a big submitter re-jump the line.
+
+def _finalize_cancelled_locked(st: dict) -> None:
+    """Publish the terminal cancelled state for one job (caller holds
+    _queue_lock; card t_fef54150). Idempotent — the straggler guard in
+    update_state() and this check make double-writes impossible, which is
+    what keeps the cancel path free of racing writers. progress/stage keep
+    their monotonic positions: cancellation is a terminal, never a rewind
+    and never success-ish."""
+    if st.get("status") == "cancelled":
+        return
+    st["status"] = "cancelled"
+    st["cancel_requested"] = True
+    st.setdefault("cancel_requested_at", round(time.time(), 3))
+    st["cancelled_at"] = round(time.time(), 3)
+    st["message"] = "Cancelled by client request"
+    _write_state(st)
+
+
+def _requeue_orphans_locked() -> tuple[int, int]:
+    """Boot reclaim: a ``processing`` state left by a dead attempt either
+    restarts (plain orphan) or lands terminal (cancel-requested). AC6 of
+    card t_fef54150: a retry/requeue can NEVER resurrect a cancelled job —
+    the request flag survives crash windows precisely so the reclaim
+    finalises it instead of re-queueing it onto the GPU. Returns
+    (requeued, cancelled)."""
+    requeued = cancelled = 0
+    with _queue_lock:
+        for st in _iter_states():
+            if st.get("status") != "processing":
+                continue
+            if st.get("cancel_requested"):
+                _finalize_cancelled_locked(st)
+                cancelled += 1
+                continue
+            st["status"] = "queued"
+            st["stage"] = "queued"
+            st["message"] = "Requeued after service restart"
+            _write_state(st)
+            requeued += 1
+    if requeued:
+        logger.info("requeued %d orphaned processing job(s) on boot", requeued)
+    if cancelled:
+        logger.info(
+            "boot reclaim: finalised %d cancel-requested job(s) as cancelled "
+            "(never requeued, card t_fef54150)", cancelled)
+    return requeued, cancelled
+
 
 def _scheduler_state_path() -> Path:
     return JOBS_DIR / SCHEDULER_STATE_NAME
@@ -856,6 +917,28 @@ def process_job_background(token: str, audio_path: str, filename: str,
     job_dir = JOBS_DIR / token
     state_file = job_dir / "status.json"
 
+    # Running-job cancel control (card t_fef54150): registered BEFORE the
+    # attempt touches anything so the window between claim and worker start
+    # can never look orphaned to the DELETE handler; deregistered only when
+    # the attempt has published its terminal state.
+    control = CancelControl(token)
+    with _cancel_registry_lock:
+        _cancel_registry[token] = control
+    # Close the claim->register window with the DURABLE flag: a DELETE that
+    # landed before the registry entry existed finalised the job as an
+    # orphan and wrote cancel_requested=true — honour it here instead of
+    # running the whole pipeline against a terminal state. Every
+    # interleaving is covered: either the handler sees this control (it
+    # signals the event directly) or its mark write precedes this read.
+    _pre = _read_state(token)
+    if _pre and _pre.get("cancel_requested"):
+        control.request()
+
+    def _check_cancelled():
+        if control.cancelled():
+            raise JobCancelled(
+                f"cancellation requested by client: {token}")
+
     def update_state(st, prog=None, msg="", err="", stage=None, dur=None):
         with _queue_lock:
             if state_file.exists():
@@ -874,7 +957,13 @@ def process_job_background(token: str, audio_path: str, filename: str,
                     # AC1 refresh (card t_b3ae9366): the decode-time probe of
                     # the real 16k wav replaces the admission-time estimate.
                     st_data["duration_seconds"] = float(dur)
-                if st == "failed":
+                if st == "cancelled":
+                    # Terminal stamp symmetry with the queued-cancel path
+                    # (card t_fef54150): progress/stage keep their monotonic
+                    # positions — a cancellation is a terminal, never a
+                    # rewind and never success-ish.
+                    st_data["cancelled_at"] = round(time.time(), 3)
+                elif st == "failed":
                     # Stage stays where the work broke; progress keeps its
                     # monotonic position but 1.0 is reserved for done, so a
                     # failure never looks success-ish.
@@ -899,6 +988,7 @@ def process_job_background(token: str, audio_path: str, filename: str,
                 _journal_append(job_dir, st_data)
 
     try:
+        _check_cancelled()
         mock = os.environ.get("MOCK_PIPELINE") == "1"
         update_state("processing", STAGE_PROGRESS["decoding"], "Decoding audio...",
                      stage="decoding")
@@ -912,6 +1002,7 @@ def process_job_background(token: str, audio_path: str, filename: str,
             decode_audio(audio_path, wav_path)
             duration = _probe_duration(wav_path)
 
+        _check_cancelled()
         update_state("processing", _stage_progress("transcribing"), "Transcribing speech...",
                      stage="transcribing",
                      dur=duration if not mock else None)
@@ -920,6 +1011,7 @@ def process_job_background(token: str, audio_path: str, filename: str,
             mock=mock,
             duration=duration or None,
             progress=_engine_progress(update_state),
+            cancel=control,
         )
 
         if not segments:
@@ -930,6 +1022,7 @@ def process_job_background(token: str, audio_path: str, filename: str,
 
         # The engine call returning is the diarization completion boundary
         # (its progress callback fired per pass/chunk inside the bands).
+        _check_cancelled()
         update_state("processing", _stage_progress("diarizing", 1.0),
                      "Diarized assembly complete", stage="diarizing")
 
@@ -939,6 +1032,7 @@ def process_job_background(token: str, audio_path: str, filename: str,
         # it). The old hard gate on os.environ == "1" meant the shipped
         # service never ran the pass at all.
         if spell_check_enabled() and not mock:
+            _check_cancelled()
             update_state("processing", STAGE_PROGRESS["spellcheck"],
                          "Spell-checking transcript...", stage="spellcheck")
             segments = spell_check_segments(segments).segments
@@ -946,6 +1040,7 @@ def process_job_background(token: str, audio_path: str, filename: str,
         cleanup_evidence: list = []
         cleanup_summary = ""
         if llm is not None:
+            _check_cancelled()
             update_state("processing", STAGE_PROGRESS["llm_cleanup"],
                          "Running opt-in LLM cleanup pass...",
                          stage="llm_cleanup")
@@ -968,10 +1063,12 @@ def process_job_background(token: str, audio_path: str, filename: str,
 
         update_state("processing", STAGE_PROGRESS["self_identification"],
                      "Suggesting speaker identities...", stage="self_identification")
+        _check_cancelled()
         suggestions = suggest_speaker_names(segments, extra_evidence=cleanup_evidence)
 
         update_state("processing", STAGE_PROGRESS["rendering"],
                      "Rendering markdown report...", stage="rendering")
+        _check_cancelled()
         meta = {
             "filename": filename,
             "source": filename,
@@ -991,11 +1088,31 @@ def process_job_background(token: str, audio_path: str, filename: str,
             "segments": segments
         }
         (job_dir / "output_result.json").write_text(json.dumps(result_data))
+        # Last gate before the terminal publish: cancel wins even if it
+        # arrived while the result files were being written — a job the
+        # client stopped must never resurrect as done.
+        _check_cancelled()
         update_state("done", 1.0, "Transcription complete.", stage="done")
 
+    except JobCancelled:
+        # Client cancel of a RUNNING attempt (card t_fef54150): this branch
+        # is the ONLY writer of the terminal cancelled state for live jobs —
+        # the handler just marks cancel_requested and signals/kills. The
+        # engine subprocess was already terminated through the kill path
+        # (or never spawned); post-kill classification must not re-run
+        # anything, so this path writes state and returns.
+        logger.info("job cancelled by client request: token=%s", token)
+        update_state("cancelled", msg="Cancelled by client request")
     except Exception as exc:
         logger.exception("Background job failed for token %s", token)
         update_state("failed", err=str(exc))
+    finally:
+        # Deregister only AFTER the terminal publish above: until this
+        # returns, a DELETE must still find the live control, never the
+        # orphan path.
+        with _cancel_registry_lock:
+            if _cancel_registry.get(token) is control:
+                del _cancel_registry[token]
 
 
 def _claim_next_queued() -> dict | None:
@@ -1192,17 +1309,11 @@ async def lifespan(app: FastAPI):
     # Boot revalidation: jobs left 'processing' by a crash/restart return to
     # the queue with their seq intact, preserving FIFO order across restarts;
     # admission limits are revalidated by every POST from this persisted state.
-    reclaimed = 0
-    with _queue_lock:
-        for st in _iter_states():
-            if st.get("status") == "processing":
-                st["status"] = "queued"
-                st["stage"] = "queued"
-                st["message"] = "Requeued after service restart"
-                _write_state(st)
-                reclaimed += 1
-    if reclaimed:
-        logger.info("requeued %d orphaned processing job(s) on boot", reclaimed)
+    # Startup reclaim (card t_fef54150): a processing job WITHOUT a cancel
+    # request is a dead attempt and re-queues as before; a processing job
+    # WITH cancel_requested lands terminal cancelled — a restart can never
+    # resurrect a client-cancelled job onto the GPU.
+    _requeued, _cancel_finalised = _requeue_orphans_locked()
 
     app.state.wake = _WakeHub()
     worker_enabled = os.environ.get("QUEUE_WORKER_ENABLED", "1") == "1"
@@ -1461,6 +1572,11 @@ def _session_job_entries(
             "source": s.get("filename", "unknown"),
             "created_at": _listing_created_at(s),
         }
+        if s.get("cancel_requested"):
+            # Card t_fef54150 AC4: a kill in flight is visible here too —
+            # the terminal state still reads 'processing' until the worker
+            # finalises, and cancel_requested is the only honest signal.
+            entry["cancel_requested"] = True
         if s.get("status") == "queued":
             entry["queue_position"] = rank.get(s["token"])
             if estimates is not None:
@@ -1575,16 +1691,35 @@ async def get_job_status(token: str):
 
 @app.delete("/v1/jobs/{token}", status_code=status.HTTP_202_ACCEPTED)
 async def cancel_job(token: str):
-    """Cancel a queued job (spec minimum for card t_daebf369).
+    """Cancel a QUEUED or RUNNING job (cards t_daebf369 + t_fef54150).
 
-    Running jobs get 409: GPU concurrency is 1 and the pipeline is mid-card,
-    so graceful mid-chunk cancel is out of scope here. Cancelled jobs free
-    both queue depth and session quota; the input audio is cleaned from disk
-    immediately while status.json is kept so the 'cancelled' state remains
-    observable. The V2 retention sweep (card t_5e6200fc) expires it — like
-    every finished status — after RETENTION_DAYS.
+    Queued: terminal immediately — nothing is running, so this handler is
+    the only writer; the input audio is cleaned from disk at once while
+    status.json is kept so the cancelled state remains observable.
+
+    Running (card t_fef54150): the old 409 is gone. Under the SAME
+    _queue_lock the worker uses for every state write, the handler marks
+    ``cancel_requested`` (+ ``cancel_requested_at``) — the flag that
+    survives a crash window so the boot reclaim finalises the job instead
+    of requeueing it — then, after releasing the queue lock, signals the
+    live attempt through the process-local CancelControl registry: the
+    engine's whole process group is TERMed then KILLed (the tested timeout
+    machinery) and the WORKER finalises the terminal ``cancelled`` state.
+    The handler returns 202 ``{"status": "cancelling"}`` and never writes
+    the terminal for a live job — exactly one writer per state, and the
+    journal can only read cancel_request -> cancelled, because the worker
+    raises at the earliest after the handler's mark write lands.
+
+    Processing WITHOUT a live control (a crashed attempt the next boot
+    reclaim has not reached yet) has nothing to kill and no worker to
+    finalise: the handler writes ``cancelled`` itself, under the same lock.
+
+    done/failed/scanned keep their 409; cancelled is idempotent. The V2
+    retention sweep (card t_5e6200fc) expires cancelled — like every
+    finished status — after RETENTION_DAYS.
     """
     validate_token(token)
+    control = None
     with _queue_lock:
         state = _read_state(token)
         if state is None:
@@ -1600,14 +1735,37 @@ async def cancel_job(token: str):
         if current == "cancelled":
             return {"token": token, "status": "cancelled"}
         if current == "processing":
+            state["cancel_requested"] = True
+            state["cancel_requested_at"] = round(time.time(), 3)
+            state["message"] = "Cancellation requested by client"
+            _write_state(state)  # journals the cancel_request transition
+            with _cancel_registry_lock:
+                control = _cancel_registry.get(token)
+            if control is None:
+                # Orphan: no live attempt in this process to signal or kill,
+                # and none can come back to life — the flag routes the boot
+                # reclaim to the terminal. Finalise here, under this lock.
+                _finalize_cancelled_locked(state)
+                logger.info("cancel: token=%s was a dead attempt — finalised "
+                            "cancelled without a kill", token)
+                return {"token": token, "status": "cancelled"}
+        else:
             raise HTTPException(
                 status_code=409,
-                detail="Job is currently processing on the GPU (concurrency=1); cancellation of running jobs is not supported yet.",
+                detail=f"Job already finished with status '{current}'.",
             )
-        raise HTTPException(
-            status_code=409,
-            detail=f"Job already finished with status '{current}'.",
-        )
+    # Live attempt, outside the queue lock (a process-group teardown can
+    # legitimately take the full TERM-then-KILL grace; holding _queue_lock
+    # across it would freeze every other state write in the service). The
+    # request flag is already durable and the event is set by request()
+    # itself, so the kill is an acceleration, never a correctness
+    # dependency: even if it races the engine exiting 0 on its own, the
+    # stage-boundary polls see the event and the terminal is cancelled.
+    killed = await run_in_threadpool(control.request)
+    logger.info("cancel: token=%s requested; engine %s — worker finalises cancelled",
+                token, "process group terminated" if killed
+                else "had already exited")
+    return {"token": token, "status": "cancelling"}
 
 
 @app.get("/v1/jobs/{token}/download")

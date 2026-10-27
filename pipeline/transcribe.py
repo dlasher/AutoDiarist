@@ -134,6 +134,16 @@ class CrispasrError(RuntimeError):
     """The CrispASR backend could not produce a transcription."""
 
 
+class JobCancelled(Exception):
+    """The client cancelled this job while it was running (card t_fef54150).
+
+    A deliberate terminal class: the cancel kill makes the engine exit by
+    signal (SIGTERM/15), which the generic failure path used to misread as
+    an engine crash. Cancellation is never a timeout and never a failure,
+    so no post-kill retry or fallback handler may treat it as one.
+    """
+
+
 class CrispasrConfigError(CrispasrError):
     """CRISPASR_BIN / GGUF_MODEL / DIAR_METHOD configuration is invalid."""
 
@@ -760,6 +770,59 @@ def _kill_process_group(proc: subprocess.Popen) -> None:
         proc.wait(timeout=5.0)
 
 
+class CancelControl:
+    """Per-attempt cancellation handle wiring a client request to the live
+    engine subprocess (card t_fef54150).
+
+    Two signals, one truth: the engine adapter polls ``cancelled()`` at
+    short granularity (stdout-read iterations and bounded process waits),
+    while ``request()`` additionally terminates the whole process group of
+    an already-attached subprocess, so a mid-chunk kill is immediate rather
+    than waiting for the next poll. ``attach()`` closes the race where the
+    cancel lands between claim and spawn: if the flag is set when the
+    process appears, it is killed on arrival.
+
+    The subprocess runs in its own session (``start_new_session=True``), so
+    the group is exactly the one engine invocation — the same guarantee the
+    timeout kill already relies on. ``detach()`` clears the reference before
+    any cleanup can reap the pid: a stale pgid must never be signalled after
+    the process is gone (pid reuse).
+    """
+
+    def __init__(self, token: str) -> None:
+        self.token = token
+        self._event = threading.Event()
+        self._lock = threading.Lock()
+        self._proc: subprocess.Popen | None = None
+
+    def cancelled(self) -> bool:
+        return self._event.is_set()
+
+    def attach(self, proc: subprocess.Popen) -> None:
+        with self._lock:
+            self._proc = proc
+            kill_now = self._event.is_set()
+        if kill_now:
+            _kill_process_group(proc)
+
+    def detach(self) -> None:
+        with self._lock:
+            self._proc = None
+
+    def request(self) -> bool:
+        """Flag the job and kill the attached engine, if any. Returns True
+        when a subprocess handle was present (live or just-exited); False
+        means the caller must decide the orphan path."""
+        self._event.set()
+        with self._lock:
+            proc = self._proc
+        if proc is None:
+            return False
+        if proc.poll() is None:
+            _kill_process_group(proc)
+        return True
+
+
 def _stderr_tail(path: str, limit: int = 800) -> str:
     try:
         text = Path(path).read_text(errors="replace").strip()
@@ -770,7 +833,8 @@ def _stderr_tail(path: str, limit: int = 800) -> str:
 
 def _run_crispasr(wav_path: str, work_dir: str,
                   progress: Callable[[str, int, int], None] | None = None,
-                  chunk_total: int = 0) -> list[dict[str, Any]]:
+                  chunk_total: int = 0,
+                  cancel: CancelControl | None = None) -> list[dict[str, Any]]:
     """One whole-file crispasr invocation -> parsed Segment dicts.
 
     Live progress needs TWO channels (card t_2e901945, measured on the
@@ -788,6 +852,15 @@ def _run_crispasr(wav_path: str, work_dir: str,
     ``work_dir`` and failure paths read only its tail.
     ``CRISPASR_TIMEOUT_SECONDS`` keeps its wall-clock semantics; on
     expiry the whole process group is killed.
+    ``cancel`` (card t_fef54150) wires the client-facing cancel to this
+    subprocess: the handle is attached the moment the engine spawns (and
+    killed on arrival if the cancel landed first), the stdout-read loop
+    polls the flag while the engine is chatty-quiet, and the bounded waits
+    wake on it too. The ``finally`` then reuses the timeout kill — TERM
+    then KILL over the whole group — and the exit is reported as
+    ``JobCancelled``, never as a timeout and never as a generic engine
+    failure (a signal-killed exit code 15/−15 must not be reclassified or
+    retried into a resurrection).
     """
     started = time.monotonic()
     out_base = os.path.join(work_dir, "crispasr_out")
@@ -813,6 +886,11 @@ def _run_crispasr(wav_path: str, work_dir: str,
                 )
         except OSError as exc:
             raise CrispasrError(f"cannot execute crispasr at {command[0]!r}: {exc}") from exc
+        if cancel is not None:
+            # Live handle for the DELETE path (card t_fef54150): if the
+            # cancel landed between claim and spawn, attach kills this
+            # engine on arrival instead of letting it chew GPU time.
+            cancel.attach(proc)
         deadline = started + timeout
         done = 0
 
@@ -857,11 +935,18 @@ def _run_crispasr(wav_path: str, work_dir: str,
         )
         stderr_pump.start()
         timed_out = False
+        cancelled = False
         try:
             while True:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     timed_out = True
+                    break
+                if cancel is not None and cancel.cancelled():
+                    # Card t_fef54150: the handler-side kill normally beats
+                    # this poll; the poll is the belt for a flag set without
+                    # a live handle attached (e.g. cancel during decode).
+                    cancelled = True
                     break
                 try:
                     line = lines.get(timeout=min(remaining, 0.25))
@@ -870,19 +955,49 @@ def _run_crispasr(wav_path: str, work_dir: str,
                 if line is None:  # stdout EOF — engine finished or closed the pipe
                     break
                 _on_line(line)
-            if not timed_out and proc.poll() is None:
-                try:
-                    proc.wait(timeout=max(0.0, deadline - time.monotonic()))
-                except subprocess.TimeoutExpired:
-                    timed_out = True
+            if not timed_out and not cancelled and proc.poll() is None:
+                wait_for = deadline - time.monotonic()
+                if cancel is not None:
+                    # Bounded wait so a cancel that lands while parked here
+                    # is observed within ~0.5s even without the direct kill.
+                    wait_for = min(wait_for, 0.5)
+                while True:
+                    try:
+                        proc.wait(timeout=max(0.0, wait_for))
+                        break
+                    except subprocess.TimeoutExpired:
+                        if cancel is not None and cancel.cancelled():
+                            cancelled = True
+                            break
+                        if time.monotonic() >= deadline:
+                            timed_out = True
+                            break
+                        wait_for = deadline - time.monotonic()
+                        if cancel is not None:
+                            wait_for = min(wait_for, 0.5)
         finally:
-            if timed_out or proc.poll() is None:
+            if timed_out or cancelled or proc.poll() is None:
                 _kill_process_group(proc)
             with contextlib.suppress(OSError, ValueError):
                 if proc.stdout is not None:
                     proc.stdout.close()
             stderr_stop.set()
             stderr_pump.join(timeout=2.0)
+            if cancel is not None:
+                # Drop the (possibly reaped) handle before anything else can
+                # signal a recycled pid through this control.
+                cancel.detach()
+        if cancelled or (cancel is not None and cancel.cancelled()):
+            # Cancel-wins: whatever the engine's exit code ended up being
+            # (TERM-killed -15, SIGKILL -9, or a race to exit 0), the
+            # client asked this job to stop and the terminal is cancelled —
+            # never a timeout, never the generic failure class. The kill
+            # from request() can beat the next poll iteration (EOF break),
+            # so the control's own flag is authoritative here, not `cancelled`.
+            raise JobCancelled(
+                f"crispasr cancelled by client request after "
+                f"{time.monotonic() - started:.1f}s (exit {proc.returncode}): "
+                f"{command[:1]}")
         if timed_out:
             raise CrispasrError(f"crispasr timed out after {timeout:.0f}s: {command[:1]}")
         returncode = proc.wait()
@@ -982,11 +1097,36 @@ def _mock_segments() -> list[dict[str, Any]]:
     ]
 
 
+def _mock_stage_hold(cancel: CancelControl | None) -> None:
+    """Parking helper for the mock transcribe stage (card t_fef54150).
+
+    ``MOCK_TRANSCRIBE_SECONDS`` (default 0 — today's instant behaviour) parks
+    the mock stage so the queue/API layer can exercise mid-run cancellation
+    without a GPU. The flag is polled at ~10 ms cadence, so the mock honours
+    the same contract as the real engine: cancel wins promptly.
+    """
+    try:
+        hold = float(os.environ.get("MOCK_TRANSCRIBE_SECONDS", "0") or 0)
+    except ValueError:
+        hold = 0.0
+    end = time.monotonic() + max(0.0, hold)
+    while True:
+        if cancel is not None and cancel.cancelled():
+            raise JobCancelled(
+                "cancellation requested during the mock transcribe stage: "
+                f"{cancel.token}")
+        remaining = end - time.monotonic()
+        if remaining <= 0:
+            return
+        time.sleep(min(0.01, remaining))
+
+
 def transcribe_and_diarize(
     audio_path: str,
     mock: bool = False,
     duration: float | None = None,
     progress: Callable[[str, int, int], None] | None = None,
+    cancel: CancelControl | None = None,
 ) -> list[dict[str, Any]]:
     """Transcribe and diarize one audio file via the CrispASR backend.
 
@@ -997,8 +1137,19 @@ def transcribe_and_diarize(
     count; ``progress`` then receives real per-chunk reports
     ``("asr", done, total)`` from the streamed engine stdout, plus the
     final ``("diar", 1, 1)`` assembly report.
+    ``cancel`` (card t_fef54150) is polled at this stage boundary BEFORE the
+    engine spawns — a retry or requeue can never resurrect an already
+    cancelled attempt by re-spawning it — threaded into the engine run for
+    the mid-chunk kill, and polled again at the assembly boundary so a
+    cancelled job never continues into the downstream passes (cancel wins
+    even if the engine raced to finish).
     """
+    if cancel is not None and cancel.cancelled():
+        raise JobCancelled(
+            "cancellation requested before the transcribe stage started: "
+            f"{cancel.token}")
     if mock or os.environ.get("MOCK_PIPELINE") == "1":
+        _mock_stage_hold(cancel)
         return _mock_segments()
 
     _validate_runtime_config()
@@ -1012,9 +1163,14 @@ def transcribe_and_diarize(
             progress("asr", 1, 2)
     with tempfile.TemporaryDirectory(prefix="autodiarist-crispasr-") as work_dir:
         segments = _run_crispasr(str(audio_path), work_dir,
-                                 progress=progress, chunk_total=chunk_total)
+                                 progress=progress, chunk_total=chunk_total,
+                                 cancel=cancel)
     if progress is not None:
         progress("diar", 1, 1)
+    if cancel is not None and cancel.cancelled():
+        raise JobCancelled(
+            "cancellation accepted at the diarization boundary: "
+            f"{cancel.token}")
     return segments
 
 

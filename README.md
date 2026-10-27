@@ -35,7 +35,7 @@ worker stages per job (api/main.py process_job_background):
   v
 GET    /v1/jobs                  -> list MY jobs (session-scoped; newest first; ?limit=1..200, default 50; + ETA for queued; + processing_count = service-wide in-flight)
 GET    /v1/jobs/{token}          -> status (+ queue_position and queue-aware ETA while queued; stage + monotonic progress)
-DELETE /v1/jobs/{token}          -> cancel a queued job (409 while processing)
+DELETE /v1/jobs/{token}          -> cancel a queued OR running job (running: 202 cancelling + engine kill)
 GET    /v1/jobs/{token}/download -> output_result.json (default) or ?format=md
 ```
 
@@ -261,19 +261,32 @@ format=md` for any other `format` value; `404` for unknown tokens (and, as a
 consistency guard, `Result file missing` / `Markdown report missing` if a
 finished job's artifact is gone from disk).
 
-### DELETE /v1/jobs/{token} — cancel a queued job
+### DELETE /v1/jobs/{token} — cancel a queued OR running job
 
 ```bash
 curl -sS -X DELETE http://127.0.0.1:8000/v1/jobs/$TOKEN
-# queued -> 202 {"token": "...", "status": "cancelled"}
+# queued    -> 202 {"token": "...", "status": "cancelled"}
+# running   -> 202 {"token": "...", "status": "cancelling"}  (then GET shows cancelled)
 ```
 
 Cancelling a `queued` job frees both queue depth and the session slot; the
 source audio is deleted immediately and the state file is kept so `cancelled`
-remains observable via GET. Repeat cancels are idempotent (`202`). A job that
-is `processing` gets `409` (`cancellation of running jobs is not supported
-yet` — GPU concurrency is 1 and the pipeline is mid-card in v1); `done` and
-`failed` jobs also get `409` (`Job already finished with status '<x>'.`).
+remains observable via GET. Repeat cancels are idempotent (`202`).
+
+A `processing` job is cancellable too (card t_fef54150): the handler marks
+`cancel_requested: true` + `cancel_requested_at` in the job state under the
+same lock the worker uses for every state write, then signals the live
+attempt through a process-local registry. The engine subprocess — already
+spawned in its own session, with the tested TERM-then-KILL
+`_kill_process_group` on the other end — is terminated immediately, so a
+long job stops within seconds instead of finishing its remaining chunks.
+The WORKER finalises the terminal `cancelled` state (the handler's `cancelling`
+answer is honest: the kill is in flight, one writer per state) and the job's
+`status_journal.jsonl` records the `cancel_request -> cancelled` ordering.
+`GET /v1/jobs/{token}` and `GET /v1/jobs` expose `cancel_requested` while the
+kill is in flight, and the boot reclaim can never requeue a cancel-requested
+job onto the GPU — a restart in the kill window lands it `cancelled`.
+`done` and `failed` jobs get `409` (`Job already finished with status '<x>'.`).
 
 ### Queueing and persistence
 
@@ -635,7 +648,7 @@ clone never runs it. It is also NOT a transcription-quality or WER test:
 ./scripts/smoke-test.sh --audio my.wav               # optional user-supplied file
 ```
 
-Five PASS/FAIL checks; exit 0 only when all five pass, non-zero exits name
+Six PASS/FAIL checks; exit 0 only when all six pass, non-zero exits name
 the failed check, and every curl command used is printed verbatim so a
 reviewer can reproduce from a laptop with no host access:
 
@@ -646,6 +659,7 @@ reviewer can reproduce from a laptop with no host access:
 | (c) | the job reaches terminal status `done` within `--timeout` (bounded polling; last observed status/stage/progress is reported on expiry; a `failed` job fails here) |
 | (d) | `GET /v1/jobs/{token}/download?format=md` is non-empty markdown with a `Duration` metadata row and a `## Transcript` section |
 | (e) | `GET /v1/jobs/{token}/download?format=json` is valid JSON with `status: done` and a non-empty `segments` array (observed speaker count is printed as INFO — informational, never a gate) |
+| (f) | a SECOND upload is DELETEd while `processing`: `202 cancelling`, then terminal `cancelled` with `cancel_requested=true` within 60 s of grace — the kill must never surface as `failed` or `done` (card t_fef54150) |
 
 Fixture lifecycle — no audio is committed and none is required from you:
 the primary fixture is pyannote's published `marklex1min.wav`, a real 79 s

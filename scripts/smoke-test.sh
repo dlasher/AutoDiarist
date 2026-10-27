@@ -3,7 +3,7 @@
 # scripts/smoke-test.sh — OPTIONAL, user-invoked aliveness/plumbing check for
 # a running AutoDiarist deployment (card t_66115e7d).
 #
-# WHAT IT DOES: five pass/fail checks against a live API endpoint:
+# WHAT IT DOES: six pass/fail checks against a live API endpoint:
 #   (a) GET  /docs                      -> HTTP 200 (service is up)
 #   (b) POST /v1/jobs  <fixture upload> -> HTTP 202 + token
 #   (c) GET  /v1/jobs/{token} polled to a terminal state within --timeout
@@ -11,6 +11,9 @@
 #       a "| Duration |" metadata row and a "## Transcript" section
 #   (e) GET  /v1/jobs/{token}/download?format=json -> valid result JSON with
 #       status done and a non-empty segments array
+#   (f) second upload, DELETE while it is PROCESSING -> 202, and the job
+#       lands terminal 'cancelled' with cancel_requested recorded
+#       (card t_fef54150 cancel-in-flight)
 #
 # WHAT IT DOES NOT DO: it is NOT part of container activation (activation
 # stays exactly: `docker compose up`). It runs NO docker command, touches no
@@ -319,10 +322,68 @@ else
   skip "(e) skipped — job never reached done"
 fi
 
+# ---- check (f): cancel a job WHILE IT IS PROCESSING (card t_fef54150) -------
+# A second submission of the same fixture gives a real in-flight window:
+# poll until 'processing' is observed, DELETE, and pin the full cancel
+# contract — 202 accepting the kill, terminal state cancelled (NOT done,
+# NOT failed), and cancel_requested visible in the job state.
+if [ "$LAST_STATUS" = "done" ]; then
+  CODE="$(curl_show "$CURL_ERRLOG" -sS -o "$TMP_DIR/resubmit.json" -w '%{http_code}' \
+          --max-time 60 -X POST -F "file=@$FIXTURE_TO_UPLOAD" "$ENDPOINT/v1/jobs" || true)"
+  if [ "$CODE" = "202" ]; then
+    TOKEN2="$(json_get "$TMP_DIR/resubmit.json" "d.get('token','')")"
+    [ -n "$TOKEN2" ] || TOKEN2=""
+  fi
+  if [ -z "$TOKEN2" ]; then
+    fail f "resubmission for the cancel-in-flight check -> HTTP '${CODE:-no-response}' (expected 202)"
+  else
+    # Catch the processing window (terminal too fast => honest skip, not a fake pass).
+    SAW_PROCESSING=0
+    DEADLINE=$(( $(now_s) + TIMEOUT ))
+    while [ "$(now_s)" -lt "$DEADLINE" ]; do
+      curl_show "$CURL_ERRLOG" -sS -o "$TMP_DIR/cancel_poll.json" --max-time 15 \
+        "$ENDPOINT/v1/jobs/$TOKEN2" >/dev/null 2>&1 || true
+      S="$(json_get "$TMP_DIR/cancel_poll.json" "d.get('status','')")"
+      [ "$S" = "processing" ] && { SAW_PROCESSING=1; break; }
+      case "$S" in done|failed|cancelled) break ;; esac
+      sleep_s 0.25
+    done
+    if [ "$SAW_PROCESSING" -ne 1 ]; then
+      fail f "second job reached '$S' without an observable processing window — cancel-in-flight NOT exercised (timeout ${TIMEOUT}s)"
+    else
+      CODE="$(curl_show "$CURL_ERRLOG" -sS -o "$TMP_DIR/cancel_delete.json" -w '%{http_code}' \
+              --max-time 30 -X DELETE "$ENDPOINT/v1/jobs/$TOKEN2" || true)"
+      RESP_STATUS="$(json_get "$TMP_DIR/cancel_delete.json" "d.get('status','')")"
+      if [ "$CODE" != "202" ] || { [ "$RESP_STATUS" != "cancelling" ] && [ "$RESP_STATUS" != "cancelled" ]; }; then
+        fail f "DELETE while processing -> HTTP '${CODE:-no-response}' status '${RESP_STATUS:-?}' (expected 202 + cancelling|cancelled; the old 409 contract must be gone)"
+      else
+        # The kill + worker finalisation must land within 60 s of grace.
+        FINAL2=""
+        DEADLINE=$(( $(now_s) + 60 ))
+        while [ "$(now_s)" -lt "$DEADLINE" ]; do
+          curl_show "$CURL_ERRLOG" -sS -o "$TMP_DIR/cancel_final.json" --max-time 15 \
+            "$ENDPOINT/v1/jobs/$TOKEN2" >/dev/null 2>&1 || true
+          FINAL2="$(json_get "$TMP_DIR/cancel_final.json" "d.get('status','')")"
+          case "$FINAL2" in done|failed|cancelled) break ;; esac
+          sleep_s 0.5
+        done
+        CREQ="$(json_get "$TMP_DIR/cancel_final.json" "str(d.get('cancel_requested'))")"
+        if [ "$FINAL2" = "cancelled" ] && [ "$CREQ" = "True" ]; then
+          pass f "DELETE during processing -> 202 '$RESP_STATUS'; terminal 'cancelled' with cancel_requested=true (engine killed, honest state)"
+        else
+          fail f "cancelled job ended as '${FINAL2:-timeout}' with cancel_requested='${CREQ:-?}' (expected cancelled/True; a kill must never surface as failed or done)"
+        fi
+      fi
+    fi
+  fi
+else
+  skip "(f) skipped — first job never reached done; nothing to resubmit for the cancel check"
+fi
+
 # ---- verdict ------------------------------------------------------------------
 cleanup
 if [ "$FAILURES" -eq 0 ] && [ "$SKIPPED" -eq 0 ]; then
-  printf '\nSMOKE TEST PASSED — 5/5 checks. ALIVENESS AND PLUMBING ONLY: transcription quality is not measured by this test.\n'
+  printf '\nSMOKE TEST PASSED — 6/6 checks. ALIVENESS AND PLUMBING ONLY: transcription quality is not measured by this test.\n'
   exit 0
 else
   printf '\nSMOKE TEST FAILED — %s check(s) failed. ALIVENESS AND PLUMBING ONLY: transcription quality is not measured by this test.\n' "$FAILURES" >&2
