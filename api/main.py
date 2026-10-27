@@ -3,6 +3,8 @@ import uuid
 import re
 import shutil
 import json
+import selectors
+import subprocess
 import time
 import asyncio
 import hashlib
@@ -1091,6 +1093,115 @@ def _probe_duration(path: str) -> float:
         return 0.0
 
 
+# Watchdog caps for the admission-time decode-and-hash child (card
+# t_971ed589). Unlike the header-only ffprobe above, this streams a FULL
+# decode of an upload up to MAX_UPLOAD_BYTES (500 MiB — dense audio can
+# legitimately decode for many minutes), so instead of one hard timeout it
+# gets two stall-aware caps; any breach kills the child and degrades the
+# job to a null hash (AC A3), never a rejection:
+#   _HASH_DECODE_STALL_SECONDS — no new byte from the child in this window
+#       (a hung ffmpeg: zero-byte hangs included).
+#   _HASH_DECODE_MAX_SECONDS   — absolute wall cap on the whole decode.
+_HASH_DECODE_STALL_SECONDS = 15.0
+_HASH_DECODE_MAX_SECONDS = 900.0
+
+
+def _hash_decoded_audio(path: str) -> str | None:
+    """SHA-256 content fingerprint of the DECODED audio (card t_971ed589).
+
+    Pipes the upload through
+    ``ffmpeg -i file -f s16le -acodec pcm_s16le -ar 16000 -ac 1 -`` — the
+    pipeline's own decode domain (16 kHz mono s16, cf.
+    ``pipeline.transcribe.decode_audio``) — and feeds the PCM stream into
+    hashlib chunk by chunk: no temp file, no second copy on disk. The
+    container bytes never reach the hash, so the same decoded content in any
+    lossless container maps to the same fingerprint; a lossy re-encode
+    changes the decoded samples and therefore legitimately hashes
+    differently (see tests/api/test_audio_hash.py, AC A4).
+
+    Truncated to 32 hex chars, the house fingerprint style of ``_hash_ident``
+    (AC A2). NEVER raises: a missing ffmpeg, an undecodable upload, a hung
+    or oversized child, or zero decoded bytes all return None so admission
+    can never reject a job because hashing failed (AC A3) — the pipeline's
+    own decode stage stays the single source of real audio errors. An
+    all-zero decode (rc 0, no samples) would fingerprint as sha256(b""), a
+    constant colliding with every other empty stream, so it degrades to
+    None too.
+
+    Both child pipes are drained through a selector with raw ``os.read``
+    (fd readiness only means bytes are in the kernel, not in a userspace
+    buffer), so a stderr-chunk flood can never deadlock the stdout stream
+    and the stall watchdog sees real progress.
+
+    Runs via ``run_in_threadpool`` at admission, exactly like
+    ``_probe_duration`` (AC A1): the event loop never blocks on the child.
+    """
+    try:
+        proc = subprocess.Popen(
+            ["ffmpeg", "-loglevel", "error", "-i", str(path),
+             "-f", "s16le", "-acodec", "pcm_s16le", "-ar", "16000", "-ac", "1", "-"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+    except OSError:
+        return None  # ffmpeg not installed (same failure posture as the probe)
+    stdout_pipe, stderr_pipe = proc.stdout, proc.stderr
+    if stdout_pipe is None or stderr_pipe is None:  # pragma: no cover - PIPE requested above
+        proc.kill()
+        proc.wait()
+        return None
+    out_fd, err_fd = stdout_pipe.fileno(), stderr_pipe.fileno()
+    digest = hashlib.sha256()
+    streamed = 0
+    stderr_tail = b""
+    outcome = ""  # non-empty when the child did NOT run to natural EOF
+    started = time.monotonic()
+    try:
+        with selectors.DefaultSelector() as sel:
+            sel.register(out_fd, selectors.EVENT_READ, "out")
+            sel.register(err_fd, selectors.EVENT_READ, "err")
+            last_activity = started
+            while sel.get_map():
+                now = time.monotonic()
+                if now - last_activity > _HASH_DECODE_STALL_SECONDS:
+                    outcome = f"stalled (no bytes for >{_HASH_DECODE_STALL_SECONDS}s)"
+                    break
+                if now - started > _HASH_DECODE_MAX_SECONDS:
+                    outcome = f"exceeded the {_HASH_DECODE_MAX_SECONDS}s wall cap"
+                    break
+                for key, _events in sel.select(timeout=1.0):
+                    fd = out_fd if key.data == "out" else err_fd
+                    chunk = os.read(fd, 1 << 16)
+                    if not chunk:
+                        sel.unregister(key.fileobj)
+                        continue
+                    last_activity = time.monotonic()
+                    if key.data == "out":
+                        streamed += len(chunk)
+                        digest.update(chunk)
+                    elif len(stderr_tail) < 4096:
+                        stderr_tail = (stderr_tail + chunk)[:4096]
+    except OSError as exc:  # pipe vanished mid-decode (defensive)
+        outcome = f"pipe error: {exc}"
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+        try:
+            proc.wait(timeout=30)
+        except subprocess.TimeoutExpired:  # pragma: no cover - kill ignored
+            outcome = outcome or "child survived SIGKILL"
+        with suppress(OSError):
+            stdout_pipe.close()
+            stderr_pipe.close()
+    rc = proc.returncode
+    if outcome or rc != 0 or streamed == 0:
+        logger.debug("audio_sha256 skipped for %s (rc=%s, bytes=%s, %s): %s",
+                     path, rc, streamed, outcome or "decode failed",
+                     stderr_tail[:200].decode(errors="replace"))
+        return None
+    return digest.hexdigest()[:32]
+
+
 def _engine_progress(update_state):
     """Map the engine's pass/chunk counts onto public stage bands.
 
@@ -1627,12 +1738,21 @@ class JobResponse(BaseModel):
     # constant disables ETA emission (see README / CONFIG.md).
     estimated_wait_seconds: float | None = None
     estimated_completion_at: str | None = None
+    # Audio content fingerprint at admission (V1.6, card t_971ed589):
+    # 32-hex truncated SHA-256 of the DECODED 16 kHz mono PCM, null when the
+    # upload could not be decoded. Presentation + bookkeeping only — no
+    # cache reads it yet. Additive: old clients ignore unknown fields.
+    audio_sha256: str | None = None
 
 
 class JobStatus(BaseModel):
     model_config = ConfigDict(extra="allow")
     token: str
     status: str
+    # Declared explicitly so jobs persisted before card t_971ed589 (whose
+    # status.json lacks the key) still render audio_sha256: null on the
+    # poll response instead of omitting the field (AC A6 stable shape).
+    audio_sha256: str | None = None
 
 
 @app.post("/v1/jobs", response_model=JobResponse, status_code=status.HTTP_202_ACCEPTED)
@@ -1675,6 +1795,15 @@ async def create_job(request: Request, response: Response, file: UploadFile = Fi
     #     probe when the job actually runs).
     probed = await run_in_threadpool(_probe_duration, str(audio_path))
     duration_seconds = round(float(probed), 3) if probed and probed > 0 else None
+
+    # 2c. Audio content fingerprint at admission (V1.6, card t_971ed589):
+    #     SHA-256 over the DECODED 16 kHz mono PCM stream, computed
+    #     off-loop in a threadpool exactly like the duration probe above
+    #     (AC A1) — the event loop never blocks on the ffmpeg child.
+    #     null (never a rejection) when the upload cannot be decoded;
+    #     presentation + bookkeeping only: nothing reads this value yet
+    #     (the later history/cache cards key on it).
+    audio_sha256 = await run_in_threadpool(_hash_decoded_audio, str(audio_path))
 
     # 3. Admission control under the queue lock: queue depth is the single
     #    system-level backpressure gate (AC1, card t_daebf369). Since V1.5
@@ -1727,6 +1856,12 @@ async def create_job(request: Request, response: Response, file: UploadFile = Fi
             # AC1: duration probed at admission (None = unknown). The ETA
             # model reads ONLY this value from state — never the audio.
             "duration_seconds": duration_seconds,
+            # Audio content fingerprint at admission (V1.6, card t_971ed589):
+            # 32-hex truncated SHA-256 of the DECODED 16 kHz mono PCM
+            # (null = unknown/undecodable). Bookkeeping here; the persisted
+            # file survives boot-resume because every state update is a
+            # read-modify-write, never a rebuild.
+            "audio_sha256": audio_sha256,
         }
         _write_state(state)
         # Fair-schedule rank at admission (1-based, card t_4b40acfd): the
@@ -1767,6 +1902,8 @@ async def create_job(request: Request, response: Response, file: UploadFile = Fi
         # recomputed by the scheduler order simulation, never a guarantee.
         estimated_wait_seconds=round(eta[0], 1) if eta else None,
         estimated_completion_at=_iso_utc(eta[1]) if eta else None,
+        # Audio content fingerprint at admission (card t_971ed589).
+        audio_sha256=audio_sha256,
     )
 
 
@@ -1784,7 +1921,9 @@ def _session_job_entries(
     """Pure session view (card t_f97d12a8): the caller's jobs only,
     newest-first (created_at desc, seq desc tiebreak), truncated to `limit`.
 
-    Every entry carries token/status/progress/stage/source/created_at;
+    Every entry carries token/status/progress/stage/source/created_at and
+    the audio content fingerprint audio_sha256 (card t_971ed589; null for
+    states persisted before it);
     queued entries additionally carry queue_position (the fair-scheduled
     execution rank from `queued_order`, the same simulation GET /v1/jobs/
     {token} and POST 202 use) and, while ETA emission is enabled, the
@@ -1809,6 +1948,10 @@ def _session_job_entries(
             "stage": s.get("stage") or s.get("status"),
             "source": s.get("filename", "unknown"),
             "created_at": _listing_created_at(s),
+            # Audio content fingerprint (card t_971ed589): same key the 202
+            # and the poll carry, read with .get so pre-feature states
+            # render null instead of omitting the field (AC A6).
+            "audio_sha256": s.get("audio_sha256"),
         }
         if s.get("cancel_requested"):
             # Card t_fef54150 AC4: a kill in flight is visible here too —

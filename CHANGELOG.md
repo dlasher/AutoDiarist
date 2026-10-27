@@ -1,5 +1,49 @@
 # Changelog
 
+## [Unreleased] — audio content fingerprint: SHA-256 of the DECODED 16 kHz PCM at admission, surfaced on state + 202 + poll + listing (card t_971ed589)
+
+**Every admitted job now carries `audio_sha256`** — a content fingerprint
+of the audio, computed at admission, stored on the persisted job state,
+and surfaced on the `POST /v1/jobs` 202 body, on every
+`GET /v1/jobs/{token}` poll and on every `GET /v1/jobs` listing entry.
+Presentation + bookkeeping ONLY: no cache, no history endpoint, nothing
+reads the value yet (the later history/cache cards key on it).
+
+- **Hashed domain: decoded audio, not container bytes.**
+  `api/main.py::_hash_decoded_audio` streams
+  `ffmpeg -i file -f s16le -acodec pcm_s16le -ar 16000 -ac 1 -` (the
+  pipeline's own decode domain, 16 kHz mono s16) through `hashlib.sha256`
+  chunk by chunk — no temp file, no second copy. The same decoded content
+  re-muxed into a different LOSSLESS container (`.wav` vs `.flac`)
+  fingerprints identically (test-pinned); a LOSSY re-encode (`.mp3` etc.)
+  genuinely changes the decoded samples and legitimately hashes
+  differently — re-uploads of the same file always match.
+- **House style:** truncated to 32 hex chars, matching `_hash_ident`
+  (domain-separated SHA-256 [:32]). No MD5 is computed or stored anywhere;
+  clients wanting a shorter id truncate the exposed value client-side.
+- **Off the event loop** (AC A1): computed via `run_in_threadpool` at
+  admission, exactly alongside the existing duration probe. A selector
+  watchdog drains both child pipes (stderr floods cannot deadlock it) and
+  kills a stalled child (`_HASH_DECODE_STALL_SECONDS`) or one exceeding
+  the wall cap (`_HASH_DECODE_MAX_SECONDS`).
+- **Failure degrades to null, never a rejection** (AC A3): missing
+  ffmpeg, undecodable upload, timeout or zero-sample decode all store
+  `null`; the job proceeds exactly as before and the pipeline's own
+  decode stage stays the single source of real audio errors. Pre-feature
+  states (no key in status.json) render `audio_sha256: null` on poll and
+  listing, keeping the response shape stable (AC A6); the listing's
+  strict-key test assertion was extended accordingly.
+- **Additive only**: no endpoint changes, no behavior changes, no new
+  config knobs (the two watchdog caps are module constants, not env —
+  AC A7); old clients ignore the new fields.
+
+Tests: `tests/api/test_audio_hash.py` (13 tests — golden pure-Python
+hash of the decoded PCM, wav/flac container pair, lossy-difference
+documentation, determinism/resubmission, null-degradation branches
+including a synthetic stalled child and stderr flood, surfacing on all
+three response bodies, pre-feature null). Suite: 519 passed, 2 skipped
+(main baseline 506 + 2 skipped).
+
 ## [Unreleased] — cancel a RUNNING job: client-facing engine kill wired to DELETE (card t_fef54150)
 
 `DELETE /v1/jobs/{token}` no longer 409s on `processing` — a running job is
