@@ -1,5 +1,52 @@
 # Changelog
 
+## [Unreleased] — running-phase ETA: `processing` jobs get a completion estimate derived from their own observed progress (card t_d64bdf29)
+
+The status check now answers *when will this finish* for a job already
+**running**, not only for one still queued. `GET /v1/jobs/{token}` (and the
+`processing` entries of `GET /v1/jobs`) carries
+`estimated_remaining_seconds` + `estimated_completion_at`, with
+`estimated_wait_seconds` aliasing the remaining seconds — derived ONLY from
+the job's own observation: published monotonic `progress` over wall time
+since `attempt_started_at` (new claim stamp; `started_at` stays the
+first-ever claim, preserved across reclaims as the queue side expects).
+The fixed linear model NEVER feeds the value (AC1); it survives only as the
+kill-switch and the startup-cost emission gate.
+
+Honesty machinery, because the card's traps are real:
+
+* emission gates (AC4): null until the job genuinely crossed
+  `RUNNING_ETA_MIN_PROGRESS` (default `0.30`, the transcribing band's lower
+  edge — decode + per-run startup cost fully behind the observation
+  window) and, when the duration is known, lived longer than the model's
+  startup floor. A fresh job or a job without start stamps shows `null`,
+  never a fabricated number.
+* publication ratchet (AC2): the published value never moves up between
+  polls; real progress advances may only tighten it. A held value goes
+  `null` — fresh or null, never stale — once progress freezes beyond
+  `RUNNING_ETA_REANCHOR_SECONDS` (default `120`; the pipeline now journals
+  `last_progress_at` so a stalled stage and a band-edge stage are
+  distinguishable) or as soon as it passes its own promised completion
+  time. A reclaim drops the dead attempt's memory — no pre-restart value
+  caps the new attempt.
+* surfaces (AC5): poll and session listing drive the same live ratchet
+  under the queue lock; queued jobs' `estimated_wait_seconds` arithmetic is
+  byte-for-byte untouched (regression-pinned), and the `POST` 202 body
+  grows no new field.
+* `PROCESSING_SECONDS_PER_AUDIO_SECOND=0` disables the whole feature, like
+  the queue side.
+
+New state fields (append-only, never reset by design): `attempt_started_at`
+(claim), `last_progress_at` (update_state, on real advances only). The
+ratchet memory is pruned at both ends of a job's life (claim, terminal
+publish), so it cannot grow with the jobs directory.
+
+`tests/api/test_running_eta.py` (17 tests) pins every AC: pure math,
+ratchet monotonicity, freeze/null semantics, gate behaviour, the
+t_b3ae9366 regression guard, cross-surface agreement, and one end-to-end
+drive through the real mock pipeline + production claim path polled live
+while `processing` (AC6). 523 passed / 2 skipped full suite; no GPU.
+
 ## [Unreleased] — falsified "identical output" A/B claim corrected; both hosts' service-level concurrency curves published (card t_ee479fdf)
 
 **Docs-only.** The README claimed "both backends produced identical output"

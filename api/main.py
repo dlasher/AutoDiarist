@@ -94,6 +94,22 @@ DEFAULT_PROCESSING_SECONDS_PER_AUDIO_SECOND = 0.185
 # have, and never re-probes at request time. Configurable via
 # AUDIO_DURATION_FALLBACK_SECONDS.
 DEFAULT_AUDIO_DURATION_SECONDS = 300.0
+# Running-phase ETA (card t_d64bdf29). Once a job is PROCESSING its
+# completion estimate is derived from its OWN observed rate — wall time
+# since the attempt started against the published monotonic progress
+# fraction — NEVER from the fixed rate constant above (that constant only
+# gates emission here; it remains the queue side's model). The job gets
+# null until it has genuinely crossed a meaningful band: the default
+# 0.30 is the transcribing band's lower edge, so decode + startup cost
+# is fully behind the elapsed-time observation and the derived rate
+# reflects steady-state work. Tunable via RUNNING_ETA_MIN_PROGRESS.
+DEFAULT_RUNNING_ETA_MIN_PROGRESS = 0.30
+# Freshness allowance for the last valid running-phase estimate while
+# progress is frozen (a stalled stage, or a band that publishes no
+# fine-grained work — spellcheck / llm_cleanup). Beyond this window the
+# estimate goes null rather than persisting a value reality has not
+# reconfirmed. Tunable via RUNNING_ETA_REANCHOR_SECONDS.
+DEFAULT_RUNNING_ETA_REANCHOR_SECONDS = 120.0
 # HTTP token charset (RFC 7230) — header/cookie names must match it.
 _HEADER_TOKEN_RE = re.compile(r"[!#$%&'*+\-.^_`|~0-9A-Za-z]+")
 
@@ -212,6 +228,50 @@ def _processing_rate() -> float:
             value, DEFAULT_PROCESSING_SECONDS_PER_AUDIO_SECOND,
         )
         return DEFAULT_PROCESSING_SECONDS_PER_AUDIO_SECOND
+    return value
+
+
+def _running_eta_min_progress() -> float:
+    """Fraction a running job must cross before it gets an estimate
+    (card t_d64bdf29 AC4). Out-of-range or non-numeric values warn and
+    fall back to the default, mirroring _processing_rate's discipline."""
+    raw = (os.environ.get("RUNNING_ETA_MIN_PROGRESS") or "").strip()
+    if not raw:
+        return DEFAULT_RUNNING_ETA_MIN_PROGRESS
+    try:
+        value = float(raw)
+    except ValueError:
+        logger.warning(
+            "config: RUNNING_ETA_MIN_PROGRESS=%r is not a number; using %.2f",
+            raw, DEFAULT_RUNNING_ETA_MIN_PROGRESS)
+        return DEFAULT_RUNNING_ETA_MIN_PROGRESS
+    if not 0.0 < value < 1.0:
+        logger.warning(
+            "config: RUNNING_ETA_MIN_PROGRESS=%r is outside (0, 1); using %.2f",
+            raw, DEFAULT_RUNNING_ETA_MIN_PROGRESS)
+        return DEFAULT_RUNNING_ETA_MIN_PROGRESS
+    return value
+
+
+def _running_eta_reanchor_seconds() -> float:
+    """Freshness allowance for a frozen running-phase estimate (card
+    t_d64bdf29): wall seconds progress may stand still before the last
+    valid value is dropped (null) instead of held stale."""
+    raw = (os.environ.get("RUNNING_ETA_REANCHOR_SECONDS") or "").strip()
+    if not raw:
+        return DEFAULT_RUNNING_ETA_REANCHOR_SECONDS
+    try:
+        value = float(raw)
+    except ValueError:
+        logger.warning(
+            "config: RUNNING_ETA_REANCHOR_SECONDS=%r is not a number; using %.1f",
+            raw, DEFAULT_RUNNING_ETA_REANCHOR_SECONDS)
+        return DEFAULT_RUNNING_ETA_REANCHOR_SECONDS
+    if value <= 0:
+        logger.warning(
+            "config: RUNNING_ETA_REANCHOR_SECONDS=%r must be positive; using %.1f",
+            raw, DEFAULT_RUNNING_ETA_REANCHOR_SECONDS)
+        return DEFAULT_RUNNING_ETA_REANCHOR_SECONDS
     return value
 
 
@@ -695,6 +755,137 @@ def _processing_remaining_seconds(processing: dict | None, rate: float,
     return max(0.0, min(est, remaining))
 
 
+# --- Running-phase ETA (card t_d64bdf29) --------------------------------------
+#
+# A PROCESSING job's completion estimate comes from its OWN observed rate:
+#     fraction = published monotonic progress (stage bands on real work
+#                boundaries — decode finish, engine chunk counts, ...)
+#     rate     = fraction / wall seconds since the attempt started
+#     remaining = (1 - fraction) / rate
+# The fixed duration-rate model NEVER feeds this number (AC1); it only
+# contributes the startup-cost emission gate below. Two honesty devices
+# keep the payload trustworthy:
+#   * emission gates (AC4): null until the job crosses
+#     RUNNING_ETA_MIN_PROGRESS and, when its duration is known, has lived
+#     longer than the linear startup-cost floor — a fresh job in warm-up
+#     has no meaningful rate observation;
+#   * the publication ratchet (_running_eta_ratchet): the published value
+#     never inflates, re-anchors only down on real progress, and goes
+#     null — never stale — once progress freezes past
+#     RUNNING_ETA_REANCHOR_SECONDS or a held value passes its own
+#     promised completion time (fresh or null, per the card).
+
+
+def _running_estimate(state: dict, now: float) -> tuple[float, float] | None:
+    """Pure observed-rate math: (remaining_seconds, completion_epoch) or
+    None when no honest estimate exists yet. Never touches the ratchet."""
+    if state.get("status") != "processing":
+        return None
+    started = state.get("attempt_started_at") or state.get("started_at")
+    if started is None:
+        return None
+    try:
+        elapsed = now - float(started)
+        frac = float(state.get("progress") or 0.0)
+    except (TypeError, ValueError):
+        return None
+    if elapsed <= 0 or not 0.0 < frac < 1.0:
+        return None
+    if frac <= _running_eta_min_progress():
+        return None
+    dur = _known_duration_seconds(state)
+    if dur is not None:
+        # Startup-cost floor: while elapsed is shorter than the linear
+        # model's estimate for everything BEFORE steady transcription
+        # (the queued->transcribing band), the observation window is
+        # dominated by fixed cost and the derived rate would be a lie.
+        # Gate only — the emitted value below never uses this model.
+        if elapsed <= dur * _processing_rate() * STAGE_PROGRESS["transcribing"]:
+            return None
+    remaining = elapsed * (1.0 - frac) / frac
+    return remaining, now + remaining
+
+
+_running_eta_floor: dict[str, dict] = {}
+
+
+def _running_eta_ratchet(state: dict, now: float | None = None,
+                         ) -> tuple[float, float] | None:
+    """Publication memory for the running-phase estimate (AC2 + freshness).
+
+    Contract across consecutive polls of one attempt: a published value
+    never moves UP; when progress advances the estimate may tighten (ratchet
+    min with the recomputation); when progress freezes — a stalled stage or
+    a band with no fine-grained publishes (spellcheck, llm_cleanup) — the
+    value is held only until RUNNING_ETA_REANCHOR_SECONDS of no-advance, or
+    until its own promised completion passes, then goes NULL. It only
+    returns on a real progress advance. The in-memory map is pruned at the
+    two ends of a job's life (claim pops the previous attempt's entry — an
+    estimate from across a restart must not cap the new attempt; terminal
+    status updates pop), so it cannot grow with the jobs directory.
+
+    Callers hold no lock; every mutation is under _queue_lock (the same
+    lock every state read/write takes, so poll and listing agree)."""
+    token = state.get("token")
+    if now is None:
+        now = time.time()
+    est = _running_estimate(state, now)
+    if token is None:
+        return est
+    with _queue_lock:
+        try:
+            prog = float(state.get("progress") or 0.0)
+        except (TypeError, ValueError):
+            prog = 0.0
+        entry = _running_eta_floor.get(token)
+        if entry is None:
+            lpa = state.get("last_progress_at")
+            try:
+                advanced_at = float(lpa) if lpa is not None else now
+            except (TypeError, ValueError):
+                advanced_at = now
+            floor, expired = est, False
+            if est is not None and (now - advanced_at) > \
+                    _running_eta_reanchor_seconds():
+                # First observation of a job whose progress has ALREADY
+                # been frozen past the allowance (seeded, stalled, or
+                # published before this process saw it): the freshly
+                # derived value is not yet trustworthy either — null until
+                # a real advance re-anchors it.
+                floor, expired = None, True
+        else:
+            advanced = prog > entry["prog"]
+            advanced_at = now if advanced else entry["advanced_at"]
+            expired = entry["expired"] and not advanced
+            if expired:
+                floor = None
+            elif (now - advanced_at) > _running_eta_reanchor_seconds():
+                floor, expired = None, True  # frozen past the allowance
+            elif (entry["floor"] is not None
+                  and now > entry["floor"][1]):
+                floor, expired = None, True  # held value missed its own ETA
+            elif est is None:
+                floor = None
+            elif entry["floor"] is None:
+                floor = est
+            else:
+                floor = (est[0], est[1]) if est[0] <= entry["floor"][0] \
+                    else entry["floor"]  # ratchet: never inflate
+        if floor is not None:
+            _running_eta_floor[token] = {
+                "prog": prog, "advanced_at": advanced_at,
+                "floor": floor, "at": now, "expired": expired}
+        elif expired:
+            # Remember WHY it went null: the anchor stays down until
+            # progress genuinely advances again (fresh or null, never stale).
+            _running_eta_floor[token] = {
+                "prog": prog, "advanced_at": advanced_at,
+                "floor": None, "at": now, "expired": True}
+        else:
+            _running_eta_floor.pop(token, None)
+        return floor
+
+
 def _wait_estimates(states: list[dict], sched: dict,
                     now: float | None = None) -> dict[str, tuple[float, float]]:
     """token -> (estimated_wait_seconds, estimated_completion_epoch) for
@@ -889,6 +1080,19 @@ def process_job_background(token: str, audio_path: str, filename: str,
                     # Monotonic non-decreasing across the whole job (card
                     # t_14ac6b49 AC2): a stage publish never rewinds.
                     st_data["progress"] = round(max(prev, prog), 4)
+                if st == "processing":
+                    # AC6 enabler (card t_d64bdf29): the running-phase ETA
+                    # must distinguish a genuinely stalled stage from a
+                    # band that publishes no fine-grained progress, so the
+                    # time of the last REAL advance is journaled — same
+                    # clamped-monotonic semantics as `progress` itself.
+                    if float(st_data.get("progress") or 0.0) > prev:
+                        st_data["last_progress_at"] = time.time()
+                else:
+                    # Terminal/failed: the job's running-phase estimate
+                    # memory is dead — prune at the source so the ratchet
+                    # map cannot grow with the jobs directory.
+                    _running_eta_floor.pop(token, None)
                 if msg:
                     st_data["message"] = msg
                 if err:
@@ -1032,6 +1236,14 @@ def _claim_next_queued() -> dict | None:
         job["queue_position"] = None
         job["message"] = "Claimed by worker"
         job["started_at"] = time.time()
+        # Card t_d64bdf29: started_at is the job's FIRST-ever claim (kept
+        # stable across reclaims); attempt_started_at marks this attempt,
+        # the honest denominator for the running-phase observed rate. A new
+        # attempt also drops the dead attempt's estimate memory — an
+        # estimate computed from pre-restart work must not cap the new
+        # attempt's value (the card's restart-staleness trap).
+        job["attempt_started_at"] = job["started_at"]
+        _running_eta_floor.pop(job["token"], None)
         _write_state(job)
         logger.info(
             "queue: claimed job token=%s session=%s serve_counter=%d cap=%d "
@@ -1434,6 +1646,7 @@ def _listing_created_at(state: dict) -> float:
 def _session_job_entries(
     states: list[dict], session_ident: str, limit: int, queued_order: list[str],
     estimates: dict[str, tuple[float, float]] | None = None,
+    running_estimates: dict[str, tuple[float, float] | None] | None = None,
 ) -> tuple[list[dict], int]:
     """Pure session view (card t_f97d12a8): the caller's jobs only,
     newest-first (created_at desc, seq desc tiebreak), truncated to `limit`.
@@ -1469,6 +1682,17 @@ def _session_job_entries(
                 eta = estimates.get(s["token"])
                 entry["estimated_wait_seconds"] = round(eta[0], 1) if eta else None
                 entry["estimated_completion_at"] = _iso_utc(eta[1]) if eta else None
+        if s.get("status") == "processing" and running_estimates is not None:
+            # Running-phase ETA (card t_d64bdf29): the SAME live ratchet
+            # value the poll endpoint reports for this token, aliased onto
+            # estimated_wait_seconds so one field answers "when will this
+            # finish" for queued AND processing entries. Null until an
+            # honest estimate exists.
+            est = running_estimates.get(s["token"])
+            rem = round(est[0], 1) if est else None
+            entry["estimated_remaining_seconds"] = rem
+            entry["estimated_wait_seconds"] = rem
+            entry["estimated_completion_at"] = _iso_utc(est[1]) if est else None
         if s.get("status") == "failed":
             entry["error"] = s.get("error") or s.get("message") or ""
         entries.append(entry)
@@ -1508,9 +1732,17 @@ async def list_jobs(request: Request, response: Response, limit: int = DEFAULT_L
         # both surfaces agree because both come from this pass. Disabled
         # emission (rate=0) omits the fields entirely, like the poll.
         estimates = _wait_estimates(states, sched) if _processing_rate() > 0 else None
+    # Running-phase ETA for this snapshot's processing entries (card
+    # t_d64bdf29): the SAME ratchet the poll endpoint drives, so both
+    # surfaces agree. Called OUTSIDE the queue lock — the ratchet takes
+    # it itself. None when the feature is disabled, like `estimates`.
+    running = None
+    if _processing_rate() > 0:
+        running = {st["token"]: _running_eta_ratchet(st) for st in states
+                   if st.get("status") == "processing" and st.get("token")}
     entries, total = _session_job_entries(
         states, _hash_ident(f"session:{session_id}"), page, queued_order,
-        estimates,
+        estimates, running,
     )
     # Echo the identity exactly like POST does (card t_920fb7dc): a client
     # that only had an IP-derived identity gets the minted id back via
@@ -1564,12 +1796,28 @@ async def get_job_status(token: str):
             eta = estimates.get(token)
             state["estimated_wait_seconds"] = round(eta[0], 1) if eta else None
             state["estimated_completion_at"] = _iso_utc(eta[1]) if eta else None
-    elif state.get("status") == "processing" and _processing_rate() > 0:
-        # A running job is past the queue: stage + monotonic progress carry
-        # the truth, so the ETA fields are present-but-null (never stale),
-        # mirroring the queue_position: None convention on claim (AC6).
-        state["estimated_wait_seconds"] = None
-        state["estimated_completion_at"] = None
+    elif state.get("status") == "processing":
+        # Running-phase ETA (card t_d64bdf29): an honest completion
+        # estimate derived from the job's OWN observed rate — elapsed time
+        # since this attempt started against the published monotonic
+        # progress. estimated_wait_seconds aliases the remaining seconds
+        # (a running client is asking the same question a queued client
+        # asks), estimated_completion_at is this job's own finish time.
+        # Null until an honest estimate exists (fresh/warm-up job, stalled
+        # past the freshness allowance, no start stamp) — never stale,
+        # never inflated. Rate=0 disables the whole feature like the
+        # queue side (t_b3ae9366).
+        if _processing_rate() > 0:
+            est = _running_eta_ratchet(state)
+            state["estimated_remaining_seconds"] = (
+                round(est[0], 1) if est else None)
+            state["estimated_completion_at"] = _iso_utc(est[1]) if est else None
+            state["estimated_wait_seconds"] = (
+                round(est[0], 1) if est else None)
+        else:
+            state["estimated_wait_seconds"] = None
+            state["estimated_completion_at"] = None
+            state["estimated_remaining_seconds"] = None
     return JobStatus(**state)
 
 
