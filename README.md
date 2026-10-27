@@ -165,8 +165,10 @@ path) — treat those as opaque.
   exists (this job's duration probe failed at admission), and the fields
   are omitted entirely when `PROCESSING_SECONDS_PER_AUDIO_SECOND=0`
   disables ETA emission.
-- `processing` — adds `started_at` (first-ever claim; preserved across
-  reclaims) and `attempt_started_at` (this attempt); `stage` moves through
+- `processing` — adds `started_at` and `attempt_started_at` (both stamped
+  on every claim, reclaims included — they always mark THIS attempt and
+  are equal; `attempt_started_at` is the alias the running-phase estimator
+  reads), `stage` moves through
   the pipeline in order while `progress` advances monotonically and
   `message` carries the stage text (e.g. `Claimed by worker`,
   `Transcribing pass 2/4`). It also carries the running-phase ETA (see
@@ -252,8 +254,16 @@ observation:
 * **Never inflates.** The published value ratchets down: a real progress
   advance may tighten the estimate (ratchet min), but a poll can never
   see the number grow, even when the job slows down or the service
-  restarted mid-run (a reclaim drops the dead attempt's memory and
-  re-derives from the new attempt's clock).
+  restarted mid-run. On a restart there is no started_at-preservation
+  trick: the claim re-stamps both clocks (they are always equal), drops
+  the dead attempt's estimate memory, and keeps the preserved `progress`
+  value only as a no-regression floor. The honesty comes from the gates:
+  while progress sits frozen at that preserved value the freeze guard is
+  already engaged (the boot reclaim leaves `last_progress_at` in the
+  past) and the startup floor holds emission null — the optimistic
+  restored-fraction-over-new-clock reading is never published. An
+  estimate resumes only once the new attempt genuinely advances past the
+  preserved fraction (pinned by the reclaim regression test).
 * **Fresh or null.** Progress freezing is normal (spellcheck /
   llm_cleanup publish at band edges only). A held value survives only
   until `RUNNING_ETA_REANCHOR_SECONDS` (default `120`) without a real

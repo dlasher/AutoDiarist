@@ -8,8 +8,10 @@ The status check now answers *when will this finish* for a job already
 `estimated_remaining_seconds` + `estimated_completion_at`, with
 `estimated_wait_seconds` aliasing the remaining seconds — derived ONLY from
 the job's own observation: published monotonic `progress` over wall time
-since `attempt_started_at` (new claim stamp; `started_at` stays the
-first-ever claim, preserved across reclaims as the queue side expects).
+since `attempt_started_at` (stamped on every claim, reclaims included —
+like `started_at` it always marks THIS attempt and the two are equal;
+`attempt_started_at` is the alias the estimator reads so the ETA keeps the
+attempt clock even if `started_at`'s meaning ever changes).
 The fixed linear model NEVER feeds the value (AC1); it survives only as the
 kill-switch and the startup-cost emission gate.
 
@@ -46,16 +48,19 @@ Honesty machinery, because the card's traps are real:
 * `PROCESSING_SECONDS_PER_AUDIO_SECOND=0` disables the whole feature, like
   the queue side.
 
-New state fields (append-only, never reset by design): `attempt_started_at`
-(claim), `last_progress_at` (update_state, on real advances only). The
+New state fields (additive schema; both stamped on every claim or real
+advance): `attempt_started_at` (claim, always equal to `started_at`),
+`last_progress_at` (update_state, on real advances only). The
 ratchet memory is pruned at both ends of a job's life (claim, terminal
 publish), so it cannot grow with the jobs directory.
 
-`tests/api/test_running_eta.py` (22 tests) pins every AC: pure math
+`tests/api/test_running_eta.py` (23 tests) pins every AC: pure math
 (50%-in `remaining <= elapsed`, convergence on a steady simulated series),
 ratchet monotonicity, freeze/null semantics, gate behaviour, the
 t_b3ae9366 regression guard, cross-surface agreement, `progress_percent`
-consistency/monotonicity, done/cancelling non-emission, and one end-to-end
+consistency/monotonicity, done/cancelling non-emission, the reclaim
+honesty chain (null until the new attempt genuinely advances past the
+preserved fraction), and one end-to-end
 drive through the real mock pipeline + production claim path polled live
 while `processing`. 528 passed / 2 skipped full suite; no GPU.
 

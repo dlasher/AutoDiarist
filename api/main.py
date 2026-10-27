@@ -733,8 +733,9 @@ def _processing_remaining_seconds(processing: dict | None, rate: float,
                                   now: float) -> float:
     """The currently-PROCESSING job's honest remaining share (never > est).
 
-    With started_at (every real claim sets one; reclaimed attempts preserve
-    it): remaining = estimate - wall time so far, clamped to [0, estimate]
+    With started_at (every claim sets it, reclaims included — it is always
+    this attempt's clock): remaining = estimate - wall time so far, clamped
+    to [0, estimate]
     — a straggler that overshoots its linear estimate contributes 0, it
     never subtracts from the prefix (AC5 negative clamp). The value falls
     monotonically as `now` advances, so a polled estimate only moves when
@@ -807,14 +808,15 @@ def _running_estimate(state: dict, now: float) -> tuple[float, float] | None:
     if frac <= _running_eta_min_progress():
         return None
     dur = _known_duration_seconds(state)
-    if dur is not None:
-        # Startup-cost floor: while elapsed is shorter than the linear
-        # model's estimate for everything BEFORE steady transcription
-        # (the queued->transcribing band), the observation window is
-        # dominated by fixed cost and the derived rate would be a lie.
-        # Gate only — the emitted value below never uses this model.
-        if elapsed <= dur * _processing_rate() * STAGE_PROGRESS["transcribing"]:
-            return None
+    # Startup-cost floor: while elapsed is shorter than the linear model's
+    # estimate for everything BEFORE steady transcription (the
+    # queued->transcribing band), the observation window is dominated by
+    # fixed cost and the derived rate would be a lie. Gate only — the
+    # emitted value below never uses this model.
+    if (dur is not None
+            and elapsed <= dur * _processing_rate()
+            * STAGE_PROGRESS["transcribing"]):
+        return None
     remaining = elapsed * (1.0 - frac) / frac
     return remaining, now + remaining
 
@@ -1249,12 +1251,19 @@ def _claim_next_queued() -> dict | None:
         job["queue_position"] = None
         job["message"] = "Claimed by worker"
         job["started_at"] = time.time()
-        # Card t_d64bdf29: started_at is the job's FIRST-ever claim (kept
-        # stable across reclaims); attempt_started_at marks this attempt,
-        # the honest denominator for the running-phase observed rate. A new
-        # attempt also drops the dead attempt's estimate memory — an
-        # estimate computed from pre-restart work must not cap the new
-        # attempt's value (the card's restart-staleness trap).
+        # Card t_d64bdf29: both stamps mark THIS attempt — they are always
+        # equal. started_at is deliberately re-stamped on every claim, never
+        # preserved across reclaims: the queue-side
+        # _processing_remaining_seconds reads it as the current attempt's
+        # elapsed clock (AC4 byte-pins that behavior). attempt_started_at is
+        # the alias the running-phase estimator prefers — a forward-compat
+        # hook so the ETA keeps reading the attempt clock even if
+        # started_at's meaning ever changes. A new attempt also drops the
+        # dead attempt's estimate memory, and restart honesty comes from the
+        # emission gates (startup floor + progress freeze): a reclaimed job
+        # publishes null until the NEW attempt genuinely advances past the
+        # preserved fraction — pinned by the reclaim regression test in
+        # tests/api/test_running_eta.py.
         job["attempt_started_at"] = job["started_at"]
         _running_eta_floor.pop(job["token"], None)
         _write_state(job)

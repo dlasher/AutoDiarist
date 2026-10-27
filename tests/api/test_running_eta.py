@@ -32,6 +32,7 @@ import calendar
 import threading
 import time
 import uuid as _uuid
+from itertools import pairwise
 
 import pytest
 from fastapi.testclient import TestClient
@@ -130,7 +131,15 @@ def test_running_estimate_uses_observed_rate_not_fixed_model(tmp_path, monkeypat
     assert abs(a[0] - (600 * RATE - 100.0)) > 30.0
 
 
-def test_attempt_started_at_preferred_over_original_start(tmp_path, monkeypatch):
+def test_running_estimate_unit_guard_prefers_attempt_clock(tmp_path, monkeypatch):
+    """UNIT GUARD for clock precedence inside `_running_estimate` (AC4:
+    denominator = attempt clock, so pre-crash elapsed never poisons the
+    restarted rate). This calls the helper directly with DIFFERENT stamps
+    to pin the lookup order only — in production every claim stamps
+    `started_at` and `attempt_started_at` with the same value (they are
+    never different), and the restart integrity chain is pinned by
+    test_reclaimed_attempt_stays_null_until_new_attempt_earns_the_estimate.
+    """
     _setup(tmp_path, monkeypatch)
     now = time.time()
     est = main._running_estimate({
@@ -156,7 +165,7 @@ def test_pure_math_strictly_decreases_across_advancing_fractions():
         est = main._running_estimate(state, now0)
         assert est is not None
         seen.append(est[0])
-    assert all(b < a for a, b in zip(seen, seen[1:])), seen
+    assert all(b < a for a, b in pairwise(seen)), seen
 
 
 def test_published_value_never_inflates_when_the_tail_slows(tmp_path, monkeypatch):
@@ -429,6 +438,90 @@ def test_ratchet_memory_pruned_by_claim_and_terminal_update(tmp_path, monkeypatc
     # end-to-end test pins that half against the real pipeline.
 
 
+def test_reclaimed_attempt_stays_null_until_new_attempt_earns_the_estimate(tmp_path, monkeypatch):
+    """Restart honesty chain at the production seams (review round 1).
+
+    Encodes the PRODUCTION-VERIFIED sequence: boot requeue (lifespan
+    touches status/stage only; `progress` + `last_progress_at` are
+    preserved) -> `_claim_next_queued` re-stamps started_at AND
+    attempt_started_at — they are always equal — and pops the ratchet
+    memory -> polls on the new attempt.
+
+    Verified outcomes (worker OFF, patched clock, no sleeps):
+      * polls inside the startup-cost floor AND while progress is frozen
+        at the preserved value -> NULL: the optimistic preserved-frac /
+        new-clock number never reaches a client — "no false convergence
+        after restart" holds via the EMISSION GATES, not via any
+        started_at-preservation mechanism;
+      * only a genuine advance above the preserved value (real
+        new-attempt work) makes an estimate return, consistent with the
+        new clock.
+    """
+    client = _setup(tmp_path, monkeypatch, rate=RATE)
+    monkeypatch.setattr(main, "_running_eta_floor", {})  # fresh process
+
+    t_crash = 10_000.0
+    token = str(_uuid.uuid4())
+    # Dead attempt: 3600 s audio, ran to the preserved band value 0.60.
+    state = {
+        "token": token, "status": "processing", "session": "s", "seq": 1,
+        "created_at": t_crash - 310.0,
+        "started_at": t_crash - 300.0,
+        "attempt_started_at": t_crash - 300.0,
+        "audio_path": "/x.wav", "filename": "x.wav",
+        "duration_seconds": 3600.0, "duration_source": "ffprobe",
+        "stage": "transcribing", "progress": 0.60,
+        "last_progress_at": t_crash - 1.0,
+    }
+
+    def patch_clock(now):
+        monkeypatch.setattr(time, "time", lambda: now)
+
+    # 1. boot requeue exactly as lifespan does it (status/stage only).
+    patch_clock(t_crash)
+    state.update(status="queued", stage="queued")
+    main._write_state(state)
+
+    # 2. fresh claim: both clocks stamped equal, ratchet memory empty,
+    #    progress preserved at 0.60 (the clamp, not a reset).
+    claimed = main._claim_next_queued()
+    assert claimed is not None and claimed["token"] == token
+    st = main._read_state(token)
+    assert st is not None
+    assert st["attempt_started_at"] == st["started_at"], (
+        "claim stamps one per-attempt clock; docs must not promise otherwise")
+    assert st["progress"] == 0.60  # preserved (clamp), the trap this guards
+
+    def poll(elapsed):
+        now = st["started_at"] + elapsed
+        patch_clock(now)
+        return client.get(f"/v1/jobs/{token}").json()
+
+    # 3. while the NEW attempt has not yet genuinely advanced past the
+    #    preserved value (frozen progress; fast restart < reanchor
+    #    window), no optimistic estimate is published. (Startup floor for
+    #    this job is 3600*0.185*0.30 = 200 s; the freeze + gates are what
+    #    make restart honest.)
+    assert poll(11.0)["estimated_remaining_seconds"] is None
+    assert poll(201.0)["estimated_remaining_seconds"] is None, (
+        "preserved-numerator / new-denominator estimate must not be emitted")
+
+    # 4. only after real new-attempt work advances the fraction does an
+    #    estimate return — and it is consistent with the new clock.
+    now = st["started_at"] + 520.0
+    patch_clock(now)
+    adv = main._read_state(token)
+    assert adv is not None
+    adv.update(progress=0.72, stage="transcribing", last_progress_at=now)
+    main._write_state(adv)
+    rem = client.get(f"/v1/jobs/{token}").json()["estimated_remaining_seconds"]
+    assert rem is not None
+    # 666 s = full re-run at the pre-crash observed rate (3600*0.185);
+    # the ratchet-capped honest observed-rate region only (preserved-frac
+    # arithmetic against stale clocks must never reach the client).
+    assert rem <= 666.0 - 520.0 + 60.0, f"estimate regressed vs true finish: {rem}"
+
+
 # ---------------------------------------------------------------------------
 # End to end against the real mock pipeline (the pinned analogue of the
 # card's live test-host run): claimed through the
@@ -511,7 +604,7 @@ def test_end_to_end_running_estimate_tracks_the_mock_run(tmp_path, monkeypatch):
     # Only meaningful-progress emissions (gate respected).
     assert all(p >= 0.30 for p, _, _ in seen)
     # Never inflates across consecutive polls (ratchet contract).
-    assert all(b <= a + 0.15 for (_, a, _), (_, b, _) in zip(seen, seen[1:])), seen
+    assert all(b <= a + 0.15 for (_, a, _), (_, b, _) in pairwise(seen)), seen
     # The last published completion stamp lands near the real finish —
     # never a wildly-late stale value while the job runs past it.
     last_completion = seen[-1][2]
