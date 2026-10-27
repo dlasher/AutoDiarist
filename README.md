@@ -33,6 +33,10 @@ worker stages per job (api/main.py process_job_background):
   speaker self-ID      (pipeline.self_identification, weighted evidence)
   render               (pipeline.renderer -> markdown_report.md)
   v
+GET    /v1/jobs                  -> list MY jobs (session-scoped; newest first; ?limit=1..200, default 50; + ETA for queued; + processing_count = service-wide in-flight)
+GET    /v1/jobs/{token}          -> status (+ audio_sha256 content fingerprint; + queue_position and queue-aware ETA while queued; stage + monotonic progress)
+DELETE /v1/jobs/{token}          -> cancel a queued job (409 while processing)
+
 GET    /v1/jobs                  -> list MY jobs (session-scoped; newest first; ?limit=1..200, default 50; + ETA for queued + running-phase ETA for processing; + processing_count = service-wide in-flight)
 GET    /v1/jobs/{token}          -> status (+ queue_position and queue-aware ETA while queued; running-phase ETA while processing; stage + monotonic progress; progress_percent)
 DELETE /v1/jobs/{token}          -> cancel a queued OR running job (running: 202 + cancelling, then engine kill and a terminal cancelled state)
@@ -58,7 +62,7 @@ from the uploaded filename). On success:
 
 ```bash
 curl -sS -F 'file=@audio.wav;type=audio/wav' http://127.0.0.1:8000/v1/jobs
-# -> 202 {"token": "6a7f…uuid4…", "status": "queued", "session": "9f2c…uuid4hex…", "queue_position": 1, "estimated_wait_seconds": 1273.5, "estimated_completion_at": "2026-10-21T09:12:33Z"}
+# -> 202 {"token": "6a7f…uuid4…", "status": "queued", "session": "9f2c…uuid4hex…", "queue_position": 1, "estimated_wait_seconds": 1273.5, "estimated_completion_at": "2026-10-21T09:12:33Z", "audio_sha256": "134eb1a10f415c05d55cea2fe9a90b39"}
 ```
 
 Admission is checked in this order, each with its own failure mode:
@@ -74,7 +78,9 @@ queued: the body carries the `token`, the `session` id, the
 `queue_position` (1-based rank in the **fair-scheduled execution order** at
 admission — see *Fair-share scheduling* below) and the queue-aware wait
 estimate (`estimated_wait_seconds` + `estimated_completion_at`, recomputed
-on every poll — see *Wait estimates* below). `MAX_JOBS_PER_SESSION` is
+on every poll — see *Wait estimates* below), plus `audio_sha256` — the
+audio content fingerprint of the upload (see *Audio content fingerprint*
+below; `null` when the file could not be decoded, never a rejection). `MAX_JOBS_PER_SESSION` is
 deprecated — if set, the service warns at boot and ignores it; the live
 per-session knob is `MAX_PROCESSING_PER_SESSION` (default **1**), which caps
 concurrently `processing` jobs per session.
@@ -101,11 +107,18 @@ Answers `200` for every session, including a brand-new one (empty list):
 {"jobs": [{"token": "6a7f…uuid4…", "status": "queued", "progress": 0.0,
            "progress_percent": 0,
            "stage": "queued", "source": "meeting.wav",
-           "created_at": 1760000000.1, "queue_position": 1,
+           "created_at": 1760000000.1, "audio_sha256": "134eb1a10f415c05d55cea2fe9a90b39",
+           "queue_position": 1,
            "estimated_wait_seconds": 1273.5,
            "estimated_completion_at": "2026-10-21T09:12:33Z"}],
  "count": 1, "total": 1, "limit": 50}
 ```
+
+- Every entry carries `token`, `status`, `progress`, `stage`, `source` (the
+  uploaded filename), `created_at` and `audio_sha256` (the audio content
+  fingerprint, *null* for undecodable uploads and for jobs persisted
+  before the field existed — see *Audio content fingerprint*).
+  `queued` entries add `queue_position`
 
 - Every entry carries `token`, `status`, `progress`, `progress_percent`
   (integer 0..100 view of the same banded float), `stage`, `source` (the
@@ -139,7 +152,9 @@ The response is the job's persisted state. Common to every status: `token`,
 `status`, `stage` (see *Progress stages* below), `seq` (monotonic admission
 ticket — arrival order), `queued_at`, `progress`, `message`, `filename`,
 `duration_seconds` (the audio length probed at admission; `null` when the
-probe could not read the file), plus the
+probe could not read the file), `audio_sha256` (the audio content
+fingerprint — see *Audio content fingerprint* below; `null` for undecodable
+uploads and for jobs persisted before the field existed), plus the
 bookkeeping fields `session` (hashed session identity), `session_ident`
 (hashed session id, see *Session identity*) and `audio_path` (server-local
 path) — treat those as opaque.
@@ -222,6 +237,30 @@ cost the linear model does not see). Observed wall time can and will
 differ: treat the numbers as a planning estimate, **not a service-level
 guarantee**. A job whose own duration probe failed shows `null` — the API
 never fabricates a duration for the job you are asking about.
+
+#### Audio content fingerprint
+
+Every job state carries `audio_sha256`: a SHA-256 **content fingerprint**
+of the audio, computed at admission and surfaced on the `202` body, every
+`GET /v1/jobs/{token}` poll and every session-listing entry (card
+t_971ed589 — presentation and bookkeeping only: no cache reads it yet).
+The hashed domain is the **decoded audio**, not the uploaded bytes: the
+upload is streamed through
+`ffmpeg -i file -f s16le -acodec pcm_s16le -ar 16000 -ac 1 -` (the
+pipeline's own decode domain — 16 kHz mono s16) into hashlib, so the same
+decoded content re-muxed into a different **lossless** container
+(`.wav` vs `.flac`) fingerprints identically, while a **lossy** re-encode
+(`.mp3`/`.m4a`/`.ogg`) genuinely changes the decoded samples and therefore
+hashes differently — re-uploads of the *same file* always match; lossy
+transcodes of one recording do not, and cannot. The value is truncated to
+**32 hex chars**, the house fingerprint style of the hashed session
+identity. The hash runs off the event loop in the same thread pool the
+duration probe uses, with a stall/timeout watchdog on the ffmpeg child; a
+missing ffmpeg, an undecodable upload or a hung decode yields `null` and
+the job is admitted exactly as before — hashing failure never rejects.
+`null` also appears for jobs persisted before this field existed. A client
+wanting an MD5-style short id should truncate this value client-side; the
+server deliberately stores no second digest.
 
 #### Running-phase ETA (V1.5.x, card t_d64bdf29)
 

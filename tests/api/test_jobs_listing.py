@@ -187,15 +187,18 @@ def test_ac5_mixed_states_newest_first_with_exact_keys(tmp_path, monkeypatch):
         # Newest-first by created_at desc: a[5]=1005, a[4]=1004, ..., a[0]=1000.
         assert _tokens(body) == [a[5], a[4], a[3], a[2], a[1], a[0]]
 
-        # A done entry carries EXACTLY the base keys. V1.5.x (card
-        # t_d64bdf29 AC6) added progress_percent alongside the banded
-        # float — the only key-set change; terminal entries still carry
-        # no ETA fields.
+        # A done entry carries EXACTLY the base keys. Two features each
+        # extended this strict set assertion, and both keys are real:
+        # progress_percent (card t_d64bdf29 AC6, alongside the banded float)
+        # and audio_sha256 (card t_971ed589 AC A6, which the listing always
+        # surfaces). These synthetic uploads are undecodable, so every
+        # audio_sha256 value is null, exactly like a pre-feature state.
         entry = body["jobs"][2]
         assert entry["status"] == "done"
         assert set(entry) == {"token", "status", "progress",
                               "progress_percent", "stage", "source",
-                              "created_at"}
+                              "created_at", "audio_sha256"}
+        assert all(j["audio_sha256"] is None for j in body["jobs"])
 
         # The failed entry adds the error string; cancelled stays in view.
         failed = next(j for j in body["jobs"] if j["status"] == "failed")
