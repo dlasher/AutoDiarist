@@ -69,7 +69,11 @@ def _instrument(main, root, box, monkeypatch, asr_passes=2, boom=None):
         Path(output_wav).write_bytes(b"RIFF fake wav")
         return output_wav
 
-    def fake_transcribe(audio_path, mock=False, duration=None, progress=None):
+    def fake_transcribe(audio_path, mock=False, duration=None, progress=None,
+                        cancel=None):
+        # Card t_fef54150: the pipeline entry now threads the per-job
+        # CancelControl through; the fake accepts it and ignores it (no
+        # engine to interrupt in these stage-band tests).
         if boom == "transcribe":
             raise RuntimeError("engine exploded")
         if progress:

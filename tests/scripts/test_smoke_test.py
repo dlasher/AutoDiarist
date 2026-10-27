@@ -117,8 +117,10 @@ def test_all_pass_exit_zero(tmp_path: Path) -> None:
         r = _run(tmp_path, port, "--timeout", "30")
         out = r.stdout + r.stderr
         assert r.returncode == 0, out
-        # Checks (a)-(e) all PASS, exactly the five gates.
-        for tag in ("(a)", "(b)", "(c)", "(d)", "(e)"):
+        # Checks (a)-(f) all PASS, exactly the six gates (t_fef54150 added
+        # the cancel-while-processing gate; the stub now answers DELETE
+        # mid-processing with 202 and lands the job terminal 'cancelled').
+        for tag in ("(a)", "(b)", "(c)", "(d)", "(e)", "(f)"):
             assert f"PASS" in out and tag in out, f"no PASS line for {tag}:\n{out}"
         # Amended AC3: primary fixture is the downloaded one, and the script
         # says so explicitly.

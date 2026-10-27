@@ -83,11 +83,19 @@ sampling (no OOM protection).
 
 `DELETE /v1/jobs/{token}` cancels a **queued** job (audio removed
 immediately, `status.json` kept so the `cancelled` state stays observable —
-and so a straggler worker can never resurrect it). Cancelling a `processing`
-job answers `409`: GPU concurrency is 1 and mid-chunk graceful cancel is out
-of v1 scope. Finished jobs — `cancelled`/`failed`/`done` — are expired
-automatically by the retention sweep (`RETENTION_DAYS`, default 30; runs at
-boot and hourly, removals logged with the token). The live pair
+and so a straggler worker can never resurrect it). A **`processing`** job is
+cancellable too (card t_fef54150): the answer is `202 {"status": "cancelling"}`
+— `cancel_requested: true` lands in the job state under the queue lock, the
+live engine's process group is TERMed then KILLed (the same tested machinery
+the timeout path uses), and the worker finalises the terminal `cancelled`
+state within seconds. `GET /v1/jobs/{token}` shows `cancel_requested` while
+the kill is in flight; the job's `status_journal.jsonl` records
+`cancel_request -> cancelled`. A `processing` state whose worker is gone
+(e.g. a crash in the kill window) is finalised `cancelled` directly by the
+handler, and the boot reclaim finalises — never requeues — any
+cancel-requested job. Finished jobs — `cancelled`/`failed`/`done` — are
+expired automatically by the retention sweep (`RETENTION_DAYS`, default 30;
+runs at boot and hourly, removals logged with the token). The live pair
 `queued`/`processing` is never age-swept; under disk pressure
 (`DISK_MIN_FREE_MIB`) queued dirs can still be evicted oldest-first, but a
 `processing` job never is (CONFIG.md).

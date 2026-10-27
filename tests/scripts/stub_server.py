@@ -16,7 +16,11 @@ Prints `READY <port>` on stdout once listening (port 0 = ephemeral).
 
 --state selects which check the tests want to trip:
   pass        docs 200; POST 202; polls queued, processing, then done;
-              downloads valid.  All five checks (a)-(e) should PASS.
+              downloads valid.  All six checks (a)-(f) should PASS — (f)
+              resubmits and DELETEs mid-'processing', so the stub carries
+              PER-TOKEN state machines plus a DELETE -> 202 cancelling
+              route that lands the token terminal 'cancelled' with
+              cancel_requested=true (card t_fef54150 contract).
   docs_404    GET /docs -> 404.  Check (a) must FAIL.
   post_fail   POST /v1/jobs -> 500.  Check (b) must FAIL.
   job_failed  polls reach terminal 'failed'.  Check (c) must FAIL.
@@ -78,8 +82,13 @@ STATE_POLLS = {
 
 class Handler(BaseHTTPRequestHandler):
     state = "pass"
-    poll_count = 0
+    poll_count = 0  # legacy global counter (kept for reference/tests of sequencing)
     lock = threading.Lock()
+    tokens: dict = {}  # noqa: RUF012 — test stub; per-token state map:
+    #                      state machines, required by check (f): the second
+    #                      submission must show its OWN processing window and
+    #                      honour DELETE like the real api does (202
+    #                      cancelling, then terminal cancelled). (t_fef54150)
     last_upload: dict | None = None  # {"size": int, "magic": str} of newest POST body
 
     def log_message(self, format, *args):  # noqa: A002 - match base signature
@@ -92,14 +101,21 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def _next_status(self) -> str:
+    def _next_status(self, token: str = "") -> str:
         with Handler.lock:
-            n = Handler.poll_count
+            if Handler.state == "never_done":
+                return "processing"
+            t = Handler.tokens.setdefault(token or "_", {"polls": 0, "cancelled": False})
+            if t["cancelled"]:
+                t["last"] = "cancelled"
+                return "cancelled"
+            seq = STATE_POLLS.get(Handler.state, STATE_POLLS["pass"])
+            n = t["polls"]
+            t["polls"] += 1
             Handler.poll_count += 1
-        if Handler.state == "never_done":
-            return "processing"
-        seq = STATE_POLLS.get(Handler.state, STATE_POLLS["pass"])
-        return seq[min(n, len(seq) - 1)]
+            out = seq[min(n, len(seq) - 1)]
+            t["last"] = out
+            return out
 
     def do_GET(self):
         url = urlparse(self.path)
@@ -142,10 +158,46 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path.startswith("/v1/jobs/"):
             token = path.split("/")[3]
-            status = self._next_status()
-            body = json.dumps({"token": token, "status": status, "stage": status,
-                               "progress": 0.5}).encode()
-            self._send(200, body, "application/json")
+            status = self._next_status(token)
+            body = {"token": token, "status": status, "stage": status,
+                    "progress": 0.5}
+            if status == "cancelled":
+                # Mirrors the real API's terminal cancel state (t_fef54150):
+                # the flag survives in the final state, check (f) asserts it.
+                body["cancel_requested"] = True
+                body["message"] = "Cancelled by client request"
+            self._send(200, json.dumps(body).encode(), "application/json")
+            return
+        self._send(404, b"no route", "text/plain")
+
+    def do_DELETE(self):
+        path = urlparse(self.path).path
+        if path.startswith("/v1/jobs/"):
+            token = path.split("/")[3]
+            with Handler.lock:
+                t = Handler.tokens.setdefault(token, {"polls": 0, "cancelled": False})
+                if t["cancelled"]:
+                    out = {"token": token, "status": "cancelled"}
+                elif Handler.state == "never_done":
+                    # A real engine kill lands the terminal cancelled even
+                    # though the pipeline would never finish on its own.
+                    t["cancelled"] = True
+                    t["last"] = "cancelled"
+                    out = {"token": token, "status": "cancelling"}
+                else:
+                    cur = t.get("last", "queued")
+                    if cur in ("queued", "processing"):
+                        t["cancelled"] = True
+                        t["last"] = "cancelled"
+                        out = {"token": token,
+                               "status": "cancelled" if cur == "queued"
+                               else "cancelling"}
+                    else:
+                        self._send(409, json.dumps(
+                            {"detail": f"Job already finished with status '{cur}'."}
+                        ).encode(), "application/json")
+                        return
+            self._send(202, json.dumps(out).encode(), "application/json")
             return
         self._send(404, b"no route", "text/plain")
 
