@@ -22,6 +22,7 @@ from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, ConfigDict
 
+from pipeline import errors as job_errors
 from pipeline.transcribe import (
     CancelControl, JobCancelled, decode_audio, transcribe_and_diarize,
 )
@@ -586,6 +587,25 @@ def _read_state(token: str) -> dict | None:
     except Exception:
         logger.warning("unreadable status.json for %s", token)
         return None
+
+
+def _terminal_error_code(state: dict) -> str | None:
+    """Resolve the machine-readable code for any job state (card t_1799d07f).
+
+    Failed jobs always surface a code — records persisted before this card
+    carry none on disk, so the raw recorded error string is classified on
+    read with the same total classifier the writer uses. CANCELLED jobs
+    are NOT failures and get no code (AC7); in-flight and done jobs
+    report None (the field is present and null, never absent — poll
+    clients must not special-case).
+    """
+    stored = state.get("error_code")
+    if stored:
+        return stored
+    if state.get("status") == "failed":
+        return job_errors.classify_message(
+            state.get("error") or state.get("message") or "")
+    return None
 
 
 def _journal_append(job_dir: Path, st_data: dict) -> None:
@@ -1514,7 +1534,7 @@ def process_job_background(token: str, audio_path: str, filename: str,
             raise JobCancelled(
                 f"cancellation requested by client: {token}")
 
-    def update_state(st, prog=None, msg="", err="", stage=None, dur=None):
+    def update_state(st, prog=None, msg="", err="", stage=None, dur=None, code=None):
         with _queue_lock:
             if state_file.exists():
                 try:
@@ -1561,6 +1581,14 @@ def process_job_background(token: str, audio_path: str, filename: str,
                     st_data["progress"] = round(min(target, 0.9999), 4)
                     if not msg:
                         msg = f"Failed during {failing}: {err}"
+                    # AC1 (card t_1799d07f): EVERY failed record carries a
+                    # machine-readable code, additive to error/message. When
+                    # the caller holds an exception it classifies explicitly;
+                    # direct message writes (empty transcript, HTTP bodies)
+                    # fall back to classifying the raw recorded string.
+                    st_data["error_code"] = (
+                        code or job_errors.classify_message(err or msg)
+                    )
                 elif prog is not None:
                     # Monotonic non-decreasing across the whole job (card
                     # t_14ac6b49 AC2): a stage publish never rewinds.
@@ -1718,7 +1746,11 @@ def process_job_background(token: str, audio_path: str, filename: str,
         update_state("cancelled", msg="Cancelled by client request")
     except Exception as exc:
         logger.exception("Background job failed for token %s", token)
-        update_state("failed", err=str(exc))
+        # AC1/AC7 (card t_1799d07f): classify from the exception object AND
+        # its raw string; anything outside the vocabulary lands on the
+        # honest INTERNAL catch-all — a failed job always gets a non-empty
+        # code, and the failure path itself must never crash.
+        update_state("failed", err=str(exc), code=job_errors.classify(exc))
     finally:
         # Deregister only AFTER the terminal publish above: until this
         # returns, a DELETE must still find the live control, never the
@@ -2428,6 +2460,10 @@ def _session_job_entries(
             entry["estimated_completion_at"] = _iso_utc(est[1]) if est else None
         if s.get("status") == "failed":
             entry["error"] = s.get("error") or s.get("message") or ""
+        # Card t_1799d07f: the machine-readable code is present on every
+        # entry (null while in flight, resolved on read for pre-card
+        # records so terminal jobs never show up code-less).
+        entry["error_code"] = _terminal_error_code(s)
         entries.append(entry)
     return entries, len(mine)
 
@@ -2615,6 +2651,9 @@ async def get_job_status(token: str):
         # Pre-stage job dirs (persisted before this API version): mirror the
         # coarse status so the field is never absent from a response.
         state["stage"] = state.get("status", "unknown")
+    # Card t_1799d07f: same never-absent discipline for the error code —
+    # present and null on in-flight jobs, resolved on terminal ones.
+    state["error_code"] = _terminal_error_code(state)
     if state.get("status") == "queued":
         # queue_position is the 1-based rank in the FAIR-SCHEDULED execution
         # order the worker actually follows (card t_4b40acfd): per-session
@@ -2714,6 +2753,8 @@ async def cancel_job(token: str):
             # client can rely on.)
             state.setdefault("completed_at", time.time())
             state["message"] = "Cancelled by client while queued"
+            # AC7 (card t_1799d07f): cancelled is NOT a failure — no
+            # error_code is written; cancel and failure stay distinct.
             _write_state(state)
             (JOBS_DIR / token / "audio_source.wav").unlink(missing_ok=True)
             return {"token": token, "status": "cancelled"}

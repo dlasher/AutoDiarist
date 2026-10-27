@@ -182,4 +182,50 @@ segment counts, timings. Inspect actual transcript text with local tools
   inside the engine until `CRISPASR_TIMEOUT_SECONDS` fires.
 - Uploaded file type is validated by **extension** (`wav mp3 m4a aac ogg
   flac`), not sniffing; a mislabeled file fails later in ffmpeg decode with
-  a `failed` job instead of a `415`.
+  a `failed` job (`error_code: BAD_INPUT`) instead of a `415`.
+
+
+## Error codes on failed jobs (card t_1799d07f)
+
+Every `failed` job's `status.json` (and both GET responses) carries
+`error_code` next to the unchanged `error`/`message` strings, so the
+failure classes with known fixes read as data instead of a stack trace:
+
+- **`OUT_OF_MEMORY`** — VRAM exhaustion. The deterministic signature from
+  the concurrency findings, now recognised in the classifier:
+  `ggml_gallocr_reserve_n_impl: failed to allocate CUDA0 buffer ...` plus
+  `nemotron: sched alloc encoder graph failed` (3/4 of every N=4 wave on
+  the 4 GB NVIDIA card). Fix: set `MAX_PROCESSING_GLOBAL` to the host's
+  measured ceiling (**3** on that box). The sampler's own
+  `VRAM_LIMIT_MIB` kill lands here too.
+- **`TIMEOUT`** — `CRISPASR_TIMEOUT_SECONDS` expired (default 1800; the
+  deployed hosts run 10800). Fix: raise the ceiling or split the input.
+- **`UNSUPPORTED_AUDIO`** — ffmpeg/ffprobe could not decode the upload
+  (mislabeled extension passes admission and fails here). Client-side
+  problem; identical bytes will fail identically.
+- **`INPUT_TOO_LARGE`** — the recorded text matches an upload over
+  `MAX_UPLOAD_BYTES` (the HTTP 413 phrasing).
+- **`ENGINE_CRASHED`** — crispasr exited non-zero (or produced unusable
+  output) with none of the above signatures. This one IS a bug report:
+  include the raw `error` string.
+- **`CONFIG_ERROR`** — deployment env, not the job: the loud
+  missing-sherpa-assets guard (`SHERPA_SEGMENT_MODEL`/`SHERPA_EMBEDDING_MODEL`
+  not found) or an unsupported `DIAR_METHOD`. Retrying the same job
+  cannot help; fix the container env.
+- **`INTERNAL`** — honest catch-all (unexpected exceptions,
+  `Empty transcript result.`). Do not infer a capacity problem from it;
+  read the message.
+
+Cancelled jobs are NOT failures and carry no code — `error_code: null`
+means "not a failed job".
+
+The vocabulary and the ordered classification rules live in
+`pipeline/errors.py`; classification is total (any recorded string maps
+to exactly one documented code, never a raise) and runs against the raw
+string, so job records persisted before this feature also surface a code
+when read through the API. If a new engine failure keeps landing on
+`INTERNAL`, add its signature to the pattern lists in that module, add
+the verbatim `error` string of the failing job as a test in
+`tests/pipeline/test_error_codes.py`, and extend the README *Error
+codes* table only if you introduce a NEW class (the AC6 pin fails on any
+code without a documentation row).

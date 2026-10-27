@@ -314,6 +314,36 @@ its name, type, or semantics.
 `tests/api/test_status_fields.py` (8 tests) pins every invariant, incl. a
 full lifecycle table for `completed_at` and a simulated crash/restart
 reclaim. Suite 508 -> 516 collected, all green.
+## [Unreleased] — machine-readable error codes on failed jobs + mechanically verified env-var catalogue (card t_1799d07f)
+
+**Additive.** Every `failed` job now carries a stable `error_code` next to
+the existing `error`/`message` strings — unchanged in content and
+semantics. Vocabulary (defined and documented in `pipeline/errors.py` and
+in the README *Error codes* table): `OUT_OF_MEMORY` (VRAM exhaustion, incl.
+the deterministic N=4 `ggml_gallocr_reserve_n_impl` / `nemotron: sched
+alloc encoder graph failed` signature — the fix is lowering
+`MAX_PROCESSING_GLOBAL`, 3 on the 4 GB NVIDIA host), `TIMEOUT`
+(`CRISPASR_TIMEOUT_SECONDS` ceiling — raise it), `UNSUPPORTED_AUDIO`
+(undecodable upload — client-side), `INPUT_TOO_LARGE` (over the
+`MAX_UPLOAD_BYTES` 413 cap), `ENGINE_CRASHED` (unclassified engine failure
+— bug report), `CONFIG_ERROR` (deployment env, e.g. the loud missing-sherpa
+assets guard), and `INTERNAL` (honest catch-all). CANCELLED jobs are NOT
+failures and carry no code — cancel and failure stay distinct. `GET
+/v1/jobs/{token}` and the listing always include `error_code` (null unless
+the job failed); records persisted before this card are classified from
+their raw error string on read. Classification is total: any string in,
+exactly one documented code out, never a raise — pinned by a test that
+compares the emitted vocabulary with the README table.
+
+Also new: `pipeline/config_vars.py`, the complete catalogue of the app's
+58 env knobs (name, default, where, effect), verified mechanically against
+the tree by `scripts/check-config-catalog.py` (exit 1 on any uncatalogued
+knob, dead entry, or drifted default; wired into
+`tests/pipeline/test_config_catalog.py`). Existing CONFIG.md sections were
+not rewritten — the two new documentation passages are appended at EOF (the
+config-docs card t_16c871a6 owns the prose structure). One existing test's
+strict listing-key assertion (`tests/api/test_jobs_listing.py`) was
+extended for the new additive `error_code` key.
 
 ## [Unreleased] — falsified "identical output" A/B claim corrected; both hosts' service-level concurrency curves published (card t_ee479fdf)
 
