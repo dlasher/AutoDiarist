@@ -158,9 +158,15 @@ ticket — arrival order), `queued_at`, `progress`, `message`, `filename`,
 probe could not read the file), `audio_sha256` (the audio content
 fingerprint — see *Audio content fingerprint* below; `null` for undecodable
 uploads and for jobs persisted before the field existed), plus the
+probe could not read the file), `audio_duration_seconds` (card t_73254ea6:
+the same probed audio length under an unambiguous name, for clients
+computing ratio-to-realtime; kept in lockstep with `duration_seconds` —
+refreshed from the decode-time probe of the real 16k wav, and `null` under
+exactly the same condition), plus the
 bookkeeping fields `session` (hashed session identity), `session_ident`
 (hashed session id, see *Session identity*) and `audio_path` (server-local
 path) — treat those as opaque.
+
 `status` is one of `queued`, `processing`, `done`, `failed`, `cancelled`:
 
 - `queued` — adds `queue_position`: the job's **1-based rank in the
@@ -204,6 +210,25 @@ path) — treat those as opaque.
   `error` (the exception message from the worker).
 - `cancelled` — `message: "Cancelled by client while queued"` plus
   `cancelled_at`; `stage`/`progress` freeze at their last published values.
+
+**Timestamps (card t_73254ea6).** The lifecycle clock fields are
+`created_at` (admission), `queued_at`, `started_at` (set when a worker
+claims the job) and `completed_at`. `completed_at` is written by the same
+code path, in the same lock, as the terminal status itself: present on
+EVERY terminal job (`done`, `failed`, `cancelled` — the first terminal
+transition wins) and **absent from the JSON** on every non-terminal one
+(`queued`, `processing`) — absent, not `null`. A terminal job without
+`completed_at` is a bug, not a state; it lets a client compute the job's
+own elapsed time without wall-clock polling.
+
+**Restart-reclaimed jobs.** If the service restarts while a job is
+`processing`, the boot pass requeues it: `status` returns to `queued`
+with `progress` preserved (never rewound). This is visible in the payload
+three ways (card t_73254ea6): `message: "Requeued after service restart"`,
+plus the marker fields `interrupted_at` (when the reclaim ran) and
+`recovered_reason: "service_restart"`. No distinct status value is
+introduced — the reclaimed job stays a normal `queued` job to the
+scheduler, and the markers survive its eventual completion as history.
 
 #### Wait estimates (ESTIMATES, never guarantees)
 

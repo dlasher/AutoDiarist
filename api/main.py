@@ -682,6 +682,14 @@ def _requeue_orphans_locked() -> tuple[int, int]:
             st["status"] = "queued"
             st["stage"] = "queued"
             st["message"] = "Requeued after service restart"
+            # Card t_73254ea6 AC6: stamp the job so a client watching only
+            # the status payload can tell "the service restarted" from
+            # "nothing is happening". Explicit FIELDS, never a distinct
+            # status — a new scheduler-visible state value would be a
+            # queue-corruption risk. The message carries the same story for
+            # status-only pollers.
+            st["interrupted_at"] = time.time()
+            st["recovered_reason"] = "service_restart"
             _write_state(st)
             requeued += 1
     if requeued:
@@ -1517,6 +1525,14 @@ def process_job_background(token: str, audio_path: str, filename: str,
                 if st_data.get("status") in ("cancelled",):
                     return
                 st_data["status"] = st
+                # Card t_73254ea6 AC1-AC4: completed_at is written by THIS
+                # code path, atomically with the status, under the same
+                # _queue_lock. Terminal states carry it (first terminal
+                # transition wins), non-terminal states never do.
+                if st in ("done", "failed", "cancelled"):
+                    st_data.setdefault("completed_at", time.time())
+                else:
+                    st_data.pop("completed_at", None)
                 prev = float(st_data.get("progress") or 0.0)
                 if stage is not None:
                     st_data["stage"] = stage
@@ -1524,13 +1540,17 @@ def process_job_background(token: str, audio_path: str, filename: str,
                     # AC1 refresh (card t_b3ae9366): the decode-time probe of
                     # the real 16k wav replaces the admission-time estimate.
                     st_data["duration_seconds"] = float(dur)
+                    # Card t_73254ea6 AC5: the unambiguous audio-length field
+                    # is refreshed in lockstep; duration_seconds keeps its
+                    # existing semantics untouched.
+                    st_data["audio_duration_seconds"] = float(dur)
                 if st == "cancelled":
                     # Terminal stamp symmetry with the queued-cancel path
                     # (card t_fef54150): progress/stage keep their monotonic
                     # positions — a cancellation is a terminal, never a
                     # rewind and never success-ish.
                     st_data["cancelled_at"] = round(time.time(), 3)
-                elif st == "failed":
+                if st == "failed":
                     # Stage stays where the work broke; progress keeps its
                     # monotonic position but 1.0 is reserved for done, so a
                     # failure never looks success-ish.
@@ -1939,6 +1959,15 @@ async def lifespan(app: FastAPI):
     # WITH cancel_requested lands terminal cancelled — a restart can never
     # resurrect a client-cancelled job onto the GPU.
     _requeued, _cancel_finalised = _requeue_orphans_locked()
+    reclaimed = 0
+    # Card t_73254ea6 AC6: a reclaim stamps the job so a client watching
+    # only the status payload can tell "the service restarted" from
+    # "nothing is happening". Chosen model: EXPLICIT FIELDS on the requeued
+    # job (status stays 'queued'), never a distinct status — a new state
+    # value the scheduler, in-flight count, fair-share ordering, queue-depth
+    # accounting and the retention/disk sweeps must all learn is a
+    # queue-corruption risk. The message carries the same story for
+    # status-only pollers.
 
     app.state.wake = _WakeHub()
     worker_enabled = os.environ.get("QUEUE_WORKER_ENABLED", "1") == "1"
@@ -2193,6 +2222,11 @@ async def create_job(request: Request, response: Response, file: UploadFile = Fi
             # file survives boot-resume because every state update is a
             # read-modify-write, never a rebuild.
             "audio_sha256": audio_sha256,
+            # Card t_73254ea6 AC5: the unambiguous audio-length field the
+            # client needs for RTF, kept in lockstep with duration_seconds
+            # (whose name and semantics stay untouched). None == probe
+            # could not read the file, same rule as duration_seconds.
+            "audio_duration_seconds": duration_seconds,
         }
         # Cache opt-in stamp (card t_ac748379 C-EN4): persisted at admission
         # only when ON, so a cache-off request's state stays byte-for-byte
@@ -2673,6 +2707,12 @@ async def cancel_job(token: str):
         if current == "queued":
             state["status"] = "cancelled"
             state["cancelled_at"] = time.time()
+            # Card t_73254ea6 AC2: this is the only path that writes the
+            # terminal 'cancelled' status, so completed_at is stamped here,
+            # in the same lock as the status change. (cancelled_at is a
+            # legacy field; completed_at is the terminal-state clock every
+            # client can rely on.)
+            state.setdefault("completed_at", time.time())
             state["message"] = "Cancelled by client while queued"
             _write_state(state)
             (JOBS_DIR / token / "audio_source.wav").unlink(missing_ok=True)
