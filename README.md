@@ -99,6 +99,7 @@ Answers `200` for every session, including a brand-new one (empty list):
 
 ```json
 {"jobs": [{"token": "6a7f…uuid4…", "status": "queued", "progress": 0.0,
+           "progress_percent": 0,
            "stage": "queued", "source": "meeting.wav",
            "created_at": 1760000000.1, "queue_position": 1,
            "estimated_wait_seconds": 1273.5,
@@ -106,7 +107,8 @@ Answers `200` for every session, including a brand-new one (empty list):
  "count": 1, "total": 1, "limit": 50}
 ```
 
-- Every entry carries `token`, `status`, `progress`, `stage`, `source` (the
+- Every entry carries `token`, `status`, `progress`, `progress_percent`
+  (integer 0..100 view of the same banded float), `stage`, `source` (the
   uploaded filename) and `created_at`. `queued` entries add `queue_position`
   (the same fair-scheduled rank the poll endpoint reports) plus the
   queue-aware wait estimate `estimated_wait_seconds` /
@@ -265,8 +267,16 @@ The value is still an ESTIMATE: progress bands are ordinal markers of
 work, not time (the transcribing band is where real per-chunk boundaries
 land, so mid-run estimates sharpen exactly when the engine streams its
 `pass n/m` reports); early emissions on long files tend optimistic and
-converge as chunks complete. The queued-side model (above) and every
-queued job's `estimated_wait_seconds` are untouched by this feature.
+converge as chunks complete. A `cancelling` job (in-flight cancel) or a
+terminal one reports no completion estimate — `stage`/`progress` remain,
+the ETA fields are simply absent/null. The queued-side model (above) and
+every queued job's `estimated_wait_seconds` are untouched by this feature.
+
+Alongside the banded float `progress`, every status payload (poll and
+listing, all states) now also carries `progress_percent`: an integer
+`0..100` derived from the same published number (`round(progress × 100)`),
+so a client can render a bar without inventing its own rounding. It is
+band-consistent by construction and monotonic because `progress` is.
 
 #### Progress stages
 

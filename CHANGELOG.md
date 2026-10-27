@@ -33,6 +33,16 @@ Honesty machinery, because the card's traps are real:
   under the queue lock; queued jobs' `estimated_wait_seconds` arithmetic is
   byte-for-byte untouched (regression-pinned), and the `POST` 202 body
   grows no new field.
+* AC6: `progress_percent` — integer 0..100 view of the banded float,
+  published on every status payload (poll + listing, all states) so a
+  client renders a bar without inventing rounding. Band-consistent and
+  monotonic by construction (it is the same published number, rounded).
+  The listing's documented base key set gains it (the exact-keys pin in
+  `test_jobs_listing.py` was updated accordingly — the one existing-test
+  edit, and exactly the "documented behaviour the AC changes" carve-out).
+* `cancelling`/terminal payloads carry no completion estimate (AC4: a
+  done job reports no remaining; scope-5: an in-flight cancel never fakes
+  one).
 * `PROCESSING_SECONDS_PER_AUDIO_SECOND=0` disables the whole feature, like
   the queue side.
 
@@ -41,11 +51,13 @@ New state fields (append-only, never reset by design): `attempt_started_at`
 ratchet memory is pruned at both ends of a job's life (claim, terminal
 publish), so it cannot grow with the jobs directory.
 
-`tests/api/test_running_eta.py` (17 tests) pins every AC: pure math,
+`tests/api/test_running_eta.py` (22 tests) pins every AC: pure math
+(50%-in `remaining <= elapsed`, convergence on a steady simulated series),
 ratchet monotonicity, freeze/null semantics, gate behaviour, the
-t_b3ae9366 regression guard, cross-surface agreement, and one end-to-end
+t_b3ae9366 regression guard, cross-surface agreement, `progress_percent`
+consistency/monotonicity, done/cancelling non-emission, and one end-to-end
 drive through the real mock pipeline + production claim path polled live
-while `processing` (AC6). 523 passed / 2 skipped full suite; no GPU.
+while `processing`. 528 passed / 2 skipped full suite; no GPU.
 
 ## [Unreleased] — falsified "identical output" A/B claim corrected; both hosts' service-level concurrency curves published (card t_ee479fdf)
 

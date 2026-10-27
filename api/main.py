@@ -776,6 +776,19 @@ def _processing_remaining_seconds(processing: dict | None, rate: float,
 #     promised completion time (fresh or null, per the card).
 
 
+def _progress_percent(state: dict) -> int:
+    """Integer 0..100 view of the banded float `progress` (card t_d64bdf29
+    AC6): clients render a bar without inventing their own rounding, and
+    the value stays consistent with the stage bands by construction (it is
+    the same published number, rounded) and monotonic (progress itself is
+    clamped non-decreasing). Unparseable/missing progress -> 0."""
+    try:
+        value = float(state.get("progress") or 0.0)
+    except (TypeError, ValueError):
+        return 0
+    return max(0, min(100, round(value * 100)))
+
+
 def _running_estimate(state: dict, now: float) -> tuple[float, float] | None:
     """Pure observed-rate math: (remaining_seconds, completion_epoch) or
     None when no honest estimate exists yet. Never touches the ratchet."""
@@ -1670,6 +1683,9 @@ def _session_job_entries(
             "token": s.get("token"),
             "status": s.get("status"),
             "progress": s.get("progress", 0.0),
+            # AC6 (card t_d64bdf29): integer percent view, same value the
+            # poll reports, so one field answers every listing renderer.
+            "progress_percent": _progress_percent(s),
             "stage": s.get("stage") or s.get("status"),
             "source": s.get("filename", "unknown"),
             "created_at": _listing_created_at(s),
@@ -1818,6 +1834,9 @@ async def get_job_status(token: str):
             state["estimated_wait_seconds"] = None
             state["estimated_completion_at"] = None
             state["estimated_remaining_seconds"] = None
+    # AC6 (card t_d64bdf29): integer percent view of the banded float on
+    # every status payload — queued, running, and terminal alike.
+    state["progress_percent"] = _progress_percent(state)
     return JobStatus(**state)
 
 

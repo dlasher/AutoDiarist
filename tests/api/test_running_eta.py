@@ -318,7 +318,94 @@ def test_post_admission_shape_unchanged(tmp_path, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# Attempt-lifecycle plumbing: ratchet memory pruning + claim stamps.
+# AC6 — progress_percent: integer 0..100 published alongside the banded
+# float `progress`, consistent with the stage bands, monotonic.
+# ---------------------------------------------------------------------------
+
+def test_progress_percent_exposed_on_poll_and_listing(tmp_path, monkeypatch):
+    client = _setup(tmp_path, monkeypatch)
+    token = _seed(stage="transcribing", progress=0.42, started_at=time.time(),
+                  last_progress_at=time.time(),
+                  session_ident=main._hash_ident("session:sessC"))
+    body = client.get(f"/v1/jobs/{token}").json()
+    assert body["progress"] == 0.42
+    assert body["progress_percent"] == 42
+    assert isinstance(body["progress_percent"], int)
+    entry = next(j for j in client.get("/v1/jobs", headers={
+        main._session_header_name(): "sessC"}).json()["jobs"] if j["token"] == token)
+    assert entry["progress_percent"] == 42
+
+
+def test_progress_percent_matches_band_floor_and_done(tmp_path, monkeypatch):
+    client = _setup(tmp_path, monkeypatch)
+    fresh = _seed(stage="decoding", progress=main.STAGE_PROGRESS["decoding"])
+    done = _seed(status="done", stage="done", progress=1.0)
+    assert client.get(f"/v1/jobs/{fresh}").json()["progress_percent"] == 5
+    d = client.get(f"/v1/jobs/{done}").json()
+    assert d["progress_percent"] == 100
+    # AC4: a finished job reports NO remaining estimate.
+    assert "estimated_remaining_seconds" not in d
+    assert d.get("estimated_completion_at") is None
+
+
+def test_progress_percent_monotonic_and_band_consistent_over_stage_sweep():
+    last = -1
+    for stage in main.STAGE_ORDER:
+        for frac in (0.0, 0.25, 0.5, 0.75, 1.0):
+            if stage == "done":
+                frac = 0.0
+            prog = main._stage_progress(stage, frac)
+            pct = main._progress_percent({"progress": prog})
+            # Consistent with the banded float: the int is the same value
+            # rounded to whole percent, and never rewinds across the sweep.
+            assert pct == round(prog * 100)
+            assert 0 <= pct <= 100
+            assert pct >= last, (stage, frac, pct, last)
+            last = pct
+
+
+def test_estimate_converges_on_a_steady_simulated_series(tmp_path, monkeypatch):
+    # AC2 wording: ~50% in, remaining never exceeds elapsed; with a steady
+    # observed rate the completion estimate converges to the real finish
+    # time as progress advances (simulated series — no GPU, no sleeps).
+    _setup(tmp_path, monkeypatch)
+    total = 600.0
+    for frac in (0.5, 0.7, 0.9, 0.95, 0.99):
+        now = total * frac
+        est = main._running_estimate({
+            "status": "processing", "progress": frac,
+            "started_at": 0.0}, now)
+        assert est is not None
+        elapsed = now
+        assert est[0] <= elapsed + 1e-9          # ~50%: remaining <= elapsed
+        assert abs(est[0] - (total - now)) < 1e-6  # exact convergence
+        assert abs(est[1] - total) < 1e-6
+
+
+# ---------------------------------------------------------------------------
+# Scope 5 — a `cancelling`/cancelled path must not break or fake the ETA.
+# ---------------------------------------------------------------------------
+
+def test_cancelling_and_cancelled_jobs_carry_no_completion_estimate(tmp_path, monkeypatch):
+    client = _setup(tmp_path, monkeypatch)
+    t = time.time()
+    cancelling = _seed(status="cancelling", stage="spellcheck", progress=0.75,
+                       started_at=t - 100.0, last_progress_at=t - 1.0,
+                       message="Cancellation requested")
+    body = client.get(f"/v1/jobs/{cancelling}").json()
+    assert body["status"] == "cancelling"
+    assert "estimated_remaining_seconds" not in body
+    assert body.get("estimated_completion_at") is None
+    assert body["progress_percent"] == 75
+    gone = _seed(status="cancelled", stage="queued", progress=0.0,
+                 cancelled_at=t)
+    b2 = client.get(f"/v1/jobs/{gone}").json()
+    assert b2["progress_percent"] == 0
+    assert "estimated_remaining_seconds" not in b2
+
+
+# ---------------------------------------------------------------------------
+# Plumbing guards.
 # ---------------------------------------------------------------------------
 
 def test_ratchet_memory_pruned_by_claim_and_terminal_update(tmp_path, monkeypatch):
@@ -343,7 +430,8 @@ def test_ratchet_memory_pruned_by_claim_and_terminal_update(tmp_path, monkeypatc
 
 
 # ---------------------------------------------------------------------------
-# AC6 — end to end against the real mock pipeline: claimed through the
+# End to end against the real mock pipeline (the pinned analogue of the
+# card's live test-host run): claimed through the
 # production path (attempt_started_at written by code, not seeded), with a
 # pause injected at a stage seam so the API can be polled WHILE processing.
 # The estimate appears only once progress is meaningful, never inflates
@@ -432,7 +520,7 @@ def test_end_to_end_running_estimate_tracks_the_mock_run(tmp_path, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# Plumbing guards.
+# Config validation.
 # ---------------------------------------------------------------------------
 
 
