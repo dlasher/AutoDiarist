@@ -33,8 +33,8 @@ worker stages per job (api/main.py process_job_background):
   speaker self-ID      (pipeline.self_identification, weighted evidence)
   render               (pipeline.renderer -> markdown_report.md)
   v
-GET    /v1/jobs                  -> list MY jobs (session-scoped; newest first; ?limit=1..200, default 50; + ETA for queued; + processing_count = service-wide in-flight)
-GET    /v1/jobs/{token}          -> status (+ queue_position and queue-aware ETA while queued; stage + monotonic progress)
+GET    /v1/jobs                  -> list MY jobs (session-scoped; newest first; ?limit=1..200, default 50; + ETA for queued + running-phase ETA for processing; + processing_count = service-wide in-flight)
+GET    /v1/jobs/{token}          -> status (+ queue_position and queue-aware ETA while queued; running-phase ETA while processing; stage + monotonic progress)
 DELETE /v1/jobs/{token}          -> cancel a queued job (409 while processing)
 GET    /v1/jobs/{token}/download -> output_result.json (default) or ?format=md
 ```
@@ -99,6 +99,7 @@ Answers `200` for every session, including a brand-new one (empty list):
 
 ```json
 {"jobs": [{"token": "6a7f…uuid4…", "status": "queued", "progress": 0.0,
+           "progress_percent": 0,
            "stage": "queued", "source": "meeting.wav",
            "created_at": 1760000000.1, "queue_position": 1,
            "estimated_wait_seconds": 1273.5,
@@ -106,13 +107,18 @@ Answers `200` for every session, including a brand-new one (empty list):
  "count": 1, "total": 1, "limit": 50}
 ```
 
-- Every entry carries `token`, `status`, `progress`, `stage`, `source` (the
+- Every entry carries `token`, `status`, `progress`, `progress_percent`
+  (integer 0..100 view of the same banded float), `stage`, `source` (the
   uploaded filename) and `created_at`. `queued` entries add `queue_position`
   (the same fair-scheduled rank the poll endpoint reports) plus the
   queue-aware wait estimate `estimated_wait_seconds` /
   `estimated_completion_at` — the SAME live values `GET /v1/jobs/{token}`
   reports (see *Wait estimates*; `null` when no honest estimate exists,
-  absent when ETA emission is disabled); `failed` entries
+  absent when ETA emission is disabled); `processing` entries add the
+  running-phase ETA trio (`estimated_remaining_seconds` +
+  `estimated_completion_at`, with `estimated_wait_seconds` aliasing the
+  remaining seconds) — the SAME live ratchet values the poll reports (see
+  *Running-phase ETA*); `failed` entries
   add `error`. `cancelled` jobs stay listed — terminal states are still part
   of "what did I submit".
 - Order: newest-first (`created_at` desc, stable `seq` desc tiebreak).
@@ -159,11 +165,19 @@ path) — treat those as opaque.
   exists (this job's duration probe failed at admission), and the fields
   are omitted entirely when `PROCESSING_SECONDS_PER_AUDIO_SECOND=0`
   disables ETA emission.
-- `processing` — adds `started_at`; `stage` moves through the pipeline in
-  order while `progress` advances monotonically and `message` carries the
-  stage text (e.g. `Claimed by worker`, `Transcribing pass 2/4`). The two
-  `estimated_*` fields are present but `null`: a running job is past the
-  queue, so `stage`/`progress` carry the truth instead.
+- `processing` — adds `started_at` and `attempt_started_at` (both stamped
+  on every claim, reclaims included — they always mark THIS attempt and
+  are equal; `attempt_started_at` is the alias the running-phase estimator
+  reads), `stage` moves through
+  the pipeline in order while `progress` advances monotonically and
+  `message` carries the stage text (e.g. `Claimed by worker`,
+  `Transcribing pass 2/4`). It also carries the running-phase ETA (see
+  *Running-phase ETA* below): `estimated_remaining_seconds` +
+  `estimated_completion_at` derived from the job's own observed progress,
+  with `estimated_wait_seconds` aliasing the remaining seconds. All three
+  are present but `null` until an honest estimate exists (fresh job, no
+  start stamp, or progress frozen past the freshness allowance) — null,
+  never stale.
 - `done` — `stage: "done"`, `progress: 1.0`, `message: "Transcription complete."`.
   The result itself is fetched from the download endpoint at
   `/v1/jobs/{token}/download` (the poll payload does not carry a URL field).
@@ -208,6 +222,71 @@ cost the linear model does not see). Observed wall time can and will
 differ: treat the numbers as a planning estimate, **not a service-level
 guarantee**. A job whose own duration probe failed shows `null` — the API
 never fabricates a duration for the job you are asking about.
+
+#### Running-phase ETA (V1.5.x, card t_d64bdf29)
+
+For a `processing` job the waiting happens in the run itself, so the poll
+(now and the session listing's processing entries) additionally answers
+*when will this finish* — derived from the job's **own observed rate**,
+never from the fixed linear model above:
+
+```
+fraction  = published monotonic `progress` (real work boundaries only)
+rate      = fraction / wall seconds since `attempt_started_at`
+remaining = (1 - fraction) / rate        -> estimated_remaining_seconds
+                                       (+ estimated_completion_at, UTC)
+```
+
+`estimated_wait_seconds` aliases `estimated_remaining_seconds` on a
+running payload — one question ("when is my result ready?") keeps one
+field name across both phases.
+
+Honesty rules, because the first observation of a job is its worst
+observation:
+
+* **Emission gates.** Null until the job genuinely crossed
+  `RUNNING_ETA_MIN_PROGRESS` (default `0.30` — the transcribing band's
+  lower edge, so decode + per-run startup cost is fully behind the
+  elapsed-time window instead of masquerading as steady-state rate), and
+  — when the duration is known — until it has lived longer than the
+  linear model's startup floor for that duration. A fresh job is null,
+  never a fabricated value.
+* **Never inflates.** The published value ratchets down: a real progress
+  advance may tighten the estimate (ratchet min), but a poll can never
+  see the number grow, even when the job slows down or the service
+  restarted mid-run. On a restart there is no started_at-preservation
+  trick: the claim re-stamps both clocks (they are always equal), drops
+  the dead attempt's estimate memory, and keeps the preserved `progress`
+  value only as a no-regression floor. The honesty comes from the gates:
+  while progress sits frozen at that preserved value the freeze guard is
+  already engaged (the boot reclaim leaves `last_progress_at` in the
+  past) and the startup floor holds emission null — the optimistic
+  restored-fraction-over-new-clock reading is never published. An
+  estimate resumes only once the new attempt genuinely advances past the
+  preserved fraction (pinned by the reclaim regression test).
+* **Fresh or null.** Progress freezing is normal (spellcheck /
+  llm_cleanup publish at band edges only). A held value survives only
+  until `RUNNING_ETA_REANCHOR_SECONDS` (default `120`) without a real
+  advance, or until it passes its own promised completion time — then it
+  goes null until progress genuinely moves again. A value computed long
+  ago that reality has not reconfirmed is worse than no value.
+* **Same kill switch.** `PROCESSING_SECONDS_PER_AUDIO_SECOND=0` disables
+  running-phase ETA emission too.
+
+The value is still an ESTIMATE: progress bands are ordinal markers of
+work, not time (the transcribing band is where real per-chunk boundaries
+land, so mid-run estimates sharpen exactly when the engine streams its
+`pass n/m` reports); early emissions on long files tend optimistic and
+converge as chunks complete. A `cancelling` job (in-flight cancel) or a
+terminal one reports no completion estimate — `stage`/`progress` remain,
+the ETA fields are simply absent/null. The queued-side model (above) and
+every queued job's `estimated_wait_seconds` are untouched by this feature.
+
+Alongside the banded float `progress`, every status payload (poll and
+listing, all states) now also carries `progress_percent`: an integer
+`0..100` derived from the same published number (`round(progress × 100)`),
+so a client can render a bar without inventing its own rounding. It is
+band-consistent by construction and monotonic because `progress` is.
 
 #### Progress stages
 
