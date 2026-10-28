@@ -45,6 +45,7 @@ AUDIO = b"RIFF....WAVEfmt ....data...."
 # fingerprint is pure-Python sha256 over the frames — same construction as
 # test_audio_hash.py's _golden/_wav_bytes pair.
 PCM = bytes(bytearray((i * 37) % 256 for i in range(16000)))  # 1 s @ 16 kHz
+PCM2 = bytes(bytearray((i * 89 + 11) % 256 for i in range(16000)))  # a second clip
 
 pytestmark = pytest.mark.skipif(
     shutil.which("ffmpeg") is None,
@@ -65,6 +66,7 @@ def _wav_bytes(pcm, rate=16000):
 
 
 WAV = _wav_bytes(PCM)
+WAV2 = _wav_bytes(PCM2)
 
 
 def _setup(tmp_path, monkeypatch, **env):
@@ -445,6 +447,48 @@ def test_stale_row_is_deleted_and_job_reruns(tmp_path, monkeypatch):
         assert body["cache_hit"] is False
         assert body["status"] == "queued"  # fresh run took over
     assert all(x[3] != src for x in _rows(root))
+
+
+def test_mid_hit_race_falls_through_without_500(tmp_path, monkeypatch):
+    """The lookup->copy race window (a concurrent sweep evicts the source
+    AFTER the row validated): the request must still answer today's 202
+    queued fresh run — never a 500 — with the row purged and the uploaded
+    audio intact for the worker."""
+    root = _setup(tmp_path, monkeypatch)
+    src, _ = _seed_done_job(root, "s1")
+    real_lookup = main._cache_lookup
+
+    def racing_lookup(jobs_dir, s, fp, sess):
+        found = real_lookup(jobs_dir, s, fp, sess)
+        if found is not None:                     # evict right after lookup
+            shutil.rmtree(jobs_dir / found)
+        return found
+    monkeypatch.setattr(main, "_cache_lookup", racing_lookup)
+    with TestClient(main.app) as client:
+        r = _post(client, "s1", x_cache="1", audio=WAV)
+        assert r.status_code == 202
+        body = r.json()
+        assert body["cache_hit"] is False and body["status"] == "queued"
+        tok = body["token"]
+    assert (root / tok / "audio_source.wav").read_bytes() == WAV
+    assert not (root / tok / "output_result.json").exists()  # partial copies cleaned
+    assert all(x[3] != src for x in _rows(root))             # row purged
+
+    # cancelled-source arm: a source that terminalised cancelled after the
+    # lookup must never be served as a hit (serve-time revalidation).
+    src2, _ = _seed_done_job(root, "s1", filename="two.wav", audio=WAV2)
+    st = _state(root, src2)
+    st["status"] = "cancelled"
+    (root / src2 / "status.json").write_text(json.dumps(st))
+    with TestClient(main.app) as client:
+        r2 = _post(client, "s1", x_cache="1", audio=WAV2)
+        assert r2.status_code == 202
+        assert r2.json()["cache_hit"] is False
+    monkeypatch.setattr(main, "_cache_lookup", lambda *a, **k: src2)
+    with TestClient(main.app) as client:
+        r3 = _post(client, "s1", x_cache="1", audio=WAV2)
+        assert r3.status_code == 202                # never a 500
+        assert r3.json()["cache_hit"] is False      # revalidated as MISS
 
 
 def test_legacy_null_hash_never_keys_a_cache(tmp_path, monkeypatch):

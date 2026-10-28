@@ -61,7 +61,7 @@ interaction matrix are documented in one place: CONFIG.md →
   (self-healing). Legacy jobs with a null `audio_sha256` never key a row:
   MISS, fresh run, no crash.
 
-Tests: `tests/api/test_cache.py` (19 tests — malformed-header 400 +
+Tests: `tests/api/test_cache.py` (20 tests — malformed-header 400 +
 no-trace, empty==absent today's path, case/space normalisation, duplicate
 header lines all-validated, kill switch obeyed-as-absent (incl. malformed
 header cell of the 2×2 matrix) and use-time re-read, no-header-no-store,
@@ -69,8 +69,9 @@ opt-in stamp + row shape, store-rule arms, hit immediate-done +
 never-queued + visibility on 202/poll/listing/history,
 one-config-input-change MISS, fingerprint stability, cross-session leak,
 byte-identical + survives-source-deletion artifacts, opt-in-vs-off
-identical content, stale-row self-heal, legacy-null-hash MISS, age-sweep
-and disk-pressure row purges). Suite: 586 passed, 2 skipped (main
+identical content, stale-row self-heal + serve-time revalidation
+(vanished and cancelled-source arms), legacy-null-hash MISS, age-sweep
+and disk-pressure row purges). Suite: 587 passed, 2 skipped (main
 baseline 567 + 2 skipped); ruff unchanged (7 pre-existing findings, none
 introduced).
 
