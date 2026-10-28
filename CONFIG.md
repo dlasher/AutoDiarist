@@ -231,6 +231,63 @@ COMPOSES with card t_dbad2235 instead of fighting it.
 | `DISK_MIN_FREE_MIB` | `8192` | Disk-pressure watermark on the filesystem backing `JOBS_DIR` (`shutil.disk_usage`). While free space is below it, job dirs are evicted oldest-mtime-first until the watermark is recovered. A `processing` job is never evicted; `queued` jobs are evictable (the next POST admission reuses their `seq` slots). `0` disables eviction. The mounted CrispASR cache volume is never touched. |
 | `DISK_CHECK_INTERVAL_SECONDS` | `300` | Interval between disk-pressure checks; the check also runs once at boot. |
 
+## Transcript cache — two controls (card t_ac748379)
+
+The cache serves a finished transcript to a client that re-uploads audio it
+has already transcribed. Two controls with OPPOSITE polarity govern it, and
+this section is the single place their interaction is documented:
+
+- **`X-Cache` request header** (per-request opt-in, house style cf.
+  `X-Session`): on `POST /v1/jobs`, values `1`, `true`, `allow`
+  (case-insensitive, whitespace-trimmed) turn the cache ON for that request
+  — BOTH directions with one flag: LOOKUP-if-present AND
+  store-on-completion (a read-only mode is out of scope). Absent or empty
+  means OFF and the request path is byte-for-byte the pre-cache behaviour.
+  Any other value is a loud `400` naming the accepted list — a malformed
+  value is never silently treated as off or on.
+- **`CACHE_DISABLED` env kill switch**: default NOT disabled (clients who
+  ask may use the cache). When truthy (`1`/`true`/`allow`, same
+  normalisation as the header; junk values warn at boot and mean
+  not-disabled) the cache is off for every request regardless of `X-Cache`
+  — lookups skipped, nothing stored, `cache_hit` false — and the header is
+  obeyed-as-absent, never an error. It is read at USE time per request, so
+  an A/B test can flip it in-process without a restart.
+
+Effect matrix (`H` = header `X-Cache` on a request; `K` = `CACHE_DISABLED`):
+
+| | `CACHE_DISABLED` unset/false-ish (off) | `CACHE_DISABLED` truthy (on) |
+|---|---|---|
+| `X-Cache` absent/empty | today's behaviour exactly: full run, no lookup, no store | today's behaviour exactly |
+| `X-Cache: 1/true/allow` | LOOKUP first; HIT answers `done` immediately (never queued, never a worker), MISS runs and STORES on completion | header obeyed-as-absent: full run, no lookup, no store, no error |
+
+The cache key is the triple (`audio_sha256`, `config_fp`, `session_ident`):
+a transcript is not a pure function of the audio. `config_fp` is
+`sha256[:16]` over the output-affecting config (engine selection, resolved
+model paths, vocab-file digest, target language, decode sample rate,
+dialogue-split setting, diarization enablement + resolved thread budget,
+speaker-count ceiling, spell-check state), computed at use time — so
+changing one input can never silently serve a stale transcript.
+`session_ident` in the key makes a cross-tenant hit structurally
+impossible: the cached artifact may contain tenant-specific output (speaker
+self-identification names, an opt-in LLM cleanup pass), so one tenant's
+transcript is only ever servable to the same tenant. A cross-session cache
+would require excluding those stages from the cached artifact and re-running
+them per request — explicitly out of scope.
+
+Storage is `JOBS_DIR/cache_index.sqlite` (`cache_entries` with the triple
+as PRIMARY KEY plus `source_token`, `created_at`, `hit_count`,
+`last_hit_at`); it survives restarts. A hit COPIES the source artifacts into
+the new job dir (never symlinks), so the hit record outlives any later
+eviction of the source. Cache rows are purged in the same pass as their
+source job dir by BOTH the `RETENTION_DAYS` age sweep and
+`DISK_MIN_FREE_MIB` eviction — the cache is never a reason to delete or to
+keep a job — and a lookup that finds a row whose source is gone self-heals
+by deleting the row and running fresh.
+
+| Variable | Default | Effect and validation |
+| --- | --- | --- |
+| `CACHE_DISABLED` | unset (not disabled) | Transcript-cache kill switch, truthy = cache off service-wide regardless of `X-Cache` (see *Transcript cache — two controls* above). Accepted truthy spellings `1`, `true`, `allow` (case-insensitive, trimmed); a junk value warns at boot and keeps the documented default. Read at use time per request — flipping it needs no restart. |
+
 ## Chunking utility — `pipeline/chunking.py`
 
 Kept for the standalone utility and its tests. The shipped CrispASR backend

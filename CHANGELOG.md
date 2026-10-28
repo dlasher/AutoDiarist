@@ -1,5 +1,79 @@
 # Changelog
 
+## [Unreleased] — transcript cache: per-request X-Cache opt-in (lookup AND store), CACHE_DISABLED kill switch, key = decoded-audio sha256 + config fingerprint + session (card t_ac748379)
+
+**`POST /v1/jobs` now accepts an optional `X-Cache` header** that lets a
+client be served a finished transcript instead of re-running the pipeline
+for audio it already transcribed. The cache is **per-request opt-in**:
+values `1` / `true` / `allow` (case-insensitive, whitespace-trimmed) turn
+it ON for that request, and one flag enables BOTH directions —
+LOOKUP-if-present AND store-on-completion (read-only mode is out of
+scope). Absent or empty means OFF and the request path is byte-for-byte
+the pre-cache behaviour. Any other value is a loud `400` naming the
+accepted list — a malformed value is never silently treated as off or on.
+The env knob `CACHE_DISABLED` (default: not disabled) is a pure KILL
+SWITCH: when truthy (same normalisation) the cache is off service-wide
+regardless of the header — lookups skipped, nothing stored, header
+obeyed-as-absent, never an error — read at USE time per request, so A/B
+tests flip it in-process with no restart. Both controls and their 2×2
+interaction matrix are documented in one place: CONFIG.md →
+"Transcript cache — two controls".
+
+- **The key is a triple, not the audio alone.** (`audio_sha256`,
+  `config_fp`, `session_ident`): a transcript is not a pure function of
+  the audio. `config_fp` = `sha256[:16]` over the canonical newline-joined
+  output-affecting config (DIAR_METHOD, resolved CRISPASR_BIN/GGUF_MODEL/
+  SHERPA_SEGMENT_MODEL/SHERPA_EMBEDDING_MODEL paths, vocab-file digest,
+  target language, the 16 kHz decode sample rate, SILENCE_SPLIT_SECONDS,
+  spell-check state, the resolved diarization thread budget, and the
+  speaker-count ceiling), computed at use time — changing any one input
+  MISSes, so a stale transcript can never be silently served after a
+  config change (asserted by test). `session_ident` in the key makes a
+  cross-tenant hit structurally impossible even with byte-identical
+  audio: the cached artifact may carry tenant-specific output (speaker
+  self-identification, opt-in LLM cleanup), and cross-session caching is
+  explicitly out of scope.
+- **A HIT never enqueues and never occupies a worker** (AC C3/C5): the
+  lookup runs after the admission content hash and BEFORE the queue-depth
+  check; the new job dir is created with the source's
+  `output_result.json` + `markdown_report.md` COPIED in (real copies,
+  never symlinks — the hit survives any later eviction of the source) and
+  a complete terminal `done` state. Served content is byte-identical to
+  the source's downloads (only token/timestamp fields legitimately
+  differ).
+- **Explicit signal everywhere** (AC C2/C6): `cache_hit` is declared on
+  the 202 model (always present, false unless this job was served from
+  the cache), visible on the poll and the job's own state together with
+  `cache_source_token`, added conditionally to session-listing entries,
+  and read through card B's reserved history column — HIT and MISS are
+  never ambiguous from the API alone.
+- **Store discipline** (C-EN4): `cache_opt_in: true` is stamped into the
+  job state at admission; the row is inserted ONLY at the worker's done
+  transition, only for opted-in jobs with a non-null content hash and
+  only while the kill switch is off — never at admission (a still-running
+  job is not a hit source) and never for a job that didn't opt in.
+- **Storage & retention**: SQLite index at `JOBS_DIR/cache_index.sqlite`
+  (stdlib sqlite3, survives restart; PK = the triple, plus source_token,
+  created_at, hit_count, last_hit_at). Cache rows are purged in the SAME
+  pass as their source dir by both the RETENTION_DAYS age sweep and
+  disk-pressure eviction — the cache is never a reason to delete or keep
+  a job — and a lookup finding a stale row deletes it and runs fresh
+  (self-healing). Legacy jobs with a null `audio_sha256` never key a row:
+  MISS, fresh run, no crash.
+
+Tests: `tests/api/test_cache.py` (19 tests — malformed-header 400 +
+no-trace, empty==absent today's path, case/space normalisation, duplicate
+header lines all-validated, kill switch obeyed-as-absent (incl. malformed
+header cell of the 2×2 matrix) and use-time re-read, no-header-no-store,
+opt-in stamp + row shape, store-rule arms, hit immediate-done +
+never-queued + visibility on 202/poll/listing/history,
+one-config-input-change MISS, fingerprint stability, cross-session leak,
+byte-identical + survives-source-deletion artifacts, opt-in-vs-off
+identical content, stale-row self-heal, legacy-null-hash MISS, age-sweep
+and disk-pressure row purges). Suite: 586 passed, 2 skipped (main
+baseline 567 + 2 skipped); ruff unchanged (7 pre-existing findings, none
+introduced).
+
 ## [Unreleased] — session-scoped HISTORY view + CSV/JSON exports: derived from existing status.json, default window 30, pinned column set (card t_a8a71898)
 
 **`GET /v1/history?limit=30&format=json|csv`** answers "what transcripts have
