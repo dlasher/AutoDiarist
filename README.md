@@ -1213,6 +1213,15 @@ setup-dominated and run much faster in relative terms.
 | SEWP Training Day 1 (140 min) | NVIDIA T400 | 147 min | **0.78–0.95x** |
 | SEWP Q&A (118 min) | AMD 8060S | 32 min | **3.73x** |
 
+Re-measured on the split build (NVIDIA T400, card t_7685c6da, the same
+8411 s file): ASR **853 s** + diarization **3077 s** = **3950 s** wall
+(66 min, **0.47x**). The old row above predates the split and was measured
+against the single-invocation path, which ran the sherpa pre-pass inside the
+engine; the split moves the diarization into its own stage after the engine
+has exited, which is why the total is now lower than the pre-split
+measurement on the same file. The AMD row is from the pre-split build and
+has not been re-measured.
+
 **Diarization accuracy.** The speaker count depends on the kind of audio, and
 the current threshold does not fit every kind:
 
@@ -1267,9 +1276,14 @@ Other long-input facts worth knowing:
   ETA absent). The shipped path no longer hands diarization to the
   engine: the engine runs ASR-only (progress live from slice 1) and the
   pipeline invokes the sherpa wrapper itself as the separate `diarizing`
-  stage. It is still not a timer: if the engine is silent, progress
-  honestly freezes (no synthetic heartbeat exists), and a `started_at`
-  check remains the fallback during any silent blocking stage.
+  stage. It is not a timer for the ASR phase: the values come from the engine's
+  own slice boundaries. The `diarizing` stage IS an estimated heartbeat
+  (card t_868131e3): the sherpa CLI exposes no progress output, so the
+  pipeline publishes a labelled estimate (`estimated=true`,
+  `estimate_method=stage_rate_model`) that advances on a fixed interval
+  while the diarization subprocess runs, and the true completion boundary
+  is published at the end. A client can therefore tell a measured
+  boundary from an estimate.
 
 
 ### CPU execution — measured (v0.8.43, kanban t_18ee2e43)

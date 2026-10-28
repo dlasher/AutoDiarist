@@ -1,7 +1,74 @@
 # Changelog
 
-<<<<<<< HEAD
-## [Unreleased] — long-file progress: ASR/diarization split restores live per-slice progress on the shipped sherpa path (card t_7685c6da)
+## [1.6.0] - 2026-10-28 — V1.6 wave: long-file progress that actually moves, and a service that refuses a collapsed transcript
+
+**A long job's bar now moves through BOTH stages, and a long file no longer
+OOM-kills the diarization.** This release splits the single engine
+invocation into an ASR pass and a pipeline-side diarization pass, so the
+per-slice progress the engine emits is no longer withheld behind the
+engine's whole-file sherpa pre-pass; and it adds a refusal for the
+silently-degraded diarization that the same pre-pass failure produced.
+
+Measured on the NVIDIA T400 against the real 8411 s (140-minute) SEWP file:
+
+- **ASR phase: 307 moving progress values over 853.3 s**, one per engine
+  slice, starting at slice 1. Before the split this published **ZERO**
+  values for the whole ASR phase.
+- **Diarization stage: a moving, labelled series** (286 ticks, one every
+  ~10 s). Before the split it published a single `(1,1)` at the END, after
+  ~50 minutes of silence.
+- **Total wall 3950 s (66 min)** for the file, and the diarization runs at
+  **0.86 GiB** instead of the pre-split **7.4 GiB** that the kernel
+  SIGKILLed. On an 8 GiB host the pre-split path could not do a
+  140-minute file at all.
+- On the AMD host (Vulkan) the same commit is deployed and verified:
+  13/13 build-time feature checks pass.
+
+**Config changes in this release (new/changed env vars):**
+
+| Variable | Change | Card |
+|---|---|---|
+| `DIARIZATION_MIN_REGIONS_PER_MINUTE` | new, default `0.5` — minimum speaker regions per minute of audio; below it a long file is judged a collapsed diarization | t_dc5c2abb |
+| `DIARIZATION_MIN_CHECK_SECONDS` | new, default `600.0` — small-audio exemption for that floor (a legitimate single-speaker recording is not a defect) | t_dc5c2abb |
+| `DIAR_HEARTBEAT_INTERVAL_SECONDS` | new, default `2.0` — seconds between the diarization stage's estimated progress ticks | t_868131e3 |
+| `DIAR_CHUNK_ESTIMATE_SECONDS` | new, default `2.0` — estimated wall seconds per second of audio for the diarization stage, used to price its tick total and estimate | t_868131e3 |
+
+The card sections below are preserved verbatim from the branches.
+
+### Silent speaker collapse: the service now REFUSES degraded diarization (`DIARIZATION_DEGRADED`) instead of emitting a collapsed transcript (card t_dc5c2abb)
+
+A long file whose **global sherpa pre-pass is OOM-killed** (measured NV
+host: `sherpa global run failed with exit code 137` on an 8411 s
+7-speaker panel) silently falls back to per-slice sherpa and completed
+"successfully" with **2 speaker regions over 1 ASR segment** — a
+transcript with meaningless speaker labels the existing zero-label guard
+does not catch. A collapsed answer shipped is worse than a loud failure.
+
+- **New typed refusal** `pipeline.transcribe.DiarizationDegradedError`
+  and **new machine-readable `error_code: DIARIZATION_DEGRADED`**
+  (distinct from `OUT_OF_MEMORY`, which describes the *cause*: clients
+  branch on the diarization degradation itself; the engine message names
+  region count, audio duration, the engine's own exit code, and the
+  remedy — no container logs needed).
+- **Engine-path detection (AC5):** `_run_crispasr` now parses the
+  captured stderr for the engine's own degradation signatures before the
+  output is accepted. Source-confirmed invariant: `sherpa → N speaker
+  regions over M ASR segments` prints ONLY on the per-slice fallback
+  path (the healthy global pass prints `sherpa global → N`), so its
+  presence on long audio is conclusive.
+- **Region-table floor (split path, AC1/AC3):**
+  `_check_diarization_plausibility(regions, duration)` refuses long audio
+  with implausibly few regions (floor `max(2, minutes x rate)`) and is
+  the entry point the split path (card t_7685c6da, runs the wrapper
+  directly and never sees engine stderr) plugs into.
+- **Calibrated by measurement, not guessed:** the collapsed 8411 s run
+  produced 0.0143 regions/min vs 3.37 for the clean run (235x gap); the
+  `DIARIZATION_MIN_CHECK_SECONDS` (600) exemption keeps the measured
+  legitimate 137 s single-speaker control (0.44/min) ACCEPTED — a bare
+  rate floor would reject it. Both knobs are catalogued and
+  README/CONFIG/TROUBLESHOOTING/PIPELINE-documented.
+- The zero-label refusal (card t_5a287979) is unchanged and still fires.
+### Long-file progress: ASR/diarization split restores live per-slice progress on the shipped sherpa path (card t_7685c6da)
 
 **A long job's bar moves during ASR now — one progress value per engine
 slice — and the running-phase ETA publishes from the first completed slice
@@ -75,43 +142,8 @@ short-file behaviour masked the defect from every earlier check.
   fails with the fix reverted). The 119-minute identity gate is PENDING
   (the long-file run had no surviving artifacts at handoff time); the
   long-file live progress/ETA check is the planner's remaining step.
-=======
-## [Unreleased] — silent speaker collapse: the service now REFUSES degraded diarization (`DIARIZATION_DEGRADED`) instead of emitting a collapsed transcript (card t_dc5c2abb)
 
-A long file whose **global sherpa pre-pass is OOM-killed** (measured NV
-host: `sherpa global run failed with exit code 137` on an 8411 s
-7-speaker panel) silently falls back to per-slice sherpa and completed
-"successfully" with **2 speaker regions over 1 ASR segment** — a
-transcript with meaningless speaker labels the existing zero-label guard
-does not catch. A collapsed answer shipped is worse than a loud failure.
-
-- **New typed refusal** `pipeline.transcribe.DiarizationDegradedError`
-  and **new machine-readable `error_code: DIARIZATION_DEGRADED`**
-  (distinct from `OUT_OF_MEMORY`, which describes the *cause*: clients
-  branch on the diarization degradation itself; the engine message names
-  region count, audio duration, the engine's own exit code, and the
-  remedy — no container logs needed).
-- **Engine-path detection (AC5):** `_run_crispasr` now parses the
-  captured stderr for the engine's own degradation signatures before the
-  output is accepted. Source-confirmed invariant: `sherpa → N speaker
-  regions over M ASR segments` prints ONLY on the per-slice fallback
-  path (the healthy global pass prints `sherpa global → N`), so its
-  presence on long audio is conclusive.
-- **Region-table floor (split path, AC1/AC3):**
-  `_check_diarization_plausibility(regions, duration)` refuses long audio
-  with implausibly few regions (floor `max(2, minutes x rate)`) and is
-  the entry point the split path (card t_7685c6da, runs the wrapper
-  directly and never sees engine stderr) plugs into.
-- **Calibrated by measurement, not guessed:** the collapsed 8411 s run
-  produced 0.0143 regions/min vs 3.37 for the clean run (235x gap); the
-  `DIARIZATION_MIN_CHECK_SECONDS` (600) exemption keeps the measured
-  legitimate 137 s single-speaker control (0.44/min) ACCEPTED — a bare
-  rate floor would reject it. Both knobs are catalogued and
-  README/CONFIG/TROUBLESHOOTING/PIPELINE-documented.
-- The zero-label refusal (card t_5a287979) is unchanged and still fires.
->>>>>>> origin/coder/t_dc5c2abb
-
-## [Unreleased] — transcript cache: per-request X-Cache opt-in (lookup AND store), CACHE_DISABLED kill switch, key = decoded-audio sha256 + config fingerprint + session (card t_ac748379)
+### transcript cache: per-request X-Cache opt-in (lookup AND store), CACHE_DISABLED kill switch, key = decoded-audio sha256 + config fingerprint + session (card t_ac748379)
 
 **`POST /v1/jobs` now accepts an optional `X-Cache` header** that lets a
 client be served a finished transcript instead of re-running the pipeline
@@ -186,7 +218,7 @@ and disk-pressure row purges). Suite: 587 passed, 2 skipped (main
 baseline 567 + 2 skipped); ruff unchanged (7 pre-existing findings, none
 introduced).
 
-## [Unreleased] — session-scoped HISTORY view + CSV/JSON exports: derived from existing status.json, default window 30, pinned column set (card t_a8a71898)
+### session-scoped HISTORY view + CSV/JSON exports: derived from existing status.json, default window 30, pinned column set (card t_a8a71898)
 
 **`GET /v1/history?limit=30&format=json|csv`** answers "what transcripts have
 I made" as a **pure derived view** over the per-job `status.json` files that
@@ -229,7 +261,7 @@ agreement + dispositions, adversarial-filename CSV round-trip, legacy
 null-hash row, reserved cache_hit key, empty-session 200 with header-only
 CSV). Suite: 567 passed, 2 skipped (main baseline 557 + 2 skipped).
 
-## [Unreleased] — audio content fingerprint: SHA-256 of the DECODED 16 kHz PCM at admission, surfaced on state + 202 + poll + listing (card t_971ed589)
+### audio content fingerprint: SHA-256 of the DECODED 16 kHz PCM at admission, surfaced on state + 202 + poll + listing (card t_971ed589)
 
 **Every admitted job now carries `audio_sha256`** — a content fingerprint
 of the audio, computed at admission, stored on the persisted job state,
@@ -273,7 +305,7 @@ including a synthetic stalled child and stderr flood, surfacing on all
 three response bodies, pre-feature null). Suite: 519 passed, 2 skipped
 (main baseline 506 + 2 skipped).
 
-## [Unreleased] — cancel a RUNNING job: client-facing engine kill wired to DELETE (card t_fef54150)
+### cancel a RUNNING job: client-facing engine kill wired to DELETE (card t_fef54150)
 
 `DELETE /v1/jobs/{token}` no longer 409s on `processing` — a running job is
 now genuinely cancellable, reusing the machinery the timeout path has always
@@ -336,7 +368,7 @@ had. The contract:
   `MOCK_TRANSCRIBE_SECONDS` test-seam knob) and TROUBLESHOOTING.md updated
   for the cancel semantics.
 
-## [Unreleased] — running-phase ETA: `processing` jobs get a completion estimate derived from their own observed progress (card t_d64bdf29)
+### running-phase ETA: `processing` jobs get a completion estimate derived from their own observed progress (card t_d64bdf29)
 
 The status check now answers *when will this finish* for a job already
 **running**, not only for one still queued. `GET /v1/jobs/{token}` (and the
@@ -399,7 +431,7 @@ honesty chain (null until the new attempt genuinely advances past the
 preserved fraction), and one end-to-end
 drive through the real mock pipeline + production claim path polled live
 while `processing`. 528 passed / 2 skipped full suite; no GPU.
-## [Unreleased] — status payload honesty: `completed_at`, `audio_duration_seconds`, restart-reclaim markers (card t_73254ea6)
+### status payload honesty: `completed_at`, `audio_duration_seconds`, restart-reclaim markers (card t_73254ea6)
 
 Three additive fields on the job status payload; no existing field changed
 its name, type, or semantics.
@@ -426,7 +458,7 @@ its name, type, or semantics.
 `tests/api/test_status_fields.py` (8 tests) pins every invariant, incl. a
 full lifecycle table for `completed_at` and a simulated crash/restart
 reclaim. Suite 508 -> 516 collected, all green.
-## [Unreleased] — machine-readable error codes on failed jobs + mechanically verified env-var catalogue (card t_1799d07f)
+### machine-readable error codes on failed jobs + mechanically verified env-var catalogue (card t_1799d07f)
 
 **Additive.** Every `failed` job now carries a stable `error_code` next to
 the existing `error`/`message` strings — unchanged in content and
@@ -457,7 +489,7 @@ config-docs card t_16c871a6 owns the prose structure). One existing test's
 strict listing-key assertion (`tests/api/test_jobs_listing.py`) was
 extended for the new additive `error_code` key.
 
-## [Unreleased] — falsified "identical output" A/B claim corrected; both hosts' service-level concurrency curves published (card t_ee479fdf)
+### falsified "identical output" A/B claim corrected; both hosts' service-level concurrency curves published (card t_ee479fdf)
 
 **Docs-only.** The README claimed "both backends produced identical output"
 twice in the AMD-vs-NVIDIA A/B section. That claim is FALSIFIED by direct
@@ -484,7 +516,7 @@ measured example (at N=3 the 4-core box gives every job 1 thread: a solo
 job takes 78.7 s instead of 43 s; `SHERPA_NUM_THREADS` pins it explicitly).
 No code, thresholds, models, or engine invocation touched.
 
-## [Unreleased] — diarization thread cap corrected 8 -> 4 + measured curves (card t_71a5768f)
+### diarization thread cap corrected 8 -> 4 + measured curves (card t_71a5768f)
 
 **The default `SHERPA_MAX_THREADS` is now 4, the measured optimum on BOTH
 shipped hosts.** The AMD operator sweep (2026-10-26) discriminated between
@@ -553,7 +585,7 @@ sweeps: threading remains a performance knob, not a quality knob.
   carry the tables + normalisation. Suite collected 454 -> 496 (grows,
   AC10-style count regression guard retained).
 
-## [Unreleased] — diarization threading (card t_3cb8f97c)
+### diarization threading (card t_3cb8f97c)
 
 **The sherpa diarization phase now runs multi-threaded, by default, at a
 computed safe thread count.** The phase (~80% of a job's wall time —
@@ -641,7 +673,7 @@ LIVE on the NVIDIA T400 host (2026-10-26, same 137.5 s clip
 * auto resolution record on a healthy box:
   `threads=4 (auto: cores=4 workers=1 cap=4 requested=unset max=unset)`.
 
-## [Unreleased] — global queue concurrency (card t_dbad2235)
+### global queue concurrency (card t_dbad2235)
 
 **The service can now process N jobs concurrently behind
 `MAX_PROCESSING_GLOBAL` (default 1).** `_queue_worker_loop` was serial by
@@ -675,7 +707,7 @@ from measurement, and the rebuild of the AMD image follows this merge.
 tests/pipeline/test_crispasr.py, compose asserts in
 tests/test_docker_packaging.py.)
 
-## [Unreleased] — domain lexicon that actually runs (card t_72405565)
+### domain lexicon that actually runs (card t_72405565)
 
 **The spell-check layer now runs in the shipped service and carries the
 measured NASA/SEWP vocabulary.** Four blockers made it inert: the API gate
@@ -701,7 +733,7 @@ four source transcripts: 40 corrections, all genuine domain fixes, zero
 prose damage. Both compose files set `SPELL_CHECK: "1"` explicitly.
 (Tests: tests/pipeline/test_spellcheck.py, tests/api/test_spellcheck_seam.py.)
 
-## [Unreleased] — speaker-count ceiling (card t_38e52d89)
+### speaker-count ceiling (card t_38e52d89)
 
 **`DIARIZATION_MAX_SPEAKERS` (default 8) bounds the diarization label
 count.** The NASA SEWP Q&A file (118 min, reference 6-7 speakers) exploded
@@ -725,7 +757,7 @@ speakers (326 segments, inside the 6-7 reference band); panel stays 3;
 compliant fixtures replay byte-identical and never re-run. (Tests:
 tests/pipeline/test_speaker_count_ceiling.py.)
 
-## [Unreleased] — live job progress on long inputs (card t_2e901945)
+### live job progress on long inputs (card t_2e901945)
 
 **`GET /v1/jobs/{token}` now moves during long transcriptions instead of
 freezing at 0.30.** Measured live: a 140-minute job published exactly
@@ -743,7 +775,7 @@ means honestly frozen progress, and short jobs behave exactly as before.
 (PIPELINE.md "Live progress on long jobs"; regression tests in
 tests/pipeline/test_engine_streaming.py.)
 
-## [Unreleased] — one-command deploy packaging (card t_f82ad22a)
+### one-command deploy packaging (card t_f82ad22a)
 
 **Contract: `git clone`, pick your compose file, `docker compose up` —
 zero edits, on both hardware targets.** The user knows their hardware:
@@ -796,7 +828,7 @@ AMD/Vulkan. Nothing past `up` is part of activation.
   consumed by `api/`+`pipeline/` sources or a baked script (invented
   keys are silent config regressions — planner review).
 
-## [Unreleased] — multi-speaker diarization fix (card t_5a287979)
+### multi-speaker diarization fix (card t_5a287979)
 
 **Diarization default changed: `DIAR_METHOD=foxnose` -> `sherpa`.**
 foxnose's global BIC speaker counter collapses panel recordings — live
