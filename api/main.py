@@ -6,6 +6,7 @@ import io
 import shutil
 import json
 import selectors
+import sqlite3
 import subprocess
 import time
 import asyncio
@@ -379,6 +380,10 @@ def sweep_expired_jobs(jobs_dir: Path, retention_days: int, now: float | None = 
             continue
         shutil.rmtree(job_dir, ignore_errors=True)
         removed.append(job_dir.name)
+        # Cache rows die with their source in the SAME pass (card
+        # t_ac748379): a row is only ever an index over live job dirs —
+        # the cache is never a reason to delete OR to keep a job.
+        _cache_purge_tokens(jobs_dir, [job_dir.name])
         logger.info(
             "retention sweep: removed job token=%s status=%s age_days=%.1f reason=age-expiry",
             job_dir.name,
@@ -428,6 +433,9 @@ def enforce_disk_pressure(jobs_dir: Path, min_free_mib: int, free_bytes_fn=None)
         freed = _dir_size_bytes(victim)
         shutil.rmtree(victim, ignore_errors=True)
         evicted.append(victim.name)
+        # Same eviction->row-purge coupling as the age sweep (card
+        # t_ac748379): rows never outlive the dirs they index.
+        _cache_purge_tokens(jobs_dir, [victim.name])
         logger.warning(
             "retention eviction: removed job token=%s status=%s freed_bytes=%d "
             "reason=disk-pressure watermark_mib=%d",
@@ -1067,6 +1075,241 @@ def _new_session_id() -> str:
     return uuid.uuid4().hex
 
 
+# --- Transcript cache (card t_ac748379) ---------------------------------------
+# PER-REQUEST OPT-IN via the X-Cache header on POST /v1/jobs (C-EN1); the
+# env knob CACHE_DISABLED is a pure KILL SWITCH (C-EN2). One flag enables
+# BOTH directions — lookup-if-present AND store-on-completion. The key is
+# the TRIPLE (audio_sha256, config_fp, session_ident): session_ident in the
+# key makes cross-tenant leakage structurally impossible (AC C7), and
+# config_fp makes serving a stale transcript after an output-affecting
+# config change impossible (AC C1). Tenant-specific stages (speaker naming,
+# opt-in LLM cleanup) stay safe under the session-scoped key; a
+# cross-session cache would have to exclude those stages from the cached
+# artifact — explicitly out of scope (plan C.7).
+
+CACHE_HEADER = "X-Cache"
+CACHE_ON_VALUES = ("1", "true", "allow")        # the ONLY accepted spellings
+CACHE_DB_NAME = "cache_index.sqlite"
+
+
+def _normalise_cache_value(raw: str | None) -> tuple[bool | None, str]:
+    """Shared normalisation for X-Cache and CACHE_DISABLED (C-EN2 says the
+    kill switch parses truthiness with the SAME rule as header values).
+
+    Returns (enabled, canonical): None/''/whitespace -> (None, '') (absent);
+    a case+space-normalised member of CACHE_ON_VALUES -> (True, value);
+    anything else -> (None, <lowercased raw>) so the CALLER decides between
+    a loud 400 (header) and a startup warning (env)."""
+    if raw is None:
+        return None, ""
+    stripped = raw.strip()
+    if not stripped:
+        return None, ""
+    canon = stripped.lower()
+    if canon in CACHE_ON_VALUES:
+        return True, canon
+    return None, canon
+
+
+def _cache_disabled() -> bool:
+    """Kill switch, read at USE time per request (house lesson t_1807881b:
+    never bake env into a decorator / never read-and-forget at import —
+    A/B tests flip it in-process with no restart)."""
+    enabled, _canon = _normalise_cache_value(os.environ.get("CACHE_DISABLED"))
+    return enabled is True
+
+
+def _cache_vocab_digest() -> str:
+    """sha256[:16] of the vocabulary file content — a fingerprint input so
+    edited vocab can never serve a stale transcript (AC C1's vocab arm)."""
+    from pipeline.spellcheck import _resolve_vocab_path
+    try:
+        data = _resolve_vocab_path(None).read_bytes()
+    except OSError:
+        data = b"<missing>"
+    return hashlib.sha256(data).hexdigest()[:16]
+
+
+def _cache_config_fp() -> str:
+    """sha256[:16] over the canonical newline-joined output-affecting
+    config, pinned by the card: engine selection, resolved model paths
+    (existing pipeline.transcribe resolvers), vocab content digest, target
+    language, the pipeline's decode sample rate, dialogue-split setting,
+    diarization enablement, the resolved diarization thread budget, the
+    speaker-count ceiling, and spellcheck state.
+
+    Computed at USE time, fresh per admission, so an in-process config
+    change is reflected immediately (A/B discipline, C-EN2); the value
+    derives only from env + file content, so a fresh process computes the
+    same fingerprint after a restart — nothing memory-only dies."""
+    from pipeline.spellcheck import spell_check_enabled
+    from pipeline.transcribe import (
+        asr_language,
+        crispasr_bin,
+        diar_method,
+        gguf_model_path,
+        gpu_backend,
+        sherpa_embedding_model,
+        sherpa_segment_model,
+    )
+    parts = [
+        f"DIAR_METHOD={diar_method()}",
+        f"CRISPASR_BIN={crispasr_bin()}",
+        f"GGUF_MODEL={gguf_model_path()}",
+        f"SHERPA_SEGMENT_MODEL={sherpa_segment_model()}",
+        f"SHERPA_EMBEDDING_MODEL={sherpa_embedding_model()}",
+        f"CRISPASR_GPU_BACKEND={gpu_backend()}",
+        f"CRISPASR_LANGUAGE={asr_language()}",
+        f"VOCAB_SHA={_cache_vocab_digest()}",
+        "SAMPLE_RATE=16000",
+        f"SILENCE_SPLIT_SECONDS={os.environ.get('SILENCE_SPLIT_SECONDS', '')}",
+        f"SPELL_CHECK={spell_check_enabled()}",
+        f"SHERPA_NUM_THREADS={os.environ.get('SHERPA_NUM_THREADS', '')}",
+        f"SHERPA_MAX_THREADS={os.environ.get('SHERPA_MAX_THREADS', '')}",
+        f"DIARIZATION_MAX_SPEAKERS={os.environ.get('DIARIZATION_MAX_SPEAKERS', '')}",
+    ]
+    return hashlib.sha256("\n".join(parts).encode()).hexdigest()[:16]
+
+
+def _cache_db_path(jobs_dir: Path | None = None) -> Path:
+    return (jobs_dir or JOBS_DIR) / CACHE_DB_NAME
+
+
+def _cache_db_connect(jobs_dir: Path) -> sqlite3.Connection:
+    conn = sqlite3.connect(str(_cache_db_path(jobs_dir)), timeout=10.0)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS cache_entries (
+            sha TEXT NOT NULL,
+            config_fp TEXT NOT NULL,
+            session_ident TEXT NOT NULL,
+            source_token TEXT NOT NULL,
+            created_at REAL NOT NULL,
+            hit_count INTEGER NOT NULL DEFAULT 0,
+            last_hit_at REAL,
+            PRIMARY KEY (sha, config_fp, session_ident)
+        )""")
+    return conn
+
+
+def _cache_lookup(jobs_dir: Path, sha: str, config_fp: str,
+                  session_ident: str) -> str | None:
+    """Return a LIVE source token for the triple, self-healing stale rows.
+
+    A row is live iff its source job's status.json says 'done' AND both
+    artifacts exist. A stale row (source evicted / artifacts missing) is
+    DELETED here and the caller falls through to a fresh run — the index can
+    only ever lag reality, never outrun it."""
+    if not sha:  # legacy jobs with a null content fingerprint never key a row
+        return None
+    db = _cache_db_path(jobs_dir)
+    if not db.exists():
+        return None
+    conn = _cache_db_connect(jobs_dir)
+    try:
+        row = conn.execute(
+            "SELECT source_token FROM cache_entries"
+            " WHERE sha=? AND config_fp=? AND session_ident=?",
+            (sha, config_fp, session_ident)).fetchone()
+        if row is None:
+            return None
+        source = row[0]
+        src_dir = jobs_dir / source
+        status = _job_status(src_dir)
+        live = (status == "done"
+                and (src_dir / "output_result.json").exists()
+                and (src_dir / "markdown_report.md").exists())
+        if not live:
+            conn.execute(
+                "DELETE FROM cache_entries WHERE sha=? AND config_fp=?"
+                " AND session_ident=?", (sha, config_fp, session_ident))
+            conn.commit()
+            logger.info("cache: dropped stale row sha=%s source=%s"
+                        " (self-healing to a fresh run)", sha[:12], source)
+            return None
+        return source
+    except sqlite3.Error as exc:
+        logger.warning("cache lookup failed (falling through to fresh run): %s", exc)
+        return None
+    finally:
+        conn.close()
+
+
+def _cache_record_hit(jobs_dir: Path, sha: str, config_fp: str,
+                      session_ident: str, source_token: str) -> None:
+    """Bump hit_count/last_hit_at on the row that served a hit. Never fails
+    a request — the counter is bookkeeping."""
+    try:
+        conn = _cache_db_connect(jobs_dir)
+        try:
+            conn.execute(
+                "UPDATE cache_entries SET hit_count = hit_count + 1,"
+                " last_hit_at = ?"
+                " WHERE sha=? AND config_fp=? AND session_ident=?"
+                " AND source_token=?",
+                (time.time(), sha, config_fp, session_ident, source_token))
+            conn.commit()
+        finally:
+            conn.close()
+    except sqlite3.Error as exc:
+        logger.warning("cache hit-count update failed: %s", exc)
+
+
+def _cache_store(jobs_dir: Path, sha: str, config_fp: str, session_ident: str,
+                 source_token: str) -> None:
+    """Insert (replace) the row for a COMPLETED opted-in job. Called only
+    from the worker's done transition — never at admission (a still-running
+    job is not a hit source) and never for a null hash, a non-opted job, or
+    while the kill switch is on."""
+    try:
+        conn = _cache_db_connect(jobs_dir)
+        try:
+            conn.execute(
+                "INSERT OR REPLACE INTO cache_entries"
+                " (sha, config_fp, session_ident, source_token, created_at,"
+                "  hit_count, last_hit_at)"
+                " VALUES (?, ?, ?, ?, ?, 0, NULL)",
+                (sha, config_fp, session_ident, source_token, time.time()))
+            conn.commit()
+        finally:
+            conn.close()
+    except sqlite3.Error as exc:
+        logger.warning("cache store failed for token=%s: %s", source_token, exc)
+
+
+def _cache_purge_tokens(jobs_dir: Path, tokens) -> int:
+    """Delete rows whose source_token is among `tokens` — the sweeps call
+    this with the exact dirs they just deleted (rows die in the SAME pass
+    as their source; AC C8's eviction arm)."""
+    tokens = set(tokens)
+    if not tokens:
+        return 0
+    db = _cache_db_path(jobs_dir)
+    if not db.exists():
+        return 0
+    try:
+        conn = _cache_db_connect(jobs_dir)
+        try:
+            doomed = conn.execute(
+                "SELECT sha, config_fp, session_ident, source_token"
+                " FROM cache_entries").fetchall()
+            doomed = [r for r in doomed if r[3] in tokens]
+            for sha, fp, sess, _src in doomed:
+                conn.execute(
+                    "DELETE FROM cache_entries"
+                    " WHERE sha=? AND config_fp=? AND session_ident=?",
+                    (sha, fp, sess))
+            if doomed:
+                conn.commit()
+                logger.info("cache sweep: removed %d row(s) with evicted"
+                            " source job(s)", len(doomed))
+            return len(doomed)
+        finally:
+            conn.close()
+    except sqlite3.Error as exc:
+        logger.warning("cache row purge failed: %s", exc)
+        return 0
+
+
 def _resolve_session(request: Request) -> tuple[str, str, str]:
     """(identity hash, session id, source) for the V1.5 precedence chain.
 
@@ -1430,6 +1673,19 @@ def process_job_background(token: str, audio_path: str, filename: str,
         # client stopped must never resurrect as done.
         _check_cancelled()
         update_state("done", 1.0, "Transcription complete.", stage="done")
+        # Cache STORE (card t_ac748379): only here — at the worker's done
+        # transition, never at admission (a still-processing job is not a
+        # hit source) — and only when the job OPTED IN via X-Cache, the
+        # kill switch is off at use time, and the content fingerprint is
+        # non-null. The row records THIS run's (sha, config_fp,
+        # session_ident) triple so a later identical request can be served
+        # without re-running the pipeline. Failure to store must never fail
+        # the job; the artifacts on disk are the product.
+        _final = _read_state(token) or {}
+        if (_final.get("cache_opt_in") and not _cache_disabled()
+                and _final.get("audio_sha256")):
+            _cache_store(JOBS_DIR, _final["audio_sha256"],
+                         _cache_config_fp(), _session_key(_final), token)
 
     except JobCancelled:
         # Client cancel of a RUNNING attempt (card t_fef54150): this branch
@@ -1651,6 +1907,23 @@ def validate_config() -> str:
         f"retention_days={days} "
         f"eta_rate={rate} eta={'on' if rate > 0 else 'OFF'}"
     )
+    # Cache kill switch (card t_ac748379 C-EN2): CACHE_DISABLED is read at
+    # use time per request, but a JUNK value means the operator meant
+    # something and got silently-defaulted behaviour — surface it at startup
+    # (the house pattern for knob typos) and keep the documented default
+    # "not disabled".
+    _cd_enabled, _cd_canon = _normalise_cache_value(os.environ.get("CACHE_DISABLED"))
+    if _cd_enabled is None and _cd_canon:
+        logger.warning(
+            "config: CACHE_DISABLED=%r is not a recognised value; the kill "
+            "switch stays NOT disabled (accepted: 1, true, allow, "
+            "case-insensitive; anything else means not-disabled)",
+            os.environ.get("CACHE_DISABLED"),
+        )
+    summary = (
+        f"{summary} "
+        f"cache={'DISABLED (kill switch)' if _cache_disabled() else 'per-request opt-in (X-Cache)'}"
+    )
     logger.info(summary)
     return summary
 
@@ -1747,9 +2020,13 @@ class JobResponse(BaseModel):
     estimated_completion_at: str | None = None
     # Audio content fingerprint at admission (V1.6, card t_971ed589):
     # 32-hex truncated SHA-256 of the DECODED 16 kHz mono PCM, null when the
-    # upload could not be decoded. Presentation + bookkeeping only — no
-    # cache reads it yet. Additive: old clients ignore unknown fields.
+    # upload could not be decoded. Card t_ac748379 uses it as the cache
+    # key's first half. Additive: old clients ignore unknown fields.
     audio_sha256: str | None = None
+    # Transcript-cache signal (card t_ac748379, AC C2): true ONLY when this
+    # job was served from the cache instead of running the pipeline. Always
+    # present (false on a normal admission) — no missing-vs-false ambiguity.
+    cache_hit: bool = False
 
 
 class JobStatus(BaseModel):
@@ -1772,6 +2049,35 @@ async def create_job(request: Request, response: Response, file: UploadFile = Fi
     ext = name.split(".")[-1].lower()
     if ext not in ("wav", "mp3", "m4a", "aac", "ogg", "flac"):
         raise HTTPException(status_code=415, detail="Unsupported file type. Supported: wav, mp3, m4a, aac, ogg, flac")
+
+    # 1b. Cache opt-in parsed from the X-Cache header BEFORE anything lands
+    #     on disk (card t_ac748379 C-EN1, house style: per-request options
+    #     travel by header, cf. X-Session). Accepted spellings,
+    #     case-insensitive and whitespace-trimmed: 1 / true / allow -> cache
+    #     ON, BOTH directions (lookup-if-present AND store-on-completion).
+    #     Absent/empty -> OFF, and the request path is byte-for-byte
+    #     today's. ANY other value -> 400 naming the accepted list: never
+    #     silently treated as off or on (AC C4d). Under the CACHE_DISABLED
+    #     kill switch the header is obeyed-as-absent — not an error (C-EN2),
+    #     so malformed spellings are not rejected while the switch is on.
+    #     Duplicate header lines are ALL inspected (never "first wins" —
+    #     `X-Cache: 1` + `X-Cache: junk` must not be silently treated as
+    #     on-or-off): every instance must carry an accepted value.
+    x_cache_values = request.headers.getlist(CACHE_HEADER)
+    if _cache_disabled():
+        cache_on = False
+    else:
+        canon_values = [_normalise_cache_value(v) for v in x_cache_values]
+        bad = [v for v, (on, _c) in zip(x_cache_values, canon_values)
+               if on is None and _c]
+        if bad:
+            raise HTTPException(
+                status_code=400,
+                detail=(f"Invalid {CACHE_HEADER} value {bad[0]!r}; "
+                        f"accepted: 1, true, allow (case-insensitive); "
+                        f"absent or empty means off"),
+            )
+        cache_on = any(on is True for on, _c in canon_values)
 
     # 2. Create job dir and stream upload.
     job_dir.mkdir(parents=True, exist_ok=True)
@@ -1808,16 +2114,34 @@ async def create_job(request: Request, response: Response, file: UploadFile = Fi
     #     off-loop in a threadpool exactly like the duration probe above
     #     (AC A1) — the event loop never blocks on the ffmpeg child.
     #     null (never a rejection) when the upload cannot be decoded;
-    #     presentation + bookkeeping only: nothing reads this value yet
-    #     (the later history/cache cards key on it).
+    #     card t_ac748379 keys the transcript cache on it — a null hash
+    #     simply never matches a cache lookup (fresh run, no crash).
     audio_sha256 = await run_in_threadpool(_hash_decoded_audio, str(audio_path))
+
+    # 2d. Transcript-cache LOOKUP (card t_ac748379): after the content hash
+    #     is known and BEFORE the queue-depth check / enqueue (AC C5) — a
+    #     HIT never enqueues a job and never occupies a worker (AC C3).
+    #     Session resolution moved ahead of admission control so the lookup
+    #     can use the same hashed session_ident that keys the store; for a
+    #     cache-OFF request the resolve order is observably identical (the
+    #     function is pure against the request).
+    session, session_id, session_source = _resolve_session(request)
+    session_ident = _hash_ident(f"session:{session_id}")
+    if cache_on and audio_sha256:
+        config_fp = _cache_config_fp()
+        source = _cache_lookup(JOBS_DIR, audio_sha256, config_fp, session_ident)
+        if source is not None:
+            return _serve_cache_hit(
+                response, request, token, job_dir, audio_path, name,
+                session, session_id, session_source, session_ident,
+                audio_sha256, source,
+            )
 
     # 3. Admission control under the queue lock: queue depth is the single
     #    system-level backpressure gate (AC1, card t_daebf369). Since V1.5
     #    (card t_82bfbc15) the per-session quota rejection is gone: every
     #    submission that fits under the depth is accepted with 202 and
     #    queued behind the others. Rejected uploads leave no trace on disk.
-    session, session_id, session_source = _resolve_session(request)
     depth_limit = _env_int("MAX_QUEUE_DEPTH", DEFAULT_MAX_QUEUE_DEPTH)
     retry_after = str(_env_int("RETRY_AFTER_SECONDS", DEFAULT_RETRY_AFTER_SECONDS))
     with _queue_lock:
@@ -1870,6 +2194,13 @@ async def create_job(request: Request, response: Response, file: UploadFile = Fi
             # read-modify-write, never a rebuild.
             "audio_sha256": audio_sha256,
         }
+        # Cache opt-in stamp (card t_ac748379 C-EN4): persisted at admission
+        # only when ON, so a cache-off request's state stays byte-for-byte
+        # today's (AC C4a). The worker's done transition reads it to decide
+        # whether to store. The header selects the DELIVERY PATH only, never
+        # the result (AC C4f): the pipeline never reads this flag.
+        if cache_on:
+            state["cache_opt_in"] = True
         _write_state(state)
         # Fair-schedule rank at admission (1-based, card t_4b40acfd): the
         # position in the round-robin execution order the worker will
@@ -1911,6 +2242,77 @@ async def create_job(request: Request, response: Response, file: UploadFile = Fi
         estimated_completion_at=_iso_utc(eta[1]) if eta else None,
         # Audio content fingerprint at admission (card t_971ed589).
         audio_sha256=audio_sha256,
+    )
+
+
+def _serve_cache_hit(response: Response, request: Request,
+                     token: str, job_dir: Path, audio_path: Path, name: str,
+                     session: str, session_id: str, session_source: str,
+                     session_ident: str, audio_sha256: str,
+                     source_token: str) -> JobResponse:
+    """Serve a HIT as a fresh, self-contained done job (card t_ac748379).
+
+    AC C3/C5: the job is NEVER started — no queue entry, no worker, the
+    response is written essentially immediately. The source's artifacts are
+    COPIED (never symlinked) so the hit record survives any later eviction
+    of the source (AC C8's survival arm), and the new job's own state is a
+    complete done state with the explicit cache signal (AC C2/C6):
+    cache_hit=true plus cache_source_token for traceability. Duration is
+    mirrored from the source's terminal state; ETA fields are null because
+    the result already exists. Session cookie/header echo is identical to
+    the normal admission path (C.9: the flag changes delivery, never the
+    response shape clients already depend on)."""
+    source_state = _read_state(source_token) or {}
+    admitted_at = time.time()
+    with _queue_lock:
+        seq = max((s.get("seq", 0) for s in _iter_states()), default=0) + 1
+        state = {
+            "token": token,
+            "status": "done",
+            "session": session,
+            "session_ident": session_ident,
+            "session_source": session_source,
+            "created_at": admitted_at,
+            "queued_at": admitted_at,
+            "seq": seq,
+            "progress": 1.0,
+            "message": "Served from transcript cache",
+            "stage": "done",
+            "filename": name,
+            "audio_path": str(audio_path),
+            "duration_seconds": source_state.get("duration_seconds"),
+            "audio_sha256": audio_sha256,
+            "cache_opt_in": True,
+            "cache_hit": True,
+            "cache_source_token": source_token,
+            "completed_at": admitted_at,
+        }
+        for artifact in ("output_result.json", "markdown_report.md"):
+            shutil.copyfile(JOBS_DIR / source_token / artifact,
+                            job_dir / artifact)
+        _write_state(state)
+    _cache_record_hit(JOBS_DIR, audio_sha256, _cache_config_fp(),
+                      session_ident, source_token)
+    logger.info("cache HIT served job token=%s from source=%s sha=%s",
+                token, source_token, audio_sha256[:12])
+    if not request.headers.get(_session_header_name(), "").strip():
+        response.headers[_session_header_name()] = session_id
+    response.set_cookie(
+        key=_session_cookie_name(),
+        value=session_id,
+        httponly=True,
+        samesite="lax",
+        path="/",
+    )
+    return JobResponse(
+        token=token,
+        status="done",
+        session=session_id,
+        queue_position=None,
+        estimated_wait_seconds=None,
+        estimated_completion_at=None,
+        audio_sha256=audio_sha256,
+        cache_hit=True,
     )
 
 
@@ -1960,6 +2362,12 @@ def _session_job_entries(
             # render null instead of omitting the field (AC A6).
             "audio_sha256": s.get("audio_sha256"),
         }
+        if s.get("cache_hit"):
+            # Card t_ac748379 AC C2/C6: the explicit cache signal travels on
+            # the listing too. Conditional key (the cancel_requested pattern
+            # above) — non-hit entries stay byte-for-byte the pre-cache
+            # shape, so the pinned listing key-set assertions hold.
+            entry["cache_hit"] = True
         if s.get("cancel_requested"):
             # Card t_fef54150 AC4: a kill in flight is visible here too —
             # the terminal state still reads 'processing' until the worker

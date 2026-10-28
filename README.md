@@ -72,6 +72,7 @@ Admission is checked in this order, each with its own failure mode:
 | Code | When | Detail |
 |---|---|---|
 | 415 | extension not whitelisted (checked before the upload touches disk) | `Unsupported file type. Supported: wav, mp3, m4a, aac, ogg, flac` |
+| 400 | `X-Cache` header present with a value outside `1`/`true`/`allow` (case/space-insensitive) — checked before the upload touches disk, never half-admitted (card t_ac748379) | `Invalid X-Cache value 'yes'; accepted: 1, true, allow (case-insensitive); absent or empty means off` |
 | 413 | upload exceeds `MAX_UPLOAD_BYTES` (enforced while streaming, not after) | `File exceeds maximum size of <bytes> bytes` |
 | 503 | queue at `MAX_QUEUE_DEPTH` (count of `queued` jobs; default 50) — **the only rejection path** (V1.5): a second job from the same session is queued, never turned away | `Queue is full (n/50 jobs queued). Retry after 30s.` + `Retry-After: <RETRY_AFTER_SECONDS>` header (default 30); the detail names both the depth and the Retry-After value |
 
@@ -245,7 +246,8 @@ never fabricates a duration for the job you are asking about.
 Every job state carries `audio_sha256`: a SHA-256 **content fingerprint**
 of the audio, computed at admission and surfaced on the `202` body, every
 `GET /v1/jobs/{token}` poll and every session-listing entry (card
-t_971ed589 — presentation and bookkeeping only: no cache reads it yet).
+t_971ed589). Card t_ac748379 uses it as the first half of the transcript
+cache key (see *Transcript cache* below).
 The hashed domain is the **decoded audio**, not the uploaded bytes: the
 upload is streamed through
 `ffmpeg -i file -f s16le -acodec pcm_s16le -ar 16000 -ac 1 -` (the
@@ -263,6 +265,45 @@ the job is admitted exactly as before — hashing failure never rejects.
 `null` also appears for jobs persisted before this field existed. A client
 wanting an MD5-style short id should truncate this value client-side; the
 server deliberately stores no second digest.
+
+#### Transcript cache — `X-Cache` (V1.7, card t_ac748379)
+
+A client that re-uploads audio it has already transcribed can be served the
+finished result instead of re-running the pipeline. The cache is
+**per-request opt-in** via a header (house style: per-request options
+travel by header, cf. `X-Session`) — the default service behaviour is
+byte-for-byte the pre-cache behaviour:
+
+```bash
+curl -sS -H 'X-Session: user-a' -H 'X-Cache: allow' \
+     -F 'file=@meeting.wav;type=audio/wav' http://127.0.0.1:8000/v1/jobs
+# MISS  -> 202 {... "status": "queued", "cache_hit": false}  (normal path;
+#          the finished result is STORED for later identical requests)
+# HIT   -> 202 {... "status": "done", "cache_hit": true, "cache_source_token": "<first job>"}
+#          answered immediately: never queued, never occupies a worker
+```
+
+Accepted `X-Cache` values, case-insensitive and whitespace-trimmed: `1`,
+`true`, `allow`. One flag, two directions: LOOKUP-if-present AND
+store-on-completion (a read-only mode is out of scope). Absent or empty
+means off; **any other value is a loud `400`** naming the accepted list,
+never silently treated as off or on. `cache_hit` is the explicit signal,
+always present on the `202` and on polls of cached jobs, and on the session
+listing and the history column reserved for it (card B). A served hit
+carries the source job's artifacts byte-for-byte (real copies, not
+symlinks) — only token/timestamp fields differ — and the flag selects the
+delivery path only, never the transcript content.
+
+Key = (`audio_sha256`, config fingerprint, `session_ident`). Because the
+session is part of the key, one tenant can never be served another
+tenant's transcript, and tenant-specific output (speaker naming, opt-in LLM
+cleanup) is safe by construction. The config fingerprint covers every
+output-affecting knob, so a config change can never silently serve a stale
+transcript. The deployment-level kill switch `CACHE_DISABLED` (env, default
+off) disables lookups and stores service-wide regardless of the header.
+Storage, the header/kill-switch interaction matrix, the retention wiring,
+and the exact fingerprint inputs are specified in one place:
+**CONFIG.md → "Transcript cache — two controls"**.
 
 #### Running-phase ETA (V1.5.x, card t_d64bdf29)
 
@@ -427,7 +468,7 @@ present, even for an empty history):
 | `duration_seconds` | audio length probed at admission; `null` when unknown |
 | `download_json` | relative URL `/v1/jobs/<token>/download?format=json` |
 | `download_md` | relative URL `/v1/jobs/<token>/download?format=md` — the per-job `markdown_report.md` already answers the .md export ask; history builds no md tables |
-| `cache_hit` | reserved for the cache card: always present, `false` until that card stamps it, so the column set never changes |
+| `cache_hit` | explicit transcript-cache signal (card t_ac748379): always present, `false` except for a job served from the cache, so the column set never changes |
 
 ### DELETE /v1/jobs/{token} — cancel a queued OR running job
 
