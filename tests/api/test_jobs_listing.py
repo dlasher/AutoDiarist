@@ -197,14 +197,21 @@ def test_ac5_mixed_states_newest_first_with_exact_keys(tmp_path, monkeypatch):
         assert entry["status"] == "done"
         assert set(entry) == {"token", "status", "progress",
                               "progress_percent", "stage", "source",
-                              "created_at", "audio_sha256"}
+                              "created_at", "audio_sha256", "error_code"}
         assert all(j["audio_sha256"] is None for j in body["jobs"])
+        # A done entry carries EXACTLY the base keys (card t_1799d07f added
+        # the never-absent error_code, null on in-flight/done entries).
+        assert entry["error_code"] is None
+        assert set(entry) == {"token", "status", "progress",
+                              "progress_percent", "stage", "source",
+                              "created_at", "audio_sha256", "error_code"}
 
         # The failed entry adds the error string; cancelled stays in view.
         failed = next(j for j in body["jobs"] if j["status"] == "failed")
         assert failed["error"] == "decode failed"
+        assert failed["error_code"] == "INTERNAL"  # unclassified raw string
         cancelled = next(j for j in body["jobs"] if j["status"] == "cancelled")
-        assert "error" not in cancelled or cancelled.get("error") is None
+        assert cancelled["error_code"] is None  # AC7: cancel != failure
 
 
 def test_ac5_same_created_at_tiebreaks_by_seq_desc(tmp_path, monkeypatch):

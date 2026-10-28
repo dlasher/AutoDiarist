@@ -404,3 +404,31 @@ a code reader — since the V2 retention sweep (card t_5e6200fc) it reads live
 in `api/main.py`, together with its two new disk-pressure siblings
 (`DISK_MIN_FREE_MIB`, `DISK_CHECK_INTERVAL_SECONDS`), all documented in the
 retention table above.
+
+
+## Machine-readable error codes (card t_1799d07f)
+
+Failed jobs carry `error_code` — `OUT_OF_MEMORY`, `TIMEOUT`,
+`UNSUPPORTED_AUDIO`, `INPUT_TOO_LARGE`, `ENGINE_CRASHED`, `CONFIG_ERROR`,
+or `INTERNAL` — alongside the unchanged `error`/`message` strings.
+Cancelled jobs are NOT failures and carry no code (`error_code: null`).
+The
+vocabulary, classification rules and actions are documented in
+`pipeline/errors.py`, `README.md` (*Error codes*) and `TROUBLESHOOTING.md`.
+
+## Environment variable catalogue (card t_1799d07f)
+
+The complete, authoritative list of every env knob the app reads — name,
+default as the code actually falls back to, where it is read, and what it
+affects — lives in `pipeline/config_vars.py` and is **mechanically
+verified** against the source tree:
+
+```
+scripts/check-config-catalog.py
+```
+
+The checker fails (exit 1) if a knob is read anywhere in `api/`,
+`pipeline/`, or the container entrypoint/wrapper without being catalogued
+(or catalogued but never read), and if a recorded default drifts from the
+code's literal default. Add your knob to `pipeline/config_vars.py` in the
+same commit that reads it and this stays true by construction.

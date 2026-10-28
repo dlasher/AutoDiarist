@@ -137,6 +137,11 @@ Answers `200` for every session, including a brand-new one (empty list):
   *Running-phase ETA*); `failed` entries
   add `error`. `cancelled` jobs stay listed — terminal states are still part
   of "what did I submit".
+  absent when ETA emission is disabled); `failed` entries
+  add `error`. Every entry also carries `error_code` — the machine-readable
+  failure code on `failed` entries (see *Error codes*), `null` everywhere
+  else (cancelled jobs are not failures). `cancelled` jobs stay listed
+  — terminal states are still part of "what did I submit".
 - Order: newest-first (`created_at` desc, stable `seq` desc tiebreak).
 - `?limit=` defaults to 50 and clamps to `[1, 200]` — out-of-range values
   clamp instead of erroring; a non-integer `limit` is `422`. `total` reports
@@ -207,7 +212,8 @@ path) — treat those as opaque.
   `/v1/jobs/{token}/download` (the poll payload does not carry a URL field).
 - `failed` — `stage` stays at the boundary where the work broke, `progress`
   holds its monotonic value **below 1.0** (a failure never looks done), plus
-  `error` (the exception message from the worker).
+  `error` (the exception message from the worker) and `error_code` (see
+  *Error codes*).
 - `cancelled` — `message: "Cancelled by client while queued"` plus
   `cancelled_at`; `stage`/`progress` freeze at their last published values.
 
@@ -544,6 +550,31 @@ FIFO order is preserved across restarts. The round-robin pointer is a file
 under `JOBS_DIR` too, so a restarted service continues the same fairness
 round instead of letting an established submitter re-jump ahead of a session
 that has not been served yet.
+
+#### Error codes (card t_1799d07f)
+
+Every `failed` job carries a **stable machine-readable `error_code`**
+alongside the human `error`/`message` strings — those two fields are
+unchanged, this is purely additive. The code tells you which class of
+failure happened, and each class has a different operator/client action:
+
+| `error_code`      | What happened                                                                 | What to do                                                            |
+|-------------------|-------------------------------------------------------------------------------|-----------------------------------------------------------------------|
+| `OUT_OF_MEMORY`   | GPU ran out of VRAM — incl. the deterministic N=4 signature on the 4 GB card   | Lower `MAX_PROCESSING_GLOBAL` to the host's measured ceiling (3 there). |
+| `TIMEOUT`         | `CRISPASR_TIMEOUT_SECONDS` ceiling expired (hosts ship at 10800)               | Raise the timeout, or split the input.                                |
+| `UNSUPPORTED_AUDIO` | The upload could not be decoded (ffmpeg/ffprobe: corrupt, wrong codec, empty) | Re-encode or reject client-side; identical bytes fail identically.    |
+| `INPUT_TOO_LARGE` | The upload exceeded `MAX_UPLOAD_BYTES` (HTTP 413)                              | Smaller input; the bytes themselves are the problem.                  |
+| `ENGINE_CRASHED`  | The engine ran and failed with no known signature                              | Report a bug — include the `error` string.                            |
+| `CONFIG_ERROR`    | Deployment env is wrong (e.g. missing sherpa assets, bad `DIAR_METHOD`)        | Fix the environment; retrying the job cannot help.                    |
+| `INTERNAL`        | Honest catch-all for everything else (e.g. empty transcript results)           | Read the `error` string; nothing above matched.                       |
+
+Cancelled jobs are NOT failures: `error_code` is null on `cancelled`,
+`done`, and in-flight jobs (the field itself is always present in status
+responses, never absent). Classification lives in `pipeline/errors.py`
+(the vocabulary and per-code actions are documented there); a job record
+persisted before this feature is classified from its raw error string on
+read, so old jobs surface codes too. See `TROUBLESHOOTING.md` for the
+failure-signature details.
 
 #### Fair-share scheduling (V1.5, card t_4b40acfd)
 
