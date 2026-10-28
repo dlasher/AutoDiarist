@@ -191,12 +191,26 @@ can be trusted:
   that — the hold is not stdio buffering, so no shim can fix it. Stdout
   chunk lines still refine progress when the burst finally arrives, which
   is why short jobs always looked healthy before this fix.
+* **The shipped sherpa path is SPLIT into two invocations (card
+  t_7685c6da).** The pinned engine runs its external-sherpa diarization
+  pre-pass BEFORE the slice loop (crispasr_run.cpp order), so when
+  diarization is handed to the engine via `--diarize --sherpa-bin`, the
+  `-pp` lines are withheld behind the pre-pass: measured ZERO of 264
+  slice lines on the 119-minute file while the 249-second panel
+  published 9 of 9 (a fast pre-pass masks the defect — which is why the
+  short-file behaviour never revealed it). The pipeline therefore runs
+  the engine ASR-only (no `--diarize`; `-ojf` so word timestamps survive
+  for turn splitting), spawns the same `SHERPA_BIN` wrapper itself, and
+  labels segments by max time-overlap exactly as the engine's
+  `assign_speakers_from_global_sherpa` does — restoring per-slice
+  progress and making `diarizing` a real, separately published stage.
+  An unset `SHERPA_BIN` (bare engine probes) keeps the legacy
+  single-invocation command.
 * **Never a timer.** No heartbeat, no wall-clock interpolation: a
   progress value that moves without engine evidence is a lie, and a
   progress value that lies about work done is worse than a frozen one.
-  Where the engine itself runs a silent blocking stage (the global sherpa
-  timeline pre-pass), progress honestly stays at the band floor until the
-  next real boundary.
+  Where the engine itself runs a silent blocking stage, progress
+  honestly stays at the band floor until the next real boundary.
 
 ## Spell check (`pipeline/spellcheck.py`)
 

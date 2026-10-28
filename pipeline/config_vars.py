@@ -92,6 +92,11 @@ CATALOG: tuple[ConfigVar, ...] = (
               "Wall-clock ceiling per engine run; expiry kills the process group "
               "and the job records error_code=TIMEOUT — raise this (hosts run "
               "10800) when TIMEOUT appears."),
+    ConfigVar("CRISPASR_SHERPA_TIMEOUT_SEC", None, "pipeline/transcribe.py",
+              "Override for the pipeline-side diarization subprocess timeout "
+              "(split path, card t_7685c6da); unset = engine parity — "
+              "max(120, ceil(audio_s) * 5), the formula crispasr applies to "
+              "its own sherpa pre-pass."),
     ConfigVar("VRAM_LIMIT_MIB", "3584", "pipeline/transcribe.py",
               "Per-engine VRAM cap (card total from nvidia-smi); the sampler "
               "kills runs crossing it with TranscriptionOOM -> error_code"

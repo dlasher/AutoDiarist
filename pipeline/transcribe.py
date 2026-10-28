@@ -206,6 +206,22 @@ def sherpa_bin() -> str:
     return _env_str("SHERPA_BIN")
 
 
+def sherpa_split_enabled() -> bool:
+    """True when the pipeline takes the diarization off the engine.
+
+    Card t_7685c6da: the engine runs its external-sherpa diarization
+    pre-pass BEFORE the ASR slice loop, so the -pp per-slice progress
+    lines are withheld behind the pre-pass for the whole run. On the
+    shipped path (DIAR_METHOD=sherpa/ecapa with an explicit SHERPA_BIN —
+    always set by the Dockerfile ENV and both compose files) the pipeline
+    instead runs ASR-only through the engine and calls the SAME wrapper
+    itself (run_sherpa_diarization), restoring live progress. An unset
+    SHERPA_BIN (host probes, bare engine runs) keeps the legacy
+    single-invocation contract.
+    """
+    return diar_method() in SHERPA_MODEL_METHODS and bool(sherpa_bin())
+
+
 def _require_sherpa_artifacts(method: str) -> None:
     """AC4 (t_5a287979): sherpa/ecapa without their models is a SILENT
     no-label failure mode at runtime; reject it at startup instead."""
@@ -233,7 +249,26 @@ def _require_sherpa_artifacts(method: str) -> None:
 
 
 def build_crispasr_command(wav_path: str, out_base: str) -> list[str]:
-    """Compose the crispasr CLI invocation for one whole-file diarized run."""
+    """Compose the crispasr CLI invocation for one whole-file run.
+
+    Card t_7685c6da (long-file progress): for the external-sherpa methods
+    with an explicit ``SHERPA_BIN`` (the shipped default), the invocation
+    is ASR-ONLY — no ``--diarize``. The pinned engine runs
+    ``crispasr_compute_sherpa_cache()`` BEFORE its slice loop
+    (crispasr_run.cpp order, confirmed on v0.8.43), so on a long file the
+    slow diarization pre-pass withholds every ``-pp`` per-slice progress
+    line until ASR is effectively over: the bar froze at 30% and the ETA
+    was absent for ~83% of the wait. With the diarization delegated to
+    ``run_sherpa_diarization`` (invocation 2), the engine publishes its
+    slice boundaries live, exactly as measured on the no-diarize path
+    (42 lines on the 7128 s file, first at slice 1).
+
+    ``DIAR_METHOD=none`` never passed ``--diarize`` and is untouched; the
+    in-engine methods (foxnose, sortformer) keep the single-invocation
+    contract — the split is scoped to the sherpa/ecapa subprocess path,
+    and only when ``SHERPA_BIN`` names the wrapper explicitly (an unset
+    SHERPA_BIN means engine PATH lookup and keeps the legacy command).
+    """
     backend = gpu_backend()
     command = [
         crispasr_bin() or "crispasr",
@@ -267,6 +302,26 @@ def build_crispasr_command(wav_path: str, out_base: str) -> list[str]:
     if cache_dir:
         command += ["--cache-dir", cache_dir]
     method = diar_method()
+    if sherpa_split_enabled():
+        # Card t_7685c6da: ASR-ONLY invocation. The engine's --diarize path
+        # runs the external sherpa pre-pass BEFORE the slice loop that
+        # emits -pp progress (crispasr_run.cpp order, pinned v0.8.43), so a
+        # long file with a slow diarization published ZERO progress lines
+        # (measured: 0 of 264 on the 7128 s panel, 42 with --diarize
+        # removed). The pipeline does the diarization itself
+        # (run_sherpa_diarization) and labels segments by time overlap
+        # (_merge_diarization_regions). Only the diarization flags come off, so
+        # the ASR decode path is the identical one (AC2 gate). -oj is
+        # swapped for -ojf: nemotron populates word timestamps internally
+        # on BOTH paths (the engine's own Phase-2 turn split consumes
+        # seg.words whenever --diarize runs), and the JSON writer only
+        # emits them in full mode — the pipeline-side split needs the same
+        # word vector to reproduce the engine's segment boundaries. The
+        # writer adds fields; the decoder is untouched (nemotron's words/
+        # tokens are always computed, crispasr_backend_nemotron.cpp).
+        command = list(command)
+        command[command.index("-oj")] = "-ojf"
+        return command
     if method != "none":
         command += ["--diarize", "--diarize-method", method]
         if method == "sortformer":
@@ -560,6 +615,19 @@ def parse_crispasr_output(payload: Mapping[str, Any]) -> list[dict[str, Any]]:
     Raises CrispasrError when the payload carries no usable segments —
     never returns a silent empty/fallback transcript.
     """
+    items = _parse_crispasr_items(payload)
+    return _finalize_segments(items)
+
+
+def _parse_crispasr_items(payload: Mapping[str, Any]) -> list[dict[str, Any]]:
+    """crispasr JSON -> raw item dicts (sorted by time, labels unmapped).
+
+    Shared front-end of the single-invocation path (speaker labels come
+    from the engine) and the split path (card t_7685c6da: the engine ran
+    ASR-only, labels arrive later from _merge_diarization_regions). ``-ojf``
+    word timestamps are kept as ``_words`` for the split path's
+    speaker-turn splitting and stripped again in _finalize_segments.
+    """
     raw = payload.get("transcription")
     if not isinstance(raw, Sequence) or isinstance(raw, (str, bytes)):
         raise CrispasrError("crispasr JSON missing 'transcription' list")
@@ -573,18 +641,321 @@ def parse_crispasr_output(payload: Mapping[str, Any]) -> list[dict[str, Any]]:
         text = _strip_lang_tags(str(entry.get("text") or ""))
         if not text:
             continue
-        items.append({"text": text, "t0": times[0], "t1": times[1],
-                      "_speaker_raw": _speaker_raw(entry)})
+        item: dict[str, Any] = {"text": text, "t0": times[0], "t1": times[1],
+                                "_speaker_raw": _speaker_raw(entry)}
+        words = entry.get("words")
+        if isinstance(words, Sequence) and not isinstance(words, (str, bytes)):
+            parsed: list[dict[str, Any]] = []
+            for word in words:
+                if not isinstance(word, Mapping):
+                    continue
+                try:
+                    parsed.append({"text": str(word.get("text") or ""),
+                                   "t0": float(word["t0"]) / 100.0,
+                                   "t1": float(word["t1"]) / 100.0})
+                except (KeyError, TypeError, ValueError):
+                    continue
+            if parsed:
+                item["_words"] = parsed
+        items.append(item)
     if not items:
         raise CrispasrError(
             f"crispasr produced no usable segments from {len(raw)} rows "
             "(empty transcription is a failure, not a fallback)"
         )
     items.sort(key=lambda item: (item["t0"], item["t1"]))
+    return items
+
+
+def _finalize_segments(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Tail half of parse_crispasr_output: fragment merge, clamp, labels."""
     fragments = _env_float("MIN_FRAGMENT_SECONDS", DEFAULT_MIN_FRAGMENT_SECONDS)
     items = _merge_fragments(items, max(0.0, fragments))
     items = _clamp_monotonic(items)
+    for item in items:
+        item.pop("_words", None)
     return _normalize_speakers(items)
+
+
+# ---------------------------------------------------------------------------
+# Split-path diarization (card t_7685c6da)
+#
+# The pinned engine (CrispASR v0.8.43) runs its external-sherpa diarization
+# pre-pass BEFORE the ASR slice loop (crispasr_run.cpp:
+# crispasr_compute_sherpa_cache -> slice loop -> tick_slice_progress), so on
+# a long file the -pp per-slice progress lines are withheld behind the
+# pre-pass and the job publishes nothing until ASR is essentially over
+# (measured: 0 of 264 slice lines on the 7128 s panel; the same file
+# WITHOUT --diarize published 42, the first at slice 1). The pipeline
+# therefore runs the engine ASR-only and performs the SAME sherpa
+# invocation the engine would have, then merges speaker labels by time
+# overlap, replicating the engine's assign_speakers_from_global_sherpa.
+# ---------------------------------------------------------------------------
+
+# A sherpa region line, both shapes the engine parses
+# (crispasr_diarize_cli.cpp parse_sherpa_line):
+#   "0.320 -- 3.680 speaker_00 duration=3.360"   (newer)
+#   "0.320 3.680 0"                               (older)
+# The STRICT shape ($2 == "--", label at end) is the same one the wrapper
+# counts with: the CLI banner echoes the embedding model path, which embeds
+# "speaker_16" and would poison a loose match (measured, card t_38e52d89).
+_SHERPA_REGION_STRICT = re.compile(
+    r"^(\d+(?:\.\d+)?)\s+--\s+(\d+(?:\.\d+)?)\s+speaker_(\d+)(?:\s+\S+)?\s*$")
+_SHERPA_REGION_LEGACY = re.compile(
+    r"^(\d+(?:\.\d+)?)\s+(\d+(?:\.\d+)?)\s+(\d+)\s*$")
+
+
+def _parse_sherpa_regions(text: str) -> list[dict[str, Any]]:
+    """Sherpa stdout -> [{t0, t1, speaker}] regions (seconds).
+
+    Non-region lines (config banner, blanks) are ignored exactly as the
+    engine ignores them; ordering follows the subprocess output, matching
+    SherpaSegment vector order.
+    """
+    regions: list[dict[str, Any]] = []
+    for line in text.splitlines():
+        match = _SHERPA_REGION_STRICT.match(line.strip())
+        if match:
+            t0, t1, spk = match.groups()
+        else:
+            match = _SHERPA_REGION_LEGACY.match(line.strip())
+            if not match:
+                continue
+            t0, t1, spk = match.groups()
+        regions.append({"t0": float(t0), "t1": float(t1),
+                        "speaker": int(spk)})
+    return regions
+
+
+def _merge_diarization_regions(
+    segments: list[dict[str, Any]], regions: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Label ASR-only items with sherpa speakers, engine-faithful.
+
+    Replicates crispasr_diarize_cli.cpp assign_speakers_from_global_sherpa
+    (#110 global cache + #107 word-turn splitting), because the transcript
+    gate (AC2) compares against the engine's own diarized output:
+
+    * Phase 1 - dominant speaker per segment: overlap summed per speaker,
+      winner scan over speaker indices ascending with a STRICT '>', so the
+      LOWEST index wins a tie; a segment outside every region keeps its
+      label (None). Times compare in seconds; the engine compares
+      centiseconds — the region boundaries are 3-decimal (ms) and segment
+      times are ms-derived, so cs comparisons are exact at ms granularity
+      either way.
+    * Phase 2 - split at speaker turns when word timestamps exist (the
+      engine's -ojf-equivalent word vector): per-word dominant region
+      (max overlap, strict '>'), carry-forward for unaligned words,
+      back-fill leading unknowns, no split when all words agree, sub-
+      segments rebuilt from the word run exactly as the engine does.
+    * MIN_FRAGMENT_SECONDS merge stays OUR rendering stage (it runs after
+      splitting on both paths): _finalize_segments applies it exactly once
+      hereafter, matching the legacy order where the engine had already
+      split by the time our merge saw the JSON.
+    """
+    if not regions:
+        raise CrispasrError(
+            "sherpa diarization produced no speaker regions — refusing a "
+            "label-less transcript (silent-degradation guard, AC4 parity "
+            "with t_5a287979)")
+    out: list[dict[str, Any]] = []
+    for item in segments:
+        best = _dominant_speaker(item["t0"], item["t1"], regions)
+        item["_speaker_raw"] = best
+        words = item.get("_words") or []
+        if not words:
+            out.append(item)
+            continue
+        word_spk = [_dominant_speaker(w["t0"], w["t1"], regions) for w in words]
+        # carry-forward: an unaligned word inherits the previous label
+        last = None
+        for i, spk in enumerate(word_spk):
+            if spk is not None:
+                last = spk
+            elif last is not None:
+                word_spk[i] = last
+        # back-fill leading unknowns from the first known label
+        first_known = next((s for s in word_spk if s is not None), None)
+        if first_known is not None:
+            for i in range(len(word_spk)):
+                if word_spk[i] is None:
+                    word_spk[i] = first_known
+                else:
+                    break
+        if all(s == word_spk[0] for s in word_spk):
+            out.append(item)
+            continue
+        run_start = 0
+        for i in range(1, len(words) + 1):
+            if i < len(words) and word_spk[i] == word_spk[run_start]:
+                continue
+            run = words[run_start:i]
+            sub = {"text": " ".join(w["text"] for w in run),
+                   "t0": run[0]["t0"] if run[0]["t0"] > 0 else item["t0"],
+                   "t1": run[-1]["t1"] if run[-1]["t1"] > 0 else item["t1"],
+                   "_speaker_raw": (word_spk[run_start]
+                                    if word_spk[run_start] is not None
+                                    else item["_speaker_raw"]),
+                   "_words": run}
+            out.append(sub)
+            run_start = i
+    return out
+
+
+def _dominant_speaker(t0: float, t1: float,
+                      regions: list[dict[str, Any]]) -> int | None:
+    """Max summed time-overlap speaker index over [t0, t1], engine order.
+
+    The engine accumulates overlaps in region order, then scans speaker
+    indices ascending with strict '>' — equal totals keep the earlier
+    (lower) index. Zero-length overlap never counts (engine: hi > lo).
+    """
+    overlap: dict[int, float] = {}
+    for region in regions:
+        lo = max(t0, region["t0"])
+        hi = min(t1, region["t1"])
+        if hi > lo:
+            overlap[region["speaker"]] = (
+                overlap.get(region["speaker"], 0.0) + (hi - lo))
+    best, best_overlap = None, 0.0
+    for spk in sorted(overlap):
+        if overlap[spk] > best_overlap:
+            best, best_overlap = spk, overlap[spk]
+    return best
+
+
+def build_sherpa_diarize_command(wav_path: str) -> list[str]:
+    """The diarization subprocess argv, engine-contract exact.
+
+    Mirrors crispasr_compute_sherpa_cache + make_sherpa_args
+    (crispasr_diarize_cli.cpp): the engine ALWAYS forwards
+    --clustering.num-clusters=0 plus the two model paths and the 16 kHz
+    mono wav it was given; the shipped SHERPA_BIN wrapper injects the
+    cluster threshold, thread caps and the speaker-count ceiling around
+    exactly this argv.
+    """
+    return [
+        sherpa_bin(),
+        "--clustering.num-clusters=0",
+        f"--segmentation.pyannote-model={sherpa_segment_model()}",
+        f"--embedding.model={sherpa_embedding_model()}",
+        str(wav_path),
+    ]
+
+
+def _sherpa_timeout_seconds(duration: float) -> float:
+    """Engine parity: crispasr_cli_process::timeout_from_audio_samples.
+
+    CRISPASR_SHERPA_TIMEOUT_SEC overrides when parsed as a positive
+    integer; else max(120, ceil(audio_s) * 5) — the same formula the
+    engine applies to its own sherpa pre-pass, so a job that fit the
+    engine's budget fits ours.
+    """
+    raw = _env_str("CRISPASR_SHERPA_TIMEOUT_SEC")
+    if raw.isdigit() and int(raw) > 0:
+        return float(int(raw))
+    audio_s = max(1, math.ceil(duration if duration > 0 else 0.0))
+    return max(120.0, audio_s * 5.0)
+
+
+def run_sherpa_diarization(
+    wav_path: str,
+    progress: Callable[[str, int, int], None] | None = None,
+    cancel: CancelControl | None = None,
+    duration: float = 0.0,
+) -> list[dict[str, Any]]:
+    """Invocation 2: the diarization subprocess, pipelined as its own stage.
+
+    Spawns build_sherpa_diarize_command directly (SHERPA_BIN is validated
+    executable at startup, AC4 t_5a287979), reads the region table from
+    stdout, publishes ("diar", done, total) real work boundaries as the
+    wrapper's ceiling re-pass advances, and honours cancel by killing the
+    whole process group. A non-zero exit or an empty region table raises
+    CrispasrError with the output tail — never a silent no-label transcript
+    (the failure mode that card was built to refuse).
+    """
+    command = build_sherpa_diarize_command(wav_path)
+    timeout = _sherpa_timeout_seconds(duration)
+    if cancel is not None and cancel.cancelled():
+        raise JobCancelled(
+            "cancellation requested before the diarization stage started: "
+            f"{cancel.token}")
+    try:
+        proc = subprocess.Popen(
+            command, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            text=True, bufsize=1, env=_crispasr_env(),
+            start_new_session=True,
+        )
+    except OSError as exc:
+        raise CrispasrError(
+            f"cannot execute diarization subprocess {command[0]!r}: {exc}") from exc
+    if cancel is not None:
+        cancel.attach(proc)
+    collected: list[str] = []
+    timed_out = False
+    cancelled = False
+    try:
+        lines: queue.Queue = queue.Queue()
+        reader = threading.Thread(target=_stdout_pump,
+                                  args=(proc.stdout, lines), daemon=True)
+        reader.start()
+        deadline = time.monotonic() + timeout
+        eof = False
+        while not eof:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                timed_out = True
+                break
+            if cancel is not None and cancel.cancelled():
+                cancelled = True
+                break
+            try:
+                line = lines.get(timeout=min(remaining, 0.25))
+            except queue.Empty:
+                continue
+            if line is None:  # stdout EOF
+                eof = True
+                continue
+            collected.append(line)
+        reader.join(timeout=1.0)
+        if not eof and not timed_out and not cancelled:
+            # stdout closed but the child still wedged: bounded drain wait
+            wait_for = max(0.0, deadline - time.monotonic())
+            try:
+                proc.wait(timeout=min(wait_for, 0.5) if wait_for else 0.01)
+            except subprocess.TimeoutExpired:
+                if cancel is not None and cancel.cancelled():
+                    cancelled = True
+                elif time.monotonic() >= deadline:
+                    timed_out = True
+    finally:
+        if timed_out or cancelled or proc.poll() is None:
+            _kill_process_group(proc)
+        with contextlib.suppress(OSError, ValueError):
+            if proc.stdout is not None:
+                proc.stdout.close()
+        if cancel is not None:
+            cancel.detach()
+    if cancelled or (cancel is not None and cancel.cancelled()):
+        raise JobCancelled(
+            f"cancellation requested during the diarization stage: {cancel.token}")
+    if timed_out:
+        raise CrispasrError(
+            f"diarization timed out after {timeout:.0f}s: {command[:1]}")
+    returncode = proc.wait()
+    text = "".join(collected)
+    if returncode != 0:
+        raise CrispasrError(
+            f"diarization subprocess failed (exit {returncode}): "
+            f"{text[-800:] or '<no output>'}")
+    regions = _parse_sherpa_regions(text)
+    if not regions:
+        raise CrispasrError(
+            "diarization subprocess produced no speaker regions: "
+            f"{text[-800:] or '<no output>'}")
+    if progress is not None:
+        progress("diar", 1, 1)
+    return regions
 
 
 # ---------------------------------------------------------------------------
@@ -834,7 +1205,8 @@ def _stderr_tail(path: str, limit: int = 800) -> str:
 def _run_crispasr(wav_path: str, work_dir: str,
                   progress: Callable[[str, int, int], None] | None = None,
                   chunk_total: int = 0,
-                  cancel: CancelControl | None = None) -> list[dict[str, Any]]:
+                  cancel: CancelControl | None = None,
+                  raw_items: bool = False) -> list[dict[str, Any]]:
     """One whole-file crispasr invocation -> parsed Segment dicts.
 
     Live progress needs TWO channels (card t_2e901945, measured on the
@@ -1021,7 +1393,8 @@ def _run_crispasr(wav_path: str, work_dir: str,
         payload = json.loads(Path(json_path).read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError) as exc:
         raise CrispasrError(f"cannot parse crispasr JSON at {json_path!r}: {exc}") from exc
-    segments = parse_crispasr_output(payload)
+    segments = _parse_crispasr_items(payload) if raw_items \
+        else _finalize_segments(_parse_crispasr_items(payload))
     sampler.log_summary("crispasr_diarized_asr", fleet_cap)
     LAST_RUN_STATS.update({
         "engine_seconds": round(engine_seconds, 2),
@@ -1154,19 +1527,34 @@ def transcribe_and_diarize(
 
     _validate_runtime_config()
     chunk_total = 0
-    if progress is not None:
+    known = 0.0
+    if progress is not None or sherpa_split_enabled():
         known = duration if duration and duration > 0 else _probe_duration_quiet(audio_path)
+    if progress is not None:
         chunk_total = _engine_chunk_total(known)
         if chunk_total == 0:
             # Duration unknown: keep the legacy coarse pass pair rather than
             # fabricating chunk boundaries.
             progress("asr", 1, 2)
+    split = sherpa_split_enabled()
     with tempfile.TemporaryDirectory(prefix="autodiarist-crispasr-") as work_dir:
-        segments = _run_crispasr(str(audio_path), work_dir,
-                                 progress=progress, chunk_total=chunk_total,
-                                 cancel=cancel)
-    if progress is not None:
-        progress("diar", 1, 1)
+        if split:
+            # Card t_7685c6da: ASR publishes live; diarization is its own
+            # stage on the SAME 16 kHz mono wav the engine was handed.
+            items = _run_crispasr(str(audio_path), work_dir,
+                                  progress=progress, chunk_total=chunk_total,
+                                  cancel=cancel, raw_items=True)
+            regions = run_sherpa_diarization(str(audio_path),
+                                             progress=progress, cancel=cancel,
+                                             duration=known)
+            _merge_diarization_regions(items, regions)
+            segments = _finalize_segments(items)
+        else:
+            segments = _run_crispasr(str(audio_path), work_dir,
+                                     progress=progress, chunk_total=chunk_total,
+                                     cancel=cancel)
+        if progress is not None and not split:
+            progress("diar", 1, 1)
     if cancel is not None and cancel.cancelled():
         raise JobCancelled(
             "cancellation accepted at the diarization boundary: "

@@ -188,6 +188,13 @@ def test_long_job_publishes_progress_during_slow_diarization(tmp_path, monkeypat
     monkeypatch.setenv("CRISPASR_BIN", str(engine))
     monkeypatch.setenv("DIAR_METHOD", "sherpa")
     monkeypatch.setenv("SHERPA_BIN", str(sherpa))
+    gguf = tmp_path / tr.Q4K_GGUF_NAME
+    gguf.write_bytes(b"ggmf")
+    monkeypatch.setenv("GGUF_MODEL", str(gguf))
+    for env, fname in (("SHERPA_SEGMENT_MODEL", "seg.onnx"),
+                       ("SHERPA_EMBEDDING_MODEL", "emb.onnx")):
+        (tmp_path / fname).write_bytes(b"onnx-stub")
+        monkeypatch.setenv(env, str(tmp_path / fname))
     monkeypatch.setattr(tr, "_probe_duration", lambda path: 60.0)
 
     events: list[tuple[float, str, int, int]] = []
@@ -205,16 +212,31 @@ def test_long_job_publishes_progress_during_slow_diarization(tmp_path, monkeypat
 
     asr_events = [e for e in events if e[1] == "asr"]
     diar_events = [e for e in events if e[1] == "diar"]
-    # AC1: more than ONE distinct ASR boundary, published DURING the run
-    # (never after the engine exited — the pump's exit-drain must not be
-    # what carries the boundaries).
-    assert len({(d, t) for _, _, d, t in asr_events}) > 1, asr_events
-    assert not [e for e in events if e[1] == "asr-after-exit"], events
+    # AC1: more than ONE distinct ASR boundary, published DURING the run.
+    # The stderr pump may re-feed the final boundary through the legacy
+    # post-exit drain (stdout counter stayed 0); what must hold is that
+    # BOTH distinct boundaries were live before the engine's exit marker
+    # existed — that is the live-progress claim the defect defeated.
+    after_exit = [e for e in events if e[1] == "asr-after-exit"]
+    live = [e for e in events if e[1] == "asr"
+            and (not after_exit or e[0] < min(a[0] for a in after_exit))]
+    assert len({(e[2], e[3]) for e in live}) > 1, events
     # AC3: diarizing is a separate published phase, after the ASR band.
     assert diar_events, events
-    # AC4: the public sequence is non-decreasing in done/total.
-    ratios = [(e[2] / e[3]) for e in events if e[1] in ("asr", "diar")]
-    assert ratios == sorted(ratios), events
+    # AC4: public progress stays monotonic. Mirror the API band mapping
+    # (transcribing [0.30,0.60), diarizing [0.60,0.75)) over the raw
+    # (stage, done/total) reports and check non-decreasing order.
+    bands = {"asr": (0.30, 0.60), "diar": (0.60, 0.75)}
+    public = [round(lo + max(0.0, min(1.0, e[2] / e[3])) * (hi - lo), 4)
+              for e in events if e[1] in bands for lo, hi in [bands[e[1]]]]
+    assert public == sorted(public), events
+    # AC5 input: the transcribing band itself must show >1 distinct value
+    # (the API maps (done,total) onto the band; a moving band is what the
+    # running-phase ETA observes, so the ETA publishes during ASR).
+    assert len({round(0.30 + max(0.0, min(1.0, e[2] / e[3])) * 0.30, 4)
+                for e in asr_events}) > 1, asr_events
+    assert diar_events and all(e[0] >= max(a[0] for a in asr_events)
+                               for e in diar_events)
     # The ASR invocation really ran without the engine diarization flags.
     argv_text = argv_dump.read_text()
     assert "--diarize" not in argv_text and "--sherpa-bin" not in argv_text
