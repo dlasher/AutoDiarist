@@ -92,6 +92,11 @@ CATALOG: tuple[ConfigVar, ...] = (
               "Wall-clock ceiling per engine run; expiry kills the process group "
               "and the job records error_code=TIMEOUT — raise this (hosts run "
               "10800) when TIMEOUT appears."),
+    ConfigVar("CRISPASR_SHERPA_TIMEOUT_SEC", None, "pipeline/transcribe.py",
+              "Override for the pipeline-side diarization subprocess timeout "
+              "(split path, card t_7685c6da); unset = engine parity — "
+              "max(120, ceil(audio_s) * 5), the formula crispasr applies to "
+              "its own sherpa pre-pass."),
     ConfigVar("VRAM_LIMIT_MIB", "3584", "pipeline/transcribe.py",
               "Per-engine VRAM cap (card total from nvidia-smi); the sampler "
               "kills runs crossing it with TranscriptionOOM -> error_code"
@@ -111,6 +116,15 @@ CATALOG: tuple[ConfigVar, ...] = (
               "Diarization backend; any other value is a CrispasrConfigError."),
     ConfigVar("MIN_FRAGMENT_SECONDS", "2.0", "pipeline/transcribe.py",
               "Fragments shorter than this are merged into neighbours at render."),
+    ConfigVar("DIARIZATION_MIN_REGIONS_PER_MINUTE", "0.5", "pipeline/transcribe.py",
+              "Speaker-region plausibility floor per audio minute (card "
+              "t_dc5c2abb). Measured calibration: the collapsed 8411 s run "
+              "produced 0.0143 regions/min vs 3.37 for the clean run; the "
+              "gap is 235x, so 0.5 is nowhere near a knife's edge."),
+    ConfigVar("DIARIZATION_MIN_CHECK_SECONDS", "600.0", "pipeline/transcribe.py",
+              "Small-audio exemption for the degradation guard: shorter "
+              "files are never judged by the region floor (a 137 s "
+              "single-speaker recording at 0.44 regions/min must PASS)."),
     ConfigVar("SILENCE_SPLIT_SECONDS", "1.5", "pipeline/renderer.py",
               "Silence gap that starts a new speaker run in the rendered report."),
     # ---- sherpa subprocess (diarization engine) -------------------------------
@@ -136,6 +150,19 @@ CATALOG: tuple[ConfigVar, ...] = (
               "Sherpa clustering threshold: higher merges fewer speakers."),
     ConfigVar("DIARIZATION_MAX_SPEAKERS", "8", "wrapper",
               "Speaker ceiling: the most speakers FastClustering may emit."),
+    ConfigVar("DIAR_HEARTBEAT_INTERVAL_SECONDS",
+              "2.0", "pipeline/transcribe.py",
+              "Seconds between progress ticks published while the split "
+              "diarization subprocess runs (card t_868131e3). Ticks are an "
+              "elapsed-time ESTIMATE, labelled estimated=true on the job "
+              "status; the real completion boundary is still published. "
+              "Non-numeric or non-positive warns and keeps 2.0."),
+    ConfigVar("DIAR_CHUNK_ESTIMATE_SECONDS",
+              "2.0", "pipeline/transcribe.py",
+              "Estimated CPU seconds of diarization work per heartbeat tick "
+              "(card t_868131e3): total = ceil(audio x rate / this), rate = "
+              "PROCESSING_SECONDS_PER_AUDIO_SECOND. Non-numeric or "
+              "non-positive warns and keeps 2.0."),
     ConfigVar("SHERPA_LD_LIBRARY_PATH", "/opt/sherpa/lib", "wrapper",
               "Library path the wrapper uses for the sherpa subprocess."),
     # ---- serving --------------------------------------------------------

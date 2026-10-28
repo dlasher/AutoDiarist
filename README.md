@@ -566,6 +566,7 @@ failure happened, and each class has a different operator/client action:
 | `INPUT_TOO_LARGE` | The upload exceeded `MAX_UPLOAD_BYTES` (HTTP 413)                              | Smaller input; the bytes themselves are the problem.                  |
 | `ENGINE_CRASHED`  | The engine ran and failed with no known signature                              | Report a bug — include the `error` string.                            |
 | `CONFIG_ERROR`    | Deployment env is wrong (e.g. missing sherpa assets, bad `DIAR_METHOD`)        | Fix the environment; retrying the job cannot help.                    |
+| `DIARIZATION_DEGRADED` | The engine exited 0 but the diarization silently degraded (OOM-killed sherpa pre-pass -> collapsed speakers); the service REFUSED the transcript (card t_dc5c2abb) | Raise the container memory limit or lower concurrency, or use a shorter file; the `error` string carries the region count and the engine's own exit code. |
 | `INTERNAL`        | Honest catch-all for everything else (e.g. empty transcript results)           | Read the `error` string; nothing above matched.                       |
 
 Cancelled jobs are NOT failures: `error_code` is null on `cancelled`,
@@ -1254,15 +1255,21 @@ Other long-input facts worth knowing:
   the whole job**, not an idle timeout. Long inputs need it raised — e.g.
   `CRISPASR_TIMEOUT_SECONDS=10800`.
 - The progress endpoint advances during a long job on real engine work
-  boundaries (card t_2e901945). The adapter runs the engine with `-pp`,
-  which writes one unbuffered line per completed ~30 s audio slice to
-  stderr (`crispasr: progress =  X% (k/N slices)`); the service tails that
-  stream and refines the `transcribing` band per slice — measured 28
-  distinct advancing values polling `GET /v1/jobs/{token}` every 10 s
-  through a 39-minute job. It is still not a timer: if the engine is
-  silent, progress honestly freezes (no synthetic heartbeat exists), and
-  a `started_at` check remains the fallback during the engine's silent
-  blocking stages (the global diarization pre-pass).
+  boundaries (cards t_2e901945, t_7685c6da). The adapter runs the engine
+  with `-pp`, which writes one unbuffered line per completed ~30 s audio
+  slice to stderr (`crispasr: progress =  X% (k/N slices)`); the service
+  tails that stream and refines the `transcribing` band **one progress
+  value per engine slice** — a 39-minute job publishes ~78 values, an
+  119-minute job ~238. History note (t_7685c6da): the t_2e901945 claim
+  was overstated at ship time — the engine runs its external-sherpa
+  diarization pre-pass BEFORE the slice loop, so a long file with a slow
+  diarization published ZERO values while ASR ran (bar frozen at 0.30,
+  ETA absent). The shipped path no longer hands diarization to the
+  engine: the engine runs ASR-only (progress live from slice 1) and the
+  pipeline invokes the sherpa wrapper itself as the separate `diarizing`
+  stage. It is still not a timer: if the engine is silent, progress
+  honestly freezes (no synthetic heartbeat exists), and a `started_at`
+  check remains the fallback during any silent blocking stage.
 
 
 ### CPU execution — measured (v0.8.43, kanban t_18ee2e43)

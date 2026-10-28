@@ -1,5 +1,116 @@
 # Changelog
 
+<<<<<<< HEAD
+## [Unreleased] — long-file progress: ASR/diarization split restores live per-slice progress on the shipped sherpa path (card t_7685c6da)
+
+**A long job's bar moves during ASR now — one progress value per engine
+slice — and the running-phase ETA publishes from the first completed slice
+instead of only after diarization.** The t_2e901945 `-pp` stream (card
+t_2e901945) was real but overstated: the pinned crispasr v0.8.43 runs its
+external-sherpa diarization pre-pass BEFORE the slice loop that emits the
+per-slice lines (crispasr_run.cpp order; source-confirmed), so on the
+shipped path a long file whose diarization was slow enough to matter
+published ZERO progress for the entire ASR phase (measured: 0 of 264
+slice lines on the 119-minute panel; 42 of 42 with `--diarize` removed).
+The 249 s panel's diarization is quick, so it published 9 of 9 and the
+short-file behaviour masked the defect from every earlier check.
+
+- **The single engine invocation splits into two.** Invocation 1 runs the
+  engine ASR-only: `build_crispasr_command` drops
+  `--diarize/--diarize-method/--sherpa-*` when `DIAR_METHOD` is a
+  sherpa-model method AND `SHERPA_BIN` names the wrapper (the shipped
+  default; an unset `SHERPA_BIN` keeps the legacy single-invocation
+  contract for bare engine probes). `-oj` becomes `-ojf` so per-word
+  timestamps reach the JSON — the decoder is untouched (nemotron always
+  computes words; the writer just starts emitting them), the ASR flags
+  are otherwise byte-identical, and the split merge consumes the same
+  word vector the engine's own turn-splitting did (AC2 identity gate).
+  Invocation 2 is `run_sherpa_diarization`: the pipeline spawns the SAME
+  `SHERPA_BIN` wrapper with the engine's exact argv contract
+  (`--clustering.num-clusters=0` + the two model paths + the 16 kHz wav,
+  `crispasr_compute_sherpa_cache`/`make_sherpa_args` parity), enforces
+  engine-parity timeout (`CRISPASR_SHERPA_TIMEOUT_SEC` overrides; else
+  `max(120, ceil(audio_s) * 5)`), kills the process group on expiry or
+  cancel, and RAISES on non-zero exit or an empty region table — a failed
+  diarization is never a silent single-speaker transcript (t_5a287979
+  AC4 parity).
+- **The merge replicates the engine, not an approximation.**
+  `_merge_diarization_regions` implements `assign_speakers_from_global_sherpa`
+  semantics exactly: segment-level dominant speaker by summed time
+  overlap with a strict-`>` scan over ascending speaker indices (lowest
+  index wins ties), and word-level speaker-turn splitting when word
+  timestamps exist (per-word dominant region, carry-forward for
+  unaligned words, back-fill of leading unknowns, sub-segments rebuilt
+  from the word run). Sherpa stdout parses with the same strict
+  `"<t0> -- <t1> speaker_<N>"` shape the wrapper counts with (loose
+  matching would read the model-path banner as a label), plus the
+  legacy `"<t0> <t1> <N>"` shape the engine also accepts.
+- **`diarizing` becomes a real stage** (band 0.60–0.75 was already in
+  STAGE_PROGRESS; it was simply never reached as a separate phase).
+  Progress stays monotonic across the boundary; the public band
+  structure and every existing consumer are unchanged.
+- **Regression test pins the discriminating condition with no long
+  fixture and no GPU** (tests/pipeline/test_long_file_progress_split.py):
+  a stub sherpa binary that SLEEPS plus a fake engine that streams real
+  `-pp` cadence prove >1 distinct live ASR boundary before the engine's
+  exit marker exists, the separate `diar` publication, argv contract,
+  merge tie/None semantics, and fail-loud parity. A short file on the
+  REAL stack would pass while the defect is live — the card's stated
+  trap — so the stub's slowness, not file length, is what is asserted.
+- Config: new knob `CRISPASR_SHERPA_TIMEOUT_SEC` catalogued
+  (`scripts/check-config-catalog.py` green at 63 entries).
+- Gates: AC2 byte-identity (segment count, speaker count, text and full
+  JSON sha256) VERIFIED via the identity gate (`/root/identity_gate.sh`,
+  NV host, old baked path vs new split path in the same pinned container,
+  serial on the T400): on the intro clip the fixed branch reproduces the
+  OLD transcript exactly — old sha == new sha ==
+  `d9b0fbfcdc1dbb93501f4f10bcd91a9b0ede2cf9640811521c5f183ebc1e7266`
+  (4 segments, 2 speakers) — and the planner's round-1 panel gate on the
+  249 s fixture (18 segments, 3 speakers) was byte-identical as well
+  (full sha `cf5f569da282…`). The gate's run BEFORE the planner's
+  harness fix caught a real call-site regression — the merge's returned
+  list was discarded, collapsing the clip to 1 segment / 1 speaker —
+  fixed and pinned by a call-site test
+  (`test_transcribe_and_diarize_call_site_keeps_the_word_split`, which
+  fails with the fix reverted). The 119-minute identity gate is PENDING
+  (the long-file run had no surviving artifacts at handoff time); the
+  long-file live progress/ETA check is the planner's remaining step.
+=======
+## [Unreleased] — silent speaker collapse: the service now REFUSES degraded diarization (`DIARIZATION_DEGRADED`) instead of emitting a collapsed transcript (card t_dc5c2abb)
+
+A long file whose **global sherpa pre-pass is OOM-killed** (measured NV
+host: `sherpa global run failed with exit code 137` on an 8411 s
+7-speaker panel) silently falls back to per-slice sherpa and completed
+"successfully" with **2 speaker regions over 1 ASR segment** — a
+transcript with meaningless speaker labels the existing zero-label guard
+does not catch. A collapsed answer shipped is worse than a loud failure.
+
+- **New typed refusal** `pipeline.transcribe.DiarizationDegradedError`
+  and **new machine-readable `error_code: DIARIZATION_DEGRADED`**
+  (distinct from `OUT_OF_MEMORY`, which describes the *cause*: clients
+  branch on the diarization degradation itself; the engine message names
+  region count, audio duration, the engine's own exit code, and the
+  remedy — no container logs needed).
+- **Engine-path detection (AC5):** `_run_crispasr` now parses the
+  captured stderr for the engine's own degradation signatures before the
+  output is accepted. Source-confirmed invariant: `sherpa → N speaker
+  regions over M ASR segments` prints ONLY on the per-slice fallback
+  path (the healthy global pass prints `sherpa global → N`), so its
+  presence on long audio is conclusive.
+- **Region-table floor (split path, AC1/AC3):**
+  `_check_diarization_plausibility(regions, duration)` refuses long audio
+  with implausibly few regions (floor `max(2, minutes x rate)`) and is
+  the entry point the split path (card t_7685c6da, runs the wrapper
+  directly and never sees engine stderr) plugs into.
+- **Calibrated by measurement, not guessed:** the collapsed 8411 s run
+  produced 0.0143 regions/min vs 3.37 for the clean run (235x gap); the
+  `DIARIZATION_MIN_CHECK_SECONDS` (600) exemption keeps the measured
+  legitimate 137 s single-speaker control (0.44/min) ACCEPTED — a bare
+  rate floor would reject it. Both knobs are catalogued and
+  README/CONFIG/TROUBLESHOOTING/PIPELINE-documented.
+- The zero-label refusal (card t_5a287979) is unchanged and still fires.
+>>>>>>> origin/coder/t_dc5c2abb
+
 ## [Unreleased] — transcript cache: per-request X-Cache opt-in (lookup AND store), CACHE_DISABLED kill switch, key = decoded-audio sha256 + config fingerprint + session (card t_ac748379)
 
 **`POST /v1/jobs` now accepts an optional `X-Cache` header** that lets a

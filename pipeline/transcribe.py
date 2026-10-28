@@ -39,6 +39,7 @@ VRAM discipline inherited from card t_95726260:
 from __future__ import annotations
 
 import contextlib
+import inspect
 import json
 import logging
 import math
@@ -47,6 +48,7 @@ import queue
 import re
 import shutil
 import signal
+import string
 import subprocess
 import tempfile
 import threading
@@ -93,6 +95,11 @@ DEFAULT_VRAM_LIMIT_MIB = 3584.0  # 3.5 GiB cap from card t_95726260
 DEFAULT_MIN_FRAGMENT_SECONDS = 2.0
 DEFAULT_TIMEOUT_SECONDS = 1800.0
 _LANG_TAG = re.compile(r"\s*<\s*[A-Za-z]{2,3}(?:-[A-Za-z0-9]{1,8})?\s*>")
+
+# Outer characters stripped before comparing a segment-text token against a
+# word-vector entry (card t_1b74a0e5 token/run matching). string.punctuation
+# plus the typographic quotes/dashes the engine's transcripts carry.
+_TOKEN_PUNCT = string.punctuation + "\u2018\u2019\u201c\u201d\u2026"
 _SPEAKER_INDEX = re.compile(r"speaker\s*(\d+)", re.IGNORECASE)
 # nemotron auto-slices audio into ~30 s windows inside the engine (spike
 # measurement); streamed chunk-line end times map onto that window grid so
@@ -148,6 +155,20 @@ class CrispasrConfigError(CrispasrError):
     """CRISPASR_BIN / GGUF_MODEL / DIAR_METHOD configuration is invalid."""
 
 
+class DiarizationDegradedError(CrispasrError):
+    """The labeling diarization pass degraded to collapsed speaker
+    regions (card t_dc5c2abb).
+
+    Distinct from the zero-label CrispasrError (t_5a287979 AC4): there the
+    engine emitted NO labels at all (missing models); here the engine
+    exited 0 with a plausible-looking transcript whose speaker separation
+    is meaningless — the measured shape is 2 regions for 8411 s after the
+    global sherpa pre-pass was OOM-killed (exit 137) and the engine fell
+    back per-slice. Both refuse loudly; this one names the degradation,
+    the measured numbers, and the remedy.
+    """
+
+
 def _env_str(name: str, default: str = "") -> str:
     return os.environ.get(name, default).strip()
 
@@ -157,6 +178,28 @@ def _env_float(name: str, default: float) -> float:
         return float(os.environ.get(name, str(default)))
     except ValueError as exc:
         raise CrispasrConfigError(f"{name} must be numeric") from exc
+
+
+def _env_positive_float(name: str, default: float) -> float:
+    """Float knob with a house-style safe fallback: unset/blank keeps the
+    default; non-numeric, zero or negative warn and keep the default.
+    A heartbeat knob must never be able to crash a running stage or set
+    an unbounded/forever cadence on a config typo (card t_868131e3)."""
+    raw = os.environ.get(name, "")
+    if not raw.strip():
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        logger.warning(
+            "config: %s=%r is not a number; using %.3f", name, raw, default)
+        return default
+    if not math.isfinite(value) or value <= 0:
+        logger.warning(
+            "config: %s=%r must be a positive number; using %.3f",
+            name, raw, default)
+        return default
+    return value
 
 
 def crispasr_bin() -> str:
@@ -206,6 +249,22 @@ def sherpa_bin() -> str:
     return _env_str("SHERPA_BIN")
 
 
+def sherpa_split_enabled() -> bool:
+    """True when the pipeline takes the diarization off the engine.
+
+    Card t_7685c6da: the engine runs its external-sherpa diarization
+    pre-pass BEFORE the ASR slice loop, so the -pp per-slice progress
+    lines are withheld behind the pre-pass for the whole run. On the
+    shipped path (DIAR_METHOD=sherpa/ecapa with an explicit SHERPA_BIN —
+    always set by the Dockerfile ENV and both compose files) the pipeline
+    instead runs ASR-only through the engine and calls the SAME wrapper
+    itself (run_sherpa_diarization), restoring live progress. An unset
+    SHERPA_BIN (host probes, bare engine runs) keeps the legacy
+    single-invocation contract.
+    """
+    return diar_method() in SHERPA_MODEL_METHODS and bool(sherpa_bin())
+
+
 def _require_sherpa_artifacts(method: str) -> None:
     """AC4 (t_5a287979): sherpa/ecapa without their models is a SILENT
     no-label failure mode at runtime; reject it at startup instead."""
@@ -233,7 +292,26 @@ def _require_sherpa_artifacts(method: str) -> None:
 
 
 def build_crispasr_command(wav_path: str, out_base: str) -> list[str]:
-    """Compose the crispasr CLI invocation for one whole-file diarized run."""
+    """Compose the crispasr CLI invocation for one whole-file run.
+
+    Card t_7685c6da (long-file progress): for the external-sherpa methods
+    with an explicit ``SHERPA_BIN`` (the shipped default), the invocation
+    is ASR-ONLY — no ``--diarize``. The pinned engine runs
+    ``crispasr_compute_sherpa_cache()`` BEFORE its slice loop
+    (crispasr_run.cpp order, confirmed on v0.8.43), so on a long file the
+    slow diarization pre-pass withholds every ``-pp`` per-slice progress
+    line until ASR is effectively over: the bar froze at 30% and the ETA
+    was absent for ~83% of the wait. With the diarization delegated to
+    ``run_sherpa_diarization`` (invocation 2), the engine publishes its
+    slice boundaries live, exactly as measured on the no-diarize path
+    (42 lines on the 7128 s file, first at slice 1).
+
+    ``DIAR_METHOD=none`` never passed ``--diarize`` and is untouched; the
+    in-engine methods (foxnose, sortformer) keep the single-invocation
+    contract — the split is scoped to the sherpa/ecapa subprocess path,
+    and only when ``SHERPA_BIN`` names the wrapper explicitly (an unset
+    SHERPA_BIN means engine PATH lookup and keeps the legacy command).
+    """
     backend = gpu_backend()
     command = [
         crispasr_bin() or "crispasr",
@@ -267,6 +345,26 @@ def build_crispasr_command(wav_path: str, out_base: str) -> list[str]:
     if cache_dir:
         command += ["--cache-dir", cache_dir]
     method = diar_method()
+    if sherpa_split_enabled():
+        # Card t_7685c6da: ASR-ONLY invocation. The engine's --diarize path
+        # runs the external sherpa pre-pass BEFORE the slice loop that
+        # emits -pp progress (crispasr_run.cpp order, pinned v0.8.43), so a
+        # long file with a slow diarization published ZERO progress lines
+        # (measured: 0 of 264 on the 7128 s panel, 42 with --diarize
+        # removed). The pipeline does the diarization itself
+        # (run_sherpa_diarization) and labels segments by time overlap
+        # (_merge_diarization_regions). Only the diarization flags come off, so
+        # the ASR decode path is the identical one (AC2 gate). -oj is
+        # swapped for -ojf: nemotron populates word timestamps internally
+        # on BOTH paths (the engine's own Phase-2 turn split consumes
+        # seg.words whenever --diarize runs), and the JSON writer only
+        # emits them in full mode — the pipeline-side split needs the same
+        # word vector to reproduce the engine's segment boundaries. The
+        # writer adds fields; the decoder is untouched (nemotron's words/
+        # tokens are always computed, crispasr_backend_nemotron.cpp).
+        command = list(command)
+        command[command.index("-oj")] = "-ojf"
+        return command
     if method != "none":
         command += ["--diarize", "--diarize-method", method]
         if method == "sortformer":
@@ -554,11 +652,207 @@ def _normalize_speakers(
     return segments
 
 
+# ---------------------------------------------------------------------------
+# Sherpa degradation detection (card t_dc5c2abb)
+# ---------------------------------------------------------------------------
+#
+# The engine's GLOBAL sherpa pre-pass buffers the whole file; on long
+# audio it can be OOM-killed (exit 137), after which the engine silently
+# FALLS BACK to per-slice sherpa. Measured on the NV host (8411.072 s
+# panel file): the fallback produced 2 speaker regions over 1 ASR segment
+# and the run completed "successfully" with a collapsed-speaker transcript
+# the zero-label guard does not catch.
+#
+# Engine stderr signatures (source-confirmed in crispasr_diarize_cli.cpp,
+# v0.8.43: the 'over M ASR segments' line prints ONLY on the per-slice
+# fallback path; the global success path prints 'sherpa global -> N'):
+_SHERPA_GLOBAL_FAILED = re.compile(
+    r"sherpa global run (?:failed with exit code \d+"
+    r"|timed out after \d+ s|produced no segments)")
+_SHERPA_FALLBACK_REGIONS = re.compile(
+    r"sherpa →\s+(\d+) speaker regions over\s+(\d+) ASR segments")
+_SHERPA_GLOBAL_REGIONS = re.compile(
+    r"sherpa global →\s+(\d+) speaker regions")
+
+# Calibration (measured legit counts, card body + planner receipt):
+#   8411 s clean run  -> 472 regions, 6 speakers  (3.37 segments/min)
+#   8411 s DEFECT     ->   2 regions              (0.0143 regions/min)
+#   249 s panel       -> 18 segments, 3 speakers  (legit, exempt anyway)
+#   137 s control     ->  1 region,  1 speaker    (legit single-speaker;
+#         a BARE rate floor would reject it at 0.44/min — the exemption
+#         below is what keeps AC3 true)
+# The gap legit-vs-defect on long audio is a factor of 235, so the floor
+# constants are not a knife's edge. Refuse only when BOTH conditions
+# hold: audio long enough that a tiny region count cannot be a legitimate
+# recording, AND the region count below a floor that scales with
+# duration. Operator-tunable via the two knobs (catalogued in
+# pipeline/config_vars.py); defaults are the measured shape.
+DIARIZATION_MIN_REGIONS_PER_MINUTE_DEFAULT = 0.5
+DIARIZATION_MIN_CHECK_SECONDS_DEFAULT = 600.0
+
+
+def _parse_sherpa_stderr(text: str) -> dict[str, Any]:
+    """Extract the engine's own sherpa degradation signals from stderr.
+
+    Returns ``{global_failed, fallback_regions, fallback_asr_segments,
+    global_regions}``; the *_regions keys are None when the line was never
+    printed. Total on arbitrary input (never raises). LAST matching line
+    wins per pattern: the fallback path prints one 'over M ASR segments'
+    line per slice (slice-local numbers — see _reject_degraded_sherpa,
+    where PRESENCE of the line is the signal, not its count), and the
+    captured number is message evidence only.
+    """
+    signal: dict[str, Any] = {"global_failed": None,
+                              "fallback_regions": None,
+                              "fallback_asr_segments": None,
+                              "global_regions": None}
+    if not text:
+        return signal
+    for line in text.splitlines():
+        match = _SHERPA_GLOBAL_FAILED.search(line)
+        if match:
+            signal["global_failed"] = line.strip()
+        match = _SHERPA_FALLBACK_REGIONS.search(line)
+        if match:
+            signal["fallback_regions"] = int(match.group(1))
+            signal["fallback_asr_segments"] = int(match.group(2))
+        match = _SHERPA_GLOBAL_REGIONS.search(line)
+        if match:
+            signal["global_regions"] = int(match.group(1))
+    return signal
+
+
+def _diarization_region_floor(duration_seconds: float) -> int:
+    """Minimum speaker regions a duration-``duration_seconds`` diarization
+    must produce to be believable (card t_dc5c2abb, AC1 threshold shape:
+    absolute floor scaled with duration with the small-audio exemption
+    applied by the caller — see calibration block above)."""
+    rate = _env_float("DIARIZATION_MIN_REGIONS_PER_MINUTE",
+                      DIARIZATION_MIN_REGIONS_PER_MINUTE_DEFAULT)
+    if rate < 0:
+        rate = 0.0
+    return max(2, int(duration_seconds / 60.0 * rate))
+
+
+def _check_diarization_plausibility(
+    regions: Sequence[Any] | int,
+    duration_seconds: float | None,
+    *,
+    engine_signal: str | None = None,
+    transcript_summary: str | None = None,
+) -> None:
+    """Refuse a collapsed speaker-region table; loud, typed, diagnostic.
+
+    ``regions`` is the DIARIZER's speaker-region table (the split path's
+    wrapper output; on the engine path a stand-in carrying the engine's
+    own reported region count) — NOT the transcript segment count: the
+    two are different quantities (472 segments came from 6 speakers on
+    the clean 8411 s run). ``duration_seconds`` is the audio length;
+    None/short audio falls under the small-audio exemption.
+
+    Raises ``DiarizationDegradedError`` (maps to the NEW
+    ``DIARIZATION_DEGRADED`` error code, AC4: distinct from the zero-label
+    refusal and from OUT_OF_MEMORY even though OOM is the usual root
+    cause). Never rejects a legitimate single-speaker recording below the
+    check threshold (AC3)."""
+    if duration_seconds is None or duration_seconds <= 0:
+        return
+    min_check = _env_float("DIARIZATION_MIN_CHECK_SECONDS",
+                           DIARIZATION_MIN_CHECK_SECONDS_DEFAULT)
+    if duration_seconds < min_check:
+        # Small-audio exemption: a short recording with one or two
+        # regions is exactly what a single-speaker upload looks like.
+        return
+    count = len(regions) if isinstance(regions, Sequence) else int(regions)
+    floor = _diarization_region_floor(duration_seconds)
+    if count >= floor:
+        return
+    message = (
+        f"crispasr diarization degraded: {count} speaker regions for "
+        f"{duration_seconds:.0f} s of audio "
+        f"(floor {floor} regions at {duration_seconds / 60.0:.1f} min) — "
+        "the global sherpa pre-pass failed and the engine's per-slice "
+        "fallback collapsed the speakers; refusing to emit a "
+        "collapsed-speaker transcript. Likely cause: the pre-pass was "
+        "OOM-killed — raise the container memory limit (or lower "
+        "concurrency), or use a shorter file"
+    )
+    if engine_signal:
+        message += f". Engine signal: {engine_signal}"
+    if transcript_summary:
+        message += f". {transcript_summary}"
+    raise DiarizationDegradedError(message)
+
+
+def _reject_degraded_sherpa(stderr_path: str,
+                            duration_seconds: float | None) -> None:
+    """Engine-path degradation check from the captured stderr FILE (AC5).
+
+    Source invariant (crispasr 0.8.43 diarize_cli, confirmed by reading
+    the code): ``sherpa → N speaker regions over M ASR segments`` prints
+    ONLY when the global pre-pass cache was invalid and the engine fell
+    back to per-slice sherpa — the path that re-inits speaker identity
+    every slice; the healthy path prints ``sherpa global → N`` instead.
+    So on this path EITHER degradation line is conclusive for long
+    audio, independent of the region count: N here is slice-local and
+    small by construction. Short audio stays under the same
+    small-audio-exemption as the region-table floor: a single-slice file
+    degraded to per-slice is byte-for-byte the global result.
+    """
+    try:
+        text = Path(stderr_path).read_text(errors="replace")
+    except OSError:
+        return  # stderr unreadable: nothing to inspect, never invent
+    signal = _parse_sherpa_stderr(text)
+    degraded = signal["global_failed"] is not None \
+        or signal["fallback_regions"] is not None
+    if not degraded:
+        return
+    min_check = _env_float("DIARIZATION_MIN_CHECK_SECONDS",
+                           DIARIZATION_MIN_CHECK_SECONDS_DEFAULT)
+    if not duration_seconds or duration_seconds < min_check:
+        return
+    regions = signal["fallback_regions"]
+    parts = [
+        (f"crispasr diarization degraded: the global sherpa pre-pass failed "
+         f"and the engine fell back to per-slice diarization for "
+         f"{duration_seconds:.0f} s of audio")
+    ]
+    if regions is not None:
+        floor = _diarization_region_floor(duration_seconds)
+        parts.append(
+            f"last fallback line carried {regions} slice-local speaker "
+            f"regions (a duration-scaled floor of {floor} whole-file "
+            f"regions is the calibration from the measured 8411 s run: "
+            f"472 segments clean vs 2 regions collapsed)")
+    if signal["global_failed"]:
+        parts.append(f"Engine signal: {signal['global_failed']}")
+    parts.append(
+        "refusing to emit a collapsed-speaker transcript. Likely cause: "
+        "the pre-pass was OOM-killed (exit 137 = SIGKILL) — raise the "
+        "container memory limit (or lower concurrency), or use a "
+        "shorter file")
+    raise DiarizationDegradedError(". ".join(parts))
+
+
 def parse_crispasr_output(payload: Mapping[str, Any]) -> list[dict[str, Any]]:
     """Map crispasr JSON to Segment dicts: {text, t0, t1, speaker}.
 
     Raises CrispasrError when the payload carries no usable segments —
     never returns a silent empty/fallback transcript.
+    """
+    items = _parse_crispasr_items(payload)
+    return _finalize_segments(items)
+
+
+def _parse_crispasr_items(payload: Mapping[str, Any]) -> list[dict[str, Any]]:
+    """crispasr JSON -> raw item dicts (sorted by time, labels unmapped).
+
+    Shared front-end of the single-invocation path (speaker labels come
+    from the engine) and the split path (card t_7685c6da: the engine ran
+    ASR-only, labels arrive later from _merge_diarization_regions). ``-ojf``
+    word timestamps are kept as ``_words`` for the split path's
+    speaker-turn splitting and stripped again in _finalize_segments.
     """
     raw = payload.get("transcription")
     if not isinstance(raw, Sequence) or isinstance(raw, (str, bytes)):
@@ -573,18 +867,620 @@ def parse_crispasr_output(payload: Mapping[str, Any]) -> list[dict[str, Any]]:
         text = _strip_lang_tags(str(entry.get("text") or ""))
         if not text:
             continue
-        items.append({"text": text, "t0": times[0], "t1": times[1],
-                      "_speaker_raw": _speaker_raw(entry)})
+        item: dict[str, Any] = {"text": text, "t0": times[0], "t1": times[1],
+                                "_speaker_raw": _speaker_raw(entry)}
+        words = entry.get("words")
+        if isinstance(words, Sequence) and not isinstance(words, (str, bytes)):
+            parsed: list[dict[str, Any]] = []
+            for word in words:
+                if not isinstance(word, Mapping):
+                    continue
+                try:
+                    # Card t_1b74a0e5: the segment text is tag-stripped
+                    # above; the word vector must be stripped too, or
+                    # <en-US> markers leak into every consumer of _words.
+                    parsed.append({"text": _strip_lang_tags(
+                                       str(word.get("text") or "")),
+                                   "t0": float(word["t0"]) / 100.0,
+                                   "t1": float(word["t1"]) / 100.0})
+                except (KeyError, TypeError, ValueError):
+                    continue
+            if parsed:
+                item["_words"] = parsed
+        items.append(item)
     if not items:
         raise CrispasrError(
             f"crispasr produced no usable segments from {len(raw)} rows "
             "(empty transcription is a failure, not a fallback)"
         )
     items.sort(key=lambda item: (item["t0"], item["t1"]))
+    return items
+
+
+def _finalize_segments(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Tail half of parse_crispasr_output: fragment merge, clamp, labels."""
     fragments = _env_float("MIN_FRAGMENT_SECONDS", DEFAULT_MIN_FRAGMENT_SECONDS)
     items = _merge_fragments(items, max(0.0, fragments))
     items = _clamp_monotonic(items)
+    for item in items:
+        item.pop("_words", None)
     return _normalize_speakers(items)
+
+
+# ---------------------------------------------------------------------------
+# Split-path diarization (card t_7685c6da)
+#
+# The pinned engine (CrispASR v0.8.43) runs its external-sherpa diarization
+# pre-pass BEFORE the ASR slice loop (crispasr_run.cpp:
+# crispasr_compute_sherpa_cache -> slice loop -> tick_slice_progress), so on
+# a long file the -pp per-slice progress lines are withheld behind the
+# pre-pass and the job publishes nothing until ASR is essentially over
+# (measured: 0 of 264 slice lines on the 7128 s panel; the same file
+# WITHOUT --diarize published 42, the first at slice 1). The pipeline
+# therefore runs the engine ASR-only and performs the SAME sherpa
+# invocation the engine would have, then merges speaker labels by time
+# overlap, replicating the engine's assign_speakers_from_global_sherpa.
+# ---------------------------------------------------------------------------
+
+# A sherpa region line, both shapes the engine parses
+# (crispasr_diarize_cli.cpp parse_sherpa_line):
+#   "0.320 -- 3.680 speaker_00 duration=3.360"   (newer)
+#   "0.320 3.680 0"                               (older)
+# The STRICT shape ($2 == "--", label at end) is the same one the wrapper
+# counts with: the CLI banner echoes the embedding model path, which embeds
+# "speaker_16" and would poison a loose match (measured, card t_38e52d89).
+_SHERPA_REGION_STRICT = re.compile(
+    r"^(\d+(?:\.\d+)?)\s+--\s+(\d+(?:\.\d+)?)\s+speaker_(\d+)(?:\s+\S+)?\s*$")
+_SHERPA_REGION_LEGACY = re.compile(
+    r"^(\d+(?:\.\d+)?)\s+(\d+(?:\.\d+)?)\s+(\d+)\s*$")
+
+
+def _parse_sherpa_regions(text: str) -> list[dict[str, Any]]:
+    """Sherpa stdout -> [{t0, t1, speaker}] regions (seconds).
+
+    Non-region lines (config banner, blanks) are ignored exactly as the
+    engine ignores them; ordering follows the subprocess output, matching
+    SherpaSegment vector order.
+    """
+    regions: list[dict[str, Any]] = []
+    for line in text.splitlines():
+        match = _SHERPA_REGION_STRICT.match(line.strip())
+        if match:
+            t0, t1, spk = match.groups()
+        else:
+            match = _SHERPA_REGION_LEGACY.match(line.strip())
+            if not match:
+                continue
+            t0, t1, spk = match.groups()
+        regions.append({"t0": float(t0), "t1": float(t1),
+                        "speaker": int(spk)})
+    return regions
+
+
+def _assign_tokens_to_runs(text: str, words: list[dict[str, Any]],
+                           run_index: list[int]) -> list[tuple[str, int]]:
+    """Map every token of a segment's ORIGINAL text onto a speaker run.
+
+    Card t_1b74a0e5: the engine's segment text and its word vector are two
+    sources that genuinely disagree - word texts carry <en-US> markers the
+    segment text has already had stripped, and the vector omits whole words
+    the text has (measured: 32 lost words / 206 chars on the 249 s panel).
+    Phase 2 therefore uses the word vector only for TIMING and derives the
+    sub-segment texts from the original text, so that joining the runs
+    reproduces the original exactly (modulo whitespace).
+
+    Walk the text tokens left to right against the words in order,
+    comparing case- and outer-punctuation-insensitively (word texts are
+    tag-stripped first, defensively, so a tagged vector still matches). A
+    token that matches consumes its word and joins that word's run. A
+    token with no matching word is an extra the vector lacks: it joins the
+    run of the NEXT unmatched word - the run around the timestamp gap it
+    precedes (measured on the old path, where 'with a focus' joined the run
+    starting with the next word) - falling back to the PREVIOUS run once
+    the vector is exhausted (the panel's tail shape, 'our customizable
+    strategic solutions allow.').
+    """
+    def norm(value: str) -> str:
+        return _strip_lang_tags(value).strip(_TOKEN_PUNCT).casefold()
+
+    assigned: list[tuple[str, int]] = []
+    wi = 0
+    last_run = run_index[-1]
+    for token in text.split():
+        if wi < len(words) and norm(token) == norm(words[wi]["text"]):
+            assigned.append((token, run_index[wi]))
+            wi += 1
+        elif wi < len(words):
+            assigned.append((token, run_index[wi]))
+        else:
+            assigned.append((token, last_run))
+    return assigned
+
+
+def _merge_diarization_regions(
+    segments: list[dict[str, Any]], regions: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Label ASR-only items with sherpa speakers, engine-faithful.
+
+    Replicates crispasr_diarize_cli.cpp assign_speakers_from_global_sherpa
+    (#110 global cache + #107 word-turn splitting), because the transcript
+    gate (AC2) compares against the engine's own diarized output:
+
+    * Phase 1 - dominant speaker per segment: overlap summed per speaker,
+      winner scan over speaker indices ascending with a STRICT '>', so the
+      LOWEST index wins a tie; a segment outside every region keeps its
+      label (None). Times compare in seconds; the engine compares
+      centiseconds — the region boundaries are 3-decimal (ms) and segment
+      times are ms-derived, so cs comparisons are exact at ms granularity
+      either way.
+    * Phase 2 - split at speaker turns when word timestamps exist (the
+      engine's -ojf-equivalent word vector): per-word dominant region
+      (max overlap, strict '>'), carry-forward for unaligned words,
+      back-fill leading unknowns, no split when all words agree, sub-
+      segments rebuilt from the word run exactly as the engine does.
+    * MIN_FRAGMENT_SECONDS merge stays OUR rendering stage (it runs after
+      splitting on both paths): _finalize_segments applies it exactly once
+      hereafter, matching the legacy order where the engine had already
+      split by the time our merge saw the JSON.
+    """
+    if not regions:
+        raise CrispasrError(
+            "sherpa diarization produced no speaker regions — refusing a "
+            "label-less transcript (silent-degradation guard, AC4 parity "
+            "with t_5a287979)")
+    out: list[dict[str, Any]] = []
+    for item in segments:
+        best = _dominant_speaker(item["t0"], item["t1"], regions)
+        item["_speaker_raw"] = best
+        words = item.get("_words") or []
+        if not words:
+            out.append(item)
+            continue
+        word_spk = [_word_speaker(w["t0"], w["t1"], regions) for w in words]
+        # carry-forward: an unaligned word inherits the previous label
+        last = None
+        for i, spk in enumerate(word_spk):
+            if spk is not None:
+                last = spk
+            elif last is not None:
+                word_spk[i] = last
+        # back-fill leading unknowns from the first known label
+        first_known = next((s for s in word_spk if s is not None), None)
+        if first_known is not None:
+            for i in range(len(word_spk)):
+                if word_spk[i] is None:
+                    word_spk[i] = first_known
+                else:
+                    break
+        if all(s == word_spk[0] for s in word_spk):
+            out.append(item)
+            continue
+        run_start = 0
+        run_index = [0] * len(words)
+        run_bounds: list[tuple[int, int]] = [(0, 0)]
+        for i in range(1, len(words) + 1):
+            if i < len(words) and word_spk[i] == word_spk[run_start]:
+                continue
+            run_bounds[-1] = (run_start, i)
+            for j in range(run_start, i):
+                run_index[j] = len(run_bounds) - 1
+            if i < len(words):
+                run_bounds.append((0, 0))
+                run_start = i
+        # Card t_1b74a0e5: sub-segment text is derived from the ORIGINAL
+        # segment text (never re-joined from the word vector, which drops
+        # words the text has and leaks language tags the text had
+        # stripped). Invariant: joining the run texts reproduces the
+        # original modulo whitespace.
+        run_tokens: list[list[str]] = [[] for _ in run_bounds]
+        for tok, run in _assign_tokens_to_runs(item["text"], words, run_index):
+            run_tokens[run].append(tok)
+        for k, (start, end) in enumerate(run_bounds):
+            run = words[start:end]
+            sub = {"text": " ".join(run_tokens[k]),
+                   "t0": run[0]["t0"] if run[0]["t0"] > 0 else item["t0"],
+                   "t1": run[-1]["t1"] if run[-1]["t1"] > 0 else item["t1"],
+                   "_speaker_raw": (word_spk[start]
+                                    if word_spk[start] is not None
+                                    else item["_speaker_raw"]),
+                   "_words": run}
+            out.append(sub)
+    return out
+
+
+def _word_speaker(t0: float, t1: float,
+                  regions: list[dict[str, Any]]) -> int | None:
+    """Speaker of a single WORD, engine Phase-2 order.
+
+    This is NOT the same rule as _dominant_speaker, and the difference is
+    what makes the split's boundaries match the engine's. The engine uses
+    two rules (CrispASR v0.8.43, examples/cli/crispasr_diarize_cli.cpp):
+
+      * Phase 1, the whole SEGMENT -> one speaker: overlap SUMMED per
+        speaker, then speaker indices scanned ascending with a strict '>',
+        so the lowest index wins a tie. That is _dominant_speaker.
+      * Phase 2, each WORD -> a speaker: the regions are scanned IN FILE
+        ORDER and the SINGLE region with the greatest overlap wins, with a
+        strict '>' so the FIRST region in file order wins a tie.
+
+    Summing (as _dominant_speaker does) is wrong for a word that straddles
+    two regions of the same speaker: the engine compares the single
+    overlaps, we compare the sums, and the two can pick different regions
+    — which moves the run boundary and changes the transcript. Measured on
+    the 249 s panel: the first run ended at 9.92 s on the old path and
+    10.80 s on ours, a 6-character difference in the output.
+
+    A degenerate word (t1 <= t0) is left unassigned (None) exactly as the
+    engine leaves it at -1, so the carry-forward handles it.
+    """
+    if t1 <= t0:
+        return None
+    best: int | None = None
+    best_overlap = 0.0
+    for region in regions:
+        lo = max(t0, region["t0"])
+        hi = min(t1, region["t1"])
+        if hi > lo and (hi - lo) > best_overlap:
+            best_overlap = hi - lo
+            best = region["speaker"]
+    return best
+
+
+def _dominant_speaker(t0: float, t1: float,
+                      regions: list[dict[str, Any]]) -> int | None:
+    """Max summed time-overlap speaker index over [t0, t1], engine order.
+
+    The engine accumulates overlaps in region order, then scans speaker
+    indices ascending with strict '>' — equal totals keep the earlier
+    (lower) index. Zero-length overlap never counts (engine: hi > lo).
+    """
+    overlap: dict[int, float] = {}
+    for region in regions:
+        lo = max(t0, region["t0"])
+        hi = min(t1, region["t1"])
+        if hi > lo:
+            overlap[region["speaker"]] = (
+                overlap.get(region["speaker"], 0.0) + (hi - lo))
+    best, best_overlap = None, 0.0
+    for spk in sorted(overlap):
+        if overlap[spk] > best_overlap:
+            best, best_overlap = spk, overlap[spk]
+    return best
+
+
+def build_sherpa_diarize_command(wav_path: str) -> list[str]:
+    """The diarization subprocess argv, engine-contract exact.
+
+    Mirrors crispasr_compute_sherpa_cache + make_sherpa_args
+    (crispasr_diarize_cli.cpp): the engine ALWAYS forwards
+    --clustering.num-clusters=0 plus the two model paths and the 16 kHz
+    mono wav it was given; the shipped SHERPA_BIN wrapper injects the
+    cluster threshold, thread caps and the speaker-count ceiling around
+    exactly this argv.
+    """
+    return [
+        sherpa_bin(),
+        "--clustering.num-clusters=0",
+        f"--segmentation.pyannote-model={sherpa_segment_model()}",
+        f"--embedding.model={sherpa_embedding_model()}",
+        str(wav_path),
+    ]
+
+
+def _sherpa_timeout_seconds(duration: float) -> float:
+    """Engine parity: crispasr_cli_process::timeout_from_audio_samples.
+
+    CRISPASR_SHERPA_TIMEOUT_SEC overrides when parsed as a positive
+    integer; else max(120, ceil(audio_s) * 5) — the same formula the
+    engine applies to its own sherpa pre-pass, so a job that fit the
+    engine's budget fits ours.
+    """
+    raw = _env_str("CRISPASR_SHERPA_TIMEOUT_SEC")
+    if raw.isdigit() and int(raw) > 0:
+        return float(int(raw))
+    audio_s = max(1, math.ceil(duration if duration > 0 else 0.0))
+    return max(120.0, audio_s * 5.0)
+
+
+# ---------------------------------------------------------------------------
+# Diarization-stage heartbeat (card t_868131e3)
+#
+# The sherpa CLI prints nothing while it runs, so between the last ASR
+# slice boundary and the finished region table the stage published EXACTLY
+# ONE event — ("diar", 1, 1) — and a 140-minute job went silent for ~50
+# minutes. The fix is a time-based heartbeat: total counts uniform work
+# chunks of the diarization stage's ESTIMATED cost, done advances with
+# elapsed time toward total (never reaching it), and the true
+# (total, total) boundary is published when the region table parses.
+# ---------------------------------------------------------------------------
+
+# The stage's cost model is the SAME rate constant the API's ETA uses
+# (PROCESSING_SECONDS_PER_AUDIO_SECOND; card: "feed the same estimate
+# rather than inventing a second source of truth").
+DIAR_HEARTBEAT_INTERVAL_DEFAULT = 2.0     # seconds between published ticks
+DIAR_CHUNK_ESTIMATE_DEFAULT = 2.0         # estimated seconds per tick
+DEFAULT_PROCESSING_RATE = 0.185           # s CPU per audio s (T400, api/main twin)
+
+
+def processing_rate_per_audio_second() -> float:
+    """Seconds of processing per second of audio, from the shared ETA
+    knob (default 0.185, the measured T400 rate). Exact 0 or junk falls
+    back to the default here — the heartbeat needs A rate, unlike the
+    API surface where 0 disables ETA emission."""
+    raw = (os.environ.get("PROCESSING_SECONDS_PER_AUDIO_SECOND") or "").strip()
+    try:
+        value = float(raw) if raw else DEFAULT_PROCESSING_RATE
+    except ValueError:
+        logger.warning(
+            "config: PROCESSING_SECONDS_PER_AUDIO_SECOND=%r is not a number;"
+            " using %.3f", raw, DEFAULT_PROCESSING_RATE)
+        value = DEFAULT_PROCESSING_RATE
+    return value if value > 0 else DEFAULT_PROCESSING_RATE
+
+
+def diar_heartbeat_settings() -> tuple[float, float]:
+    """(interval_seconds, chunk_estimate_seconds), both positive."""
+    return (
+        _env_positive_float("DIAR_HEARTBEAT_INTERVAL_SECONDS",
+                            DIAR_HEARTBEAT_INTERVAL_DEFAULT),
+        _env_positive_float("DIAR_CHUNK_ESTIMATE_SECONDS",
+                            DIAR_CHUNK_ESTIMATE_DEFAULT),
+    )
+
+
+def diar_tick_plan(*, duration: float, rate: float,
+                   chunk_seconds: float = DIAR_CHUNK_ESTIMATE_DEFAULT,
+                   ) -> tuple[int, float]:
+    """(total_ticks, seconds_per_tick) for the diarization stage.
+
+    total = ceil(duration x rate / chunk_seconds) — uniform estimated work
+    chunks of the stage's linear-model cost. seconds_per_tick = chunk /
+    rate, so a job that runs AT the model advances exactly one tick per
+    interval; the cap-then-final design keeps honesty when it runs slower
+    or faster. duration/rate at or below zero (unknown duration) yields
+    total 0: the caller must emit NO ticks rather than fabricate a
+    counter for a file it cannot measure.
+    """
+    if duration is None or duration <= 0 or rate <= 0 or chunk_seconds <= 0:
+        return 0, 0.0
+    cost = float(duration) * float(rate)
+    total = max(1, math.ceil(cost / float(chunk_seconds)))
+    return total, float(chunk_seconds) / float(rate)
+
+
+def _callback_accepts_kwarg(cb, name: str) -> bool:
+    """True when `cb` can receive the keyword `name` (a named parameter or
+    **kwargs). Legacy 3-arg callbacks (cards t_2e901945/t_7685c6da wired
+    `lambda stage, done, total: ...`) keep working unchanged — they simply
+    do not see the estimate label."""
+    try:
+        params = inspect.signature(cb).parameters
+    except (TypeError, ValueError):
+        return True
+    for param in params.values():
+        if param.kind is inspect.Parameter.VAR_KEYWORD:
+            return True
+        if param.name == name:
+            return True
+    return False
+
+
+class _DiarHeartbeat:
+    """Background tick publisher for one diarization stage (AC1-AC4).
+
+    Driven by the STAGE lifetime, not the subprocess's: the wrapper's
+    ceiling re-pass restarts the diarization underneath the wait loop
+    (pass 1 -> label count -> re-pass), so the clock starts once, when
+    the stage spawns, and never resets — the count cannot rewind across
+    a restart. Ticks are strictly below total (progress must not fake
+    completion), monotonic, and carry estimated=True + the method label
+    so no client can mistake a heartbeat for a real work boundary. The
+    thread touches no API lock; it only calls the progress callback,
+    which takes the queue lock for its own short write.
+    """
+
+    def __init__(self, progress, total: int, interval: float,
+                 tick_seconds: float) -> None:
+        self._progress = progress
+        self._labelled = _callback_accepts_kwarg(progress, "estimated")
+        self.total = total
+        self._interval = interval
+        self._tick = tick_seconds
+        self._started = time.monotonic()
+        self._stop = threading.Event()
+        self._published = 0
+        self._thread: threading.Thread | None = None
+
+    def start(self) -> None:
+        if self.total <= 0:
+            return
+        self._thread = threading.Thread(target=self._loop,
+                                         name="diar-heartbeat", daemon=True)
+        self._thread.start()
+
+    def _loop(self) -> None:
+        while not self._stop.wait(self._interval):
+            self.publish_now()
+
+    def publish_now(self) -> bool:
+        """Advance the elapsed-time model and publish if the value moved.
+        Returns True when a new tick was published. Monotonic by
+        construction: the model value only grows with elapsed time, and
+        an advance beyond total - 1 is held there until the real boundary
+        lands. EVERY publication here is labelled estimated=True — even
+        one triggered by an observed region line, because the VALUE is
+        model-derived, not a measured count of work (AC4: a client must
+        never mistake it for a real slice boundary)."""
+        if self.total <= 0:
+            return False
+        elapsed = time.monotonic() - self._started
+        model = int(elapsed / self._tick) if self._tick > 0 else 0
+        done = min(model, self.total - 1)
+        if done <= self._published:
+            return False
+        self._published = done
+        try:
+            if self._labelled:
+                self._progress("diar", done, self.total,
+                               estimated=True,
+                               estimate_method="elapsed_time_model")
+            else:
+                self._progress("diar", done, self.total)
+        except Exception:  # a progress sink must never kill the stage
+            logger.exception("diarization heartbeat publish failed")
+        return True
+
+    def last_published(self) -> int:
+        return self._published
+
+    def stop(self) -> None:
+        """Idempotent: signal the loop AND join it, so the heartbeat never
+        outlives the stage (AC5: nothing holds the process or a lock open
+        after the stage exits, on any path — success, cancel, timeout)."""
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=self._interval + 1.0)
+            self._thread = None
+
+
+def run_sherpa_diarization(
+    wav_path: str,
+    progress: Callable[..., None] | None = None,
+    cancel: CancelControl | None = None,
+    duration: float = 0.0,
+) -> list[dict[str, Any]]:
+    """Invocation 2: the diarization subprocess, pipelined as its own stage.
+
+    Spawns build_sherpa_diarize_command directly (SHERPA_BIN is validated
+    executable at startup, AC4 t_5a287979), reads the region table from
+    stdout, and publishes the ``("diar", done, total)`` series. Two
+    signals, one band (card t_868131e3):
+
+      * REAL boundaries — every strict region line the stdout pump
+        delivers while the stage is in flight (the wrapper's ceiling
+        re-pass streams its table before exit) — advances `done` and is
+        NOT labelled.
+      * A TIME-BASED HEARTBEAT for the silence between them: total counts
+        uniform work chunks of the stage's linear-model cost (the SAME
+        rate constant as the API ETA), `done` advances with elapsed time
+        toward it, capped at total - 1 so a tick never claims completion.
+        Every tick carries estimated=True + estimate_method, so a client
+        can never mistake it for a measured boundary.
+
+    The heartbeat clock starts with the STAGE, not the subprocess, so the
+    wrapper's re-pass restart cannot rewind the count. The final event is
+    always the true (total, total) boundary. Honour cancel kills the whole
+    process group; the heartbeat thread stops on every exit path. A
+    non-zero exit or an empty region table raises CrispasrError with the
+    output tail — never a silent no-label transcript (the failure mode
+    that card was built to refuse).
+    """
+    command = build_sherpa_diarize_command(wav_path)
+    timeout = _sherpa_timeout_seconds(duration)
+    if cancel is not None and cancel.cancelled():
+        raise JobCancelled(
+            "cancellation requested before the diarization stage started: "
+            f"{cancel.token}")
+    try:
+        proc = subprocess.Popen(
+            command, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            text=True, bufsize=1, env=_crispasr_env(),
+            start_new_session=True,
+        )
+    except OSError as exc:
+        raise CrispasrError(
+            f"cannot execute diarization subprocess {command[0]!r}: {exc}") from exc
+    if cancel is not None:
+        cancel.attach(proc)
+    heartbeat: _DiarHeartbeat | None = None
+    if progress is not None:
+        interval, chunk = diar_heartbeat_settings()
+        total, tick_seconds = diar_tick_plan(duration=duration,
+                                             rate=processing_rate_per_audio_second(),
+                                             chunk_seconds=chunk)
+        if total > 0:
+            heartbeat = _DiarHeartbeat(progress, total, interval, tick_seconds)
+            heartbeat.start()
+    collected: list[str] = []
+    timed_out = False
+    cancelled = False
+    try:
+        lines: queue.Queue = queue.Queue()
+        reader = threading.Thread(target=_stdout_pump,
+                                  args=(proc.stdout, lines), daemon=True)
+        reader.start()
+        deadline = time.monotonic() + timeout
+        eof = False
+        while not eof:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                timed_out = True
+                break
+            if cancel is not None and cancel.cancelled():
+                cancelled = True
+                break
+            try:
+                line = lines.get(timeout=min(remaining, 0.25))
+            except queue.Empty:
+                continue
+            if line is None:  # stdout EOF
+                eof = True
+                continue
+            collected.append(line)
+            # REAL in-flight boundary: a strict region line is the
+            # diarizer's own output, so it advances the count immediately
+            # and is never labelled as an estimate.
+            if heartbeat is not None and _SHERPA_REGION_STRICT.match(line.strip()):
+                heartbeat.publish_now()
+        reader.join(timeout=1.0)
+        if not eof and not timed_out and not cancelled:
+            # stdout closed but the child still wedged: bounded drain wait
+            wait_for = max(0.0, deadline - time.monotonic())
+            try:
+                proc.wait(timeout=min(wait_for, 0.5) if wait_for else 0.01)
+            except subprocess.TimeoutExpired:
+                if cancel is not None and cancel.cancelled():
+                    cancelled = True
+                elif time.monotonic() >= deadline:
+                    timed_out = True
+    finally:
+        if timed_out or cancelled or proc.poll() is None:
+            _kill_process_group(proc)
+        with contextlib.suppress(OSError, ValueError):
+            if proc.stdout is not None:
+                proc.stdout.close()
+        if cancel is not None:
+            cancel.detach()
+        if heartbeat is not None:
+            heartbeat.stop()
+    if cancelled or (cancel is not None and cancel.cancelled()):
+        raise JobCancelled(
+            f"cancellation requested during the diarization stage: {cancel.token}")
+    if timed_out:
+        raise CrispasrError(
+            f"diarization timed out after {timeout:.0f}s: {command[:1]}")
+    returncode = proc.wait()
+    text = "".join(collected)
+    if returncode != 0:
+        raise CrispasrError(
+            f"diarization subprocess failed (exit {returncode}): "
+            f"{text[-800:] or '<no output>'}")
+    regions = _parse_sherpa_regions(text)
+    if not regions:
+        raise CrispasrError(
+            "diarization subprocess produced no speaker regions: "
+            f"{text[-800:] or '<no output>'}")
+    if progress is not None:
+        # The TRUE completion boundary, never labelled as an estimate.
+        # If no tick ever published (short path finishes inside one
+        # interval, or the duration is unknown), the legacy ("diar", 1, 1)
+        # event stays byte-identical (AC6); a moved band must land on
+        # (total, total) so the final done == total == the true total (AC1).
+        if heartbeat is not None and heartbeat.last_published() > 0:
+            progress("diar", heartbeat.total, heartbeat.total)
+        else:
+            progress("diar", 1, 1)
+    return regions
 
 
 # ---------------------------------------------------------------------------
@@ -834,7 +1730,9 @@ def _stderr_tail(path: str, limit: int = 800) -> str:
 def _run_crispasr(wav_path: str, work_dir: str,
                   progress: Callable[[str, int, int], None] | None = None,
                   chunk_total: int = 0,
-                  cancel: CancelControl | None = None) -> list[dict[str, Any]]:
+                  cancel: CancelControl | None = None,
+                  raw_items: bool = False,
+                  duration_seconds: float | None = None) -> list[dict[str, Any]]:
     """One whole-file crispasr invocation -> parsed Segment dicts.
 
     Live progress needs TWO channels (card t_2e901945, measured on the
@@ -1021,7 +1919,24 @@ def _run_crispasr(wav_path: str, work_dir: str,
         payload = json.loads(Path(json_path).read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError) as exc:
         raise CrispasrError(f"cannot parse crispasr JSON at {json_path!r}: {exc}") from exc
-    segments = parse_crispasr_output(payload)
+    # Card t_dc5c2abb: the engine exited 0 — but did its GLOBAL sherpa
+    # pre-pass silently degrade to the per-slice fallback on the way? The
+    # fallback line prints only on that path (source-confirmed), so its
+    # presence IS the degradation signal: the transcript is a fake with
+    # per-slice speaker identities, whatever the region count says.
+    # The duration-scaled region FLOOR is the split path's own detection
+    # (there the wrapper region table is the inspected quantity, not the
+    # engine's line); on this path the signal check is strictly stronger
+    # evidence than the floor, and the floor is what makes the message
+    # diagnostic with the measured numbers.
+    known_duration = (duration_seconds if duration_seconds and duration_seconds > 0
+                      else _probe_duration_quiet(wav_path))
+    _reject_degraded_sherpa(stderr_path, known_duration)
+    # Card t_7685c6da: raw_items hands the UNSPLIT items back so the
+    # split path can merge the pipeline-side diarization regions into
+    # them (the merge returns a NEW list; see _merge_diarization_regions).
+    segments = _parse_crispasr_items(payload) if raw_items \
+        else _finalize_segments(_parse_crispasr_items(payload))
     sampler.log_summary("crispasr_diarized_asr", fleet_cap)
     LAST_RUN_STATS.update({
         "engine_seconds": round(engine_seconds, 2),
@@ -1136,7 +2051,10 @@ def transcribe_and_diarize(
     invocation. ``duration`` (or a cheap probe) fixes the engine chunk
     count; ``progress`` then receives real per-chunk reports
     ``("asr", done, total)`` from the streamed engine stdout, plus the
-    final ``("diar", 1, 1)`` assembly report.
+    ``("diar", ...)`` series from the pipeline-side diarization stage —
+    heartbeat ticks labelled ``estimated=True`` while the subprocess
+    runs, then the final true boundary (card t_868131e3). The legacy
+    single-invocation path keeps its ``("diar", 1, 1)`` assembly report.
     ``cancel`` (card t_fef54150) is polled at this stage boundary BEFORE the
     engine spawns — a retry or requeue can never resurrect an already
     cancelled attempt by re-spawning it — threaded into the engine run for
@@ -1154,18 +2072,52 @@ def transcribe_and_diarize(
 
     _validate_runtime_config()
     chunk_total = 0
-    if progress is not None:
+    known = 0.0
+    if progress is not None or sherpa_split_enabled():
         known = duration if duration and duration > 0 else _probe_duration_quiet(audio_path)
+    if progress is not None:
         chunk_total = _engine_chunk_total(known)
         if chunk_total == 0:
             # Duration unknown: keep the legacy coarse pass pair rather than
             # fabricating chunk boundaries.
             progress("asr", 1, 2)
+    split = sherpa_split_enabled()
     with tempfile.TemporaryDirectory(prefix="autodiarist-crispasr-") as work_dir:
-        segments = _run_crispasr(str(audio_path), work_dir,
-                                 progress=progress, chunk_total=chunk_total,
-                                 cancel=cancel)
-    if progress is not None:
+        if split:
+            # Card t_7685c6da: ASR publishes live; diarization is its own
+            # stage on the SAME 16 kHz mono wav the engine was handed.
+            items = _run_crispasr(str(audio_path), work_dir,
+                                  progress=progress, chunk_total=chunk_total,
+                                  cancel=cancel, raw_items=True,
+                                  duration_seconds=known)
+            regions = run_sherpa_diarization(str(audio_path),
+                                             progress=progress, cancel=cancel,
+                                             duration=known)
+            # CONTRACT: _merge_diarization_regions RETURNS a new list — the
+            # Phase-2 word-split sub-segments exist only there, never on the
+            # input items. Discarding the return (gate t_7685c6da regression)
+            # finalized the original one-segment ASR item and collapsed the
+            # panel clip to 1 speaker instead of 2; the direct-call merge
+            # tests could not see it because non-split segments mutate
+            # _speaker_raw in place.
+            items = _merge_diarization_regions(items, regions)
+            # Card t_dc5c2abb: the split path has no engine stderr to
+            # inspect for the fallback line (the wrapper is spawned
+            # directly), so its degradation detection is the duration-
+            # scaled region FLOOR over the wrapper's own region table —
+            # the SAME _check_diarization_plausibility the engine path
+            # uses, applied to the region table instead of the engine's
+            # reported count.
+            _check_diarization_plausibility(regions, known)
+            segments = _finalize_segments(items)
+        else:
+            segments = _run_crispasr(str(audio_path), work_dir,
+                                     progress=progress, chunk_total=chunk_total,
+                                     cancel=cancel,
+                                     duration_seconds=(duration
+                                                       if duration and duration > 0
+                                                       else None))
+    if progress is not None and not split:
         progress("diar", 1, 1)
     if cancel is not None and cancel.cancelled():
         raise JobCancelled(

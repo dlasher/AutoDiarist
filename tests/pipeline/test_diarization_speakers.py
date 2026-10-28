@@ -148,6 +148,14 @@ def test_build_command_wires_sherpa_models(tmp_path, monkeypatch):
 
 
 def test_build_command_wires_sherpa_bin_wrapper(tmp_path, monkeypatch):
+    """Card t_7685c6da supersedes the pre-split contract.
+
+    The wrapper no longer reaches the engine via --sherpa-bin: the split
+    runs the engine ASR-only and the pipeline spawns SHERPA_BIN itself
+    (build_sherpa_diarize_command), which is what restores live -pp
+    progress on long files. The wiring requirement survives, in the
+    second invocation's argv.
+    """
     seg = _touch(tmp_path / SHERPA_SEGMENT_NAME)
     emb = _touch(tmp_path / SHERPA_EMBEDDING_NAME)
     wrapper = _fake_binary(tmp_path, "sherpa-wrapper", "exit 0")
@@ -156,7 +164,10 @@ def test_build_command_wires_sherpa_bin_wrapper(tmp_path, monkeypatch):
     monkeypatch.setenv("SHERPA_EMBEDDING_MODEL", emb)
     monkeypatch.setenv("SHERPA_BIN", str(wrapper))
     cmd = tr.build_crispasr_command("/tmp/a.wav", "/tmp/out")
-    assert "--sherpa-bin" in cmd and str(wrapper) in cmd
+    assert "--sherpa-bin" not in cmd and "--diarize" not in cmd
+    diar_cmd = tr.build_sherpa_diarize_command("/tmp/full16k.wav")
+    assert diar_cmd[0] == str(wrapper)
+    assert seg in " ".join(diar_cmd) and emb in " ".join(diar_cmd)
 
 
 def test_shipped_default_is_multi_speaker_capable_method():
