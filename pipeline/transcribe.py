@@ -816,7 +816,7 @@ def _merge_diarization_regions(
         if not words:
             out.append(item)
             continue
-        word_spk = [_dominant_speaker(w["t0"], w["t1"], regions) for w in words]
+        word_spk = [_word_speaker(w["t0"], w["t1"], regions) for w in words]
         # carry-forward: an unaligned word inherits the previous label
         last = None
         for i, spk in enumerate(word_spk):
@@ -866,6 +866,44 @@ def _merge_diarization_regions(
                    "_words": run}
             out.append(sub)
     return out
+
+
+def _word_speaker(t0: float, t1: float,
+                  regions: list[dict[str, Any]]) -> int | None:
+    """Speaker of a single WORD, engine Phase-2 order.
+
+    This is NOT the same rule as _dominant_speaker, and the difference is
+    what makes the split's boundaries match the engine's. The engine uses
+    two rules (CrispASR v0.8.43, examples/cli/crispasr_diarize_cli.cpp):
+
+      * Phase 1, the whole SEGMENT -> one speaker: overlap SUMMED per
+        speaker, then speaker indices scanned ascending with a strict '>',
+        so the lowest index wins a tie. That is _dominant_speaker.
+      * Phase 2, each WORD -> a speaker: the regions are scanned IN FILE
+        ORDER and the SINGLE region with the greatest overlap wins, with a
+        strict '>' so the FIRST region in file order wins a tie.
+
+    Summing (as _dominant_speaker does) is wrong for a word that straddles
+    two regions of the same speaker: the engine compares the single
+    overlaps, we compare the sums, and the two can pick different regions
+    — which moves the run boundary and changes the transcript. Measured on
+    the 249 s panel: the first run ended at 9.92 s on the old path and
+    10.80 s on ours, a 6-character difference in the output.
+
+    A degenerate word (t1 <= t0) is left unassigned (None) exactly as the
+    engine leaves it at -1, so the carry-forward handles it.
+    """
+    if t1 <= t0:
+        return None
+    best: int | None = None
+    best_overlap = 0.0
+    for region in regions:
+        lo = max(t0, region["t0"])
+        hi = min(t1, region["t1"])
+        if hi > lo and (hi - lo) > best_overlap:
+            best_overlap = hi - lo
+            best = region["speaker"]
+    return best
 
 
 def _dominant_speaker(t0: float, t1: float,
