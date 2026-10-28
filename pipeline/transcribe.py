@@ -39,6 +39,7 @@ VRAM discipline inherited from card t_95726260:
 from __future__ import annotations
 
 import contextlib
+import inspect
 import json
 import logging
 import math
@@ -163,6 +164,28 @@ def _env_float(name: str, default: float) -> float:
         return float(os.environ.get(name, str(default)))
     except ValueError as exc:
         raise CrispasrConfigError(f"{name} must be numeric") from exc
+
+
+def _env_positive_float(name: str, default: float) -> float:
+    """Float knob with a house-style safe fallback: unset/blank keeps the
+    default; non-numeric, zero or negative warn and keep the default.
+    A heartbeat knob must never be able to crash a running stage or set
+    an unbounded/forever cadence on a config typo (card t_868131e3)."""
+    raw = os.environ.get(name, "")
+    if not raw.strip():
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        logger.warning(
+            "config: %s=%r is not a number; using %.3f", name, raw, default)
+        return default
+    if not math.isfinite(value) or value <= 0:
+        logger.warning(
+            "config: %s=%r must be a positive number; using %.3f",
+            name, raw, default)
+        return default
+    return value
 
 
 def crispasr_bin() -> str:
@@ -962,9 +985,170 @@ def _sherpa_timeout_seconds(duration: float) -> float:
     return max(120.0, audio_s * 5.0)
 
 
+# ---------------------------------------------------------------------------
+# Diarization-stage heartbeat (card t_868131e3)
+#
+# The sherpa CLI prints nothing while it runs, so between the last ASR
+# slice boundary and the finished region table the stage published EXACTLY
+# ONE event — ("diar", 1, 1) — and a 140-minute job went silent for ~50
+# minutes. The fix is a time-based heartbeat: total counts uniform work
+# chunks of the diarization stage's ESTIMATED cost, done advances with
+# elapsed time toward total (never reaching it), and the true
+# (total, total) boundary is published when the region table parses.
+# ---------------------------------------------------------------------------
+
+# The stage's cost model is the SAME rate constant the API's ETA uses
+# (PROCESSING_SECONDS_PER_AUDIO_SECOND; card: "feed the same estimate
+# rather than inventing a second source of truth").
+DIAR_HEARTBEAT_INTERVAL_DEFAULT = 2.0     # seconds between published ticks
+DIAR_CHUNK_ESTIMATE_DEFAULT = 2.0         # estimated seconds per tick
+DEFAULT_PROCESSING_RATE = 0.185           # s CPU per audio s (T400, api/main twin)
+
+
+def processing_rate_per_audio_second() -> float:
+    """Seconds of processing per second of audio, from the shared ETA
+    knob (default 0.185, the measured T400 rate). Exact 0 or junk falls
+    back to the default here — the heartbeat needs A rate, unlike the
+    API surface where 0 disables ETA emission."""
+    raw = (os.environ.get("PROCESSING_SECONDS_PER_AUDIO_SECOND") or "").strip()
+    try:
+        value = float(raw) if raw else DEFAULT_PROCESSING_RATE
+    except ValueError:
+        logger.warning(
+            "config: PROCESSING_SECONDS_PER_AUDIO_SECOND=%r is not a number;"
+            " using %.3f", raw, DEFAULT_PROCESSING_RATE)
+        value = DEFAULT_PROCESSING_RATE
+    return value if value > 0 else DEFAULT_PROCESSING_RATE
+
+
+def diar_heartbeat_settings() -> tuple[float, float]:
+    """(interval_seconds, chunk_estimate_seconds), both positive."""
+    return (
+        _env_positive_float("DIAR_HEARTBEAT_INTERVAL_SECONDS",
+                            DIAR_HEARTBEAT_INTERVAL_DEFAULT),
+        _env_positive_float("DIAR_CHUNK_ESTIMATE_SECONDS",
+                            DIAR_CHUNK_ESTIMATE_DEFAULT),
+    )
+
+
+def diar_tick_plan(*, duration: float, rate: float,
+                   chunk_seconds: float = DIAR_CHUNK_ESTIMATE_DEFAULT,
+                   ) -> tuple[int, float]:
+    """(total_ticks, seconds_per_tick) for the diarization stage.
+
+    total = ceil(duration x rate / chunk_seconds) — uniform estimated work
+    chunks of the stage's linear-model cost. seconds_per_tick = chunk /
+    rate, so a job that runs AT the model advances exactly one tick per
+    interval; the cap-then-final design keeps honesty when it runs slower
+    or faster. duration/rate at or below zero (unknown duration) yields
+    total 0: the caller must emit NO ticks rather than fabricate a
+    counter for a file it cannot measure.
+    """
+    if duration is None or duration <= 0 or rate <= 0 or chunk_seconds <= 0:
+        return 0, 0.0
+    cost = float(duration) * float(rate)
+    total = max(1, math.ceil(cost / float(chunk_seconds)))
+    return total, float(chunk_seconds) / float(rate)
+
+
+def _callback_accepts_kwarg(cb, name: str) -> bool:
+    """True when `cb` can receive the keyword `name` (a named parameter or
+    **kwargs). Legacy 3-arg callbacks (cards t_2e901945/t_7685c6da wired
+    `lambda stage, done, total: ...`) keep working unchanged — they simply
+    do not see the estimate label."""
+    try:
+        params = inspect.signature(cb).parameters
+    except (TypeError, ValueError):
+        return True
+    for param in params.values():
+        if param.kind is inspect.Parameter.VAR_KEYWORD:
+            return True
+        if param.name == name:
+            return True
+    return False
+
+
+class _DiarHeartbeat:
+    """Background tick publisher for one diarization stage (AC1-AC4).
+
+    Driven by the STAGE lifetime, not the subprocess's: the wrapper's
+    ceiling re-pass restarts the diarization underneath the wait loop
+    (pass 1 -> label count -> re-pass), so the clock starts once, when
+    the stage spawns, and never resets — the count cannot rewind across
+    a restart. Ticks are strictly below total (progress must not fake
+    completion), monotonic, and carry estimated=True + the method label
+    so no client can mistake a heartbeat for a real work boundary. The
+    thread touches no API lock; it only calls the progress callback,
+    which takes the queue lock for its own short write.
+    """
+
+    def __init__(self, progress, total: int, interval: float,
+                 tick_seconds: float) -> None:
+        self._progress = progress
+        self._labelled = _callback_accepts_kwarg(progress, "estimated")
+        self.total = total
+        self._interval = interval
+        self._tick = tick_seconds
+        self._started = time.monotonic()
+        self._stop = threading.Event()
+        self._published = 0
+        self._thread: threading.Thread | None = None
+
+    def start(self) -> None:
+        if self.total <= 0:
+            return
+        self._thread = threading.Thread(target=self._loop,
+                                         name="diar-heartbeat", daemon=True)
+        self._thread.start()
+
+    def _loop(self) -> None:
+        while not self._stop.wait(self._interval):
+            self.publish_now()
+
+    def publish_now(self) -> bool:
+        """Advance the elapsed-time model and publish if the value moved.
+        Returns True when a new tick was published. Monotonic by
+        construction: the model value only grows with elapsed time, and
+        an advance beyond total - 1 is held there until the real boundary
+        lands. EVERY publication here is labelled estimated=True — even
+        one triggered by an observed region line, because the VALUE is
+        model-derived, not a measured count of work (AC4: a client must
+        never mistake it for a real slice boundary)."""
+        if self.total <= 0:
+            return False
+        elapsed = time.monotonic() - self._started
+        model = int(elapsed / self._tick) if self._tick > 0 else 0
+        done = min(model, self.total - 1)
+        if done <= self._published:
+            return False
+        self._published = done
+        try:
+            if self._labelled:
+                self._progress("diar", done, self.total,
+                               estimated=True,
+                               estimate_method="elapsed_time_model")
+            else:
+                self._progress("diar", done, self.total)
+        except Exception:  # a progress sink must never kill the stage
+            logger.exception("diarization heartbeat publish failed")
+        return True
+
+    def last_published(self) -> int:
+        return self._published
+
+    def stop(self) -> None:
+        """Idempotent: signal the loop AND join it, so the heartbeat never
+        outlives the stage (AC5: nothing holds the process or a lock open
+        after the stage exits, on any path — success, cancel, timeout)."""
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=self._interval + 1.0)
+            self._thread = None
+
+
 def run_sherpa_diarization(
     wav_path: str,
-    progress: Callable[[str, int, int], None] | None = None,
+    progress: Callable[..., None] | None = None,
     cancel: CancelControl | None = None,
     duration: float = 0.0,
 ) -> list[dict[str, Any]]:
@@ -972,11 +1156,27 @@ def run_sherpa_diarization(
 
     Spawns build_sherpa_diarize_command directly (SHERPA_BIN is validated
     executable at startup, AC4 t_5a287979), reads the region table from
-    stdout, publishes ("diar", done, total) real work boundaries as the
-    wrapper's ceiling re-pass advances, and honours cancel by killing the
-    whole process group. A non-zero exit or an empty region table raises
-    CrispasrError with the output tail — never a silent no-label transcript
-    (the failure mode that card was built to refuse).
+    stdout, and publishes the ``("diar", done, total)`` series. Two
+    signals, one band (card t_868131e3):
+
+      * REAL boundaries — every strict region line the stdout pump
+        delivers while the stage is in flight (the wrapper's ceiling
+        re-pass streams its table before exit) — advances `done` and is
+        NOT labelled.
+      * A TIME-BASED HEARTBEAT for the silence between them: total counts
+        uniform work chunks of the stage's linear-model cost (the SAME
+        rate constant as the API ETA), `done` advances with elapsed time
+        toward it, capped at total - 1 so a tick never claims completion.
+        Every tick carries estimated=True + estimate_method, so a client
+        can never mistake it for a measured boundary.
+
+    The heartbeat clock starts with the STAGE, not the subprocess, so the
+    wrapper's re-pass restart cannot rewind the count. The final event is
+    always the true (total, total) boundary. Honour cancel kills the whole
+    process group; the heartbeat thread stops on every exit path. A
+    non-zero exit or an empty region table raises CrispasrError with the
+    output tail — never a silent no-label transcript (the failure mode
+    that card was built to refuse).
     """
     command = build_sherpa_diarize_command(wav_path)
     timeout = _sherpa_timeout_seconds(duration)
@@ -995,6 +1195,15 @@ def run_sherpa_diarization(
             f"cannot execute diarization subprocess {command[0]!r}: {exc}") from exc
     if cancel is not None:
         cancel.attach(proc)
+    heartbeat: _DiarHeartbeat | None = None
+    if progress is not None:
+        interval, chunk = diar_heartbeat_settings()
+        total, tick_seconds = diar_tick_plan(duration=duration,
+                                             rate=processing_rate_per_audio_second(),
+                                             chunk_seconds=chunk)
+        if total > 0:
+            heartbeat = _DiarHeartbeat(progress, total, interval, tick_seconds)
+            heartbeat.start()
     collected: list[str] = []
     timed_out = False
     cancelled = False
@@ -1021,6 +1230,11 @@ def run_sherpa_diarization(
                 eof = True
                 continue
             collected.append(line)
+            # REAL in-flight boundary: a strict region line is the
+            # diarizer's own output, so it advances the count immediately
+            # and is never labelled as an estimate.
+            if heartbeat is not None and _SHERPA_REGION_STRICT.match(line.strip()):
+                heartbeat.publish_now()
         reader.join(timeout=1.0)
         if not eof and not timed_out and not cancelled:
             # stdout closed but the child still wedged: bounded drain wait
@@ -1040,6 +1254,8 @@ def run_sherpa_diarization(
                 proc.stdout.close()
         if cancel is not None:
             cancel.detach()
+        if heartbeat is not None:
+            heartbeat.stop()
     if cancelled or (cancel is not None and cancel.cancelled()):
         raise JobCancelled(
             f"cancellation requested during the diarization stage: {cancel.token}")
@@ -1058,7 +1274,15 @@ def run_sherpa_diarization(
             "diarization subprocess produced no speaker regions: "
             f"{text[-800:] or '<no output>'}")
     if progress is not None:
-        progress("diar", 1, 1)
+        # The TRUE completion boundary, never labelled as an estimate.
+        # If no tick ever published (short path finishes inside one
+        # interval, or the duration is unknown), the legacy ("diar", 1, 1)
+        # event stays byte-identical (AC6); a moved band must land on
+        # (total, total) so the final done == total == the true total (AC1).
+        if heartbeat is not None and heartbeat.last_published() > 0:
+            progress("diar", heartbeat.total, heartbeat.total)
+        else:
+            progress("diar", 1, 1)
     return regions
 
 
@@ -1613,7 +1837,10 @@ def transcribe_and_diarize(
     invocation. ``duration`` (or a cheap probe) fixes the engine chunk
     count; ``progress`` then receives real per-chunk reports
     ``("asr", done, total)`` from the streamed engine stdout, plus the
-    final ``("diar", 1, 1)`` assembly report.
+    ``("diar", ...)`` series from the pipeline-side diarization stage —
+    heartbeat ticks labelled ``estimated=True`` while the subprocess
+    runs, then the final true boundary (card t_868131e3). The legacy
+    single-invocation path keeps its ``("diar", 1, 1)`` assembly report.
     ``cancel`` (card t_fef54150) is polled at this stage boundary BEFORE the
     engine spawns — a retry or requeue can never resurrect an already
     cancelled attempt by re-spawning it — threaded into the engine run for

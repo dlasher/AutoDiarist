@@ -141,6 +141,19 @@ CATALOG: tuple[ConfigVar, ...] = (
               "Sherpa clustering threshold: higher merges fewer speakers."),
     ConfigVar("DIARIZATION_MAX_SPEAKERS", "8", "wrapper",
               "Speaker ceiling: the most speakers FastClustering may emit."),
+    ConfigVar("DIAR_HEARTBEAT_INTERVAL_SECONDS",
+              "2.0", "pipeline/transcribe.py",
+              "Seconds between progress ticks published while the split "
+              "diarization subprocess runs (card t_868131e3). Ticks are an "
+              "elapsed-time ESTIMATE, labelled estimated=true on the job "
+              "status; the real completion boundary is still published. "
+              "Non-numeric or non-positive warns and keeps 2.0."),
+    ConfigVar("DIAR_CHUNK_ESTIMATE_SECONDS",
+              "2.0", "pipeline/transcribe.py",
+              "Estimated CPU seconds of diarization work per heartbeat tick "
+              "(card t_868131e3): total = ceil(audio x rate / this), rate = "
+              "PROCESSING_SECONDS_PER_AUDIO_SECOND. Non-numeric or "
+              "non-positive warns and keeps 2.0."),
     ConfigVar("SHERPA_LD_LIBRARY_PATH", "/opt/sherpa/lib", "wrapper",
               "Library path the wrapper uses for the sherpa subprocess."),
     # ---- serving --------------------------------------------------------
