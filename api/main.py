@@ -1,6 +1,8 @@
 import os
 import uuid
 import re
+import csv
+import io
 import shutil
 import json
 import selectors
@@ -78,6 +80,11 @@ SCHEDULER_STATE_NAME = "_scheduler.json"
 # "keep it knob-free"). ?limit= outside [1, MAX_LIST_LIMIT] clamps, never 4xx.
 DEFAULT_LIST_LIMIT = 50
 MAX_LIST_LIMIT = 200
+# Session-scoped HISTORY window (card t_a8a71898, decision B2): the owner's
+# "about the last 30". A code default like the listing above — deliberately
+# NOT an env knob; ?limit= on GET /v1/history clamps into [1, MAX_LIST_LIMIT],
+# the exact same clamp precedent (never 4xx).
+HISTORY_DEFAULT_LIMIT = 30
 # Queue-aware wait estimate (V1.5, card t_b3ae9366). ETA comes from ONE
 # linear model — duration_seconds x PROCESSING_SECONDS_PER_AUDIO_SECOND —
 # summed over the fair execution order. It is an ESTIMATE, never a
@@ -2043,6 +2050,117 @@ async def list_jobs(request: Request, response: Response, limit: int = DEFAULT_L
         response.headers[_session_header_name()] = session_id
     return {"jobs": entries, "count": len(entries), "total": total,
             "limit": page, "processing_count": processing_count}
+
+
+# --- Session-scoped HISTORY view (card t_a8a71898) ----------------------------
+# Decision B1: a DERIVED presentation of the same on-disk status.json files
+# that back GET /v1/jobs — there is deliberately no history store, table, or
+# journal. Persistence is governed by the untouched RETENTION_DAYS sweep and
+# disk-pressure eviction (B7); this endpoint can only ever read the live
+# window, never outlive the jobs it lists.
+
+HISTORY_COLUMNS = (
+    "token", "filename", "audio_sha256", "status", "created_at",
+    "completed_at", "duration_seconds", "download_json", "download_md",
+    "cache_hit",
+)
+# Terminal statuses whose status.json mtime IS the completion clock — the
+# exact same clock _job_mtime/the retention sweep uses (decision B3).
+_TERMINAL_STATUSES = ("done", "failed", "cancelled")
+
+
+def _history_rows(states: list[dict], session_ident: str,
+                  limit: int) -> tuple[list[dict], int]:
+    """Pure session view for GET /v1/history: same filter and same
+    newest-first order (created_at desc, seq desc tiebreak) as
+    _session_job_entries, then truncated to `limit`.
+
+    Rows carry exactly the documented HISTORY_COLUMNS set (decision B3),
+    identical in JSON and CSV, including the reserved cache_hit key card C
+    will stamp. Legacy states missing card A's audio_sha256 render null,
+    never crash (B7)."""
+    mine = [s for s in states if s.get("session_ident") == session_ident]
+    mine.sort(key=lambda s: (_listing_created_at(s), s.get("seq") or 0),
+              reverse=True)
+    rows = []
+    for s in mine[:limit]:
+        token = s.get("token")
+        created = _listing_created_at(s)
+        terminal = s.get("status") in _TERMINAL_STATUSES
+        rows.append({
+            "token": token,
+            "filename": s.get("filename", "unknown"),
+            "audio_sha256": s.get("audio_sha256"),
+            "status": s.get("status"),
+            "created_at": _iso_utc(created) if created else None,
+            # Completion clock: the SAME _job_mtime the retention sweep
+            # expires on; null while the job is still in flight.
+            "completed_at": _iso_utc(_job_mtime(JOBS_DIR / token))
+                            if terminal and token else None,
+            "duration_seconds": s.get("duration_seconds"),
+            "download_json": f"/v1/jobs/{token}/download?format=json",
+            "download_md": f"/v1/jobs/{token}/download?format=md",
+            # Reserved for card C: B always emits the key so the pinned
+            # column set never changes again.
+            "cache_hit": s.get("cache_hit", False),
+        })
+    return rows, len(mine)
+
+
+@app.get("/v1/history")
+async def history(request: Request, response: Response,
+                  limit: int = HISTORY_DEFAULT_LIMIT, format: str = "json"):
+    """Session-scoped transcript history with CSV/JSON export (V1.7, card
+    t_a8a71898).
+
+    Derived view (B1): reads the same per-job status.json snapshot and the
+    same hashed session_ident filter that back GET /v1/jobs — the caller's
+    jobs only, newest-first, default window HISTORY_DEFAULT_LIMIT (30).
+    ?limit= clamps into [1, MAX_LIST_LIMIT] like the listing precedent;
+    out-of-range never 4xx. ?format=csv returns the identical row set as an
+    RFC-4180 CSV (stdlib csv writer) with an attachment disposition named
+    _session_history.csv; JSON answers _session_history.json.
+
+    Scoping is a security requirement (B6), not a preference: there is no
+    cross-session or admin mode; an anonymous caller only sees its
+    anon-grouped jobs. Rows never contain the session identity itself, and
+    the export filenames carry no tenant-identifying info (B5).
+    """
+    if format not in ("json", "csv"):
+        raise HTTPException(status_code=422,
+                            detail="Unknown format requested. Use format=json or format=csv")
+    _, session_id, _ = _resolve_session(request)
+    page = max(1, min(limit, MAX_LIST_LIMIT))
+    with _queue_lock:
+        states = _iter_states()
+    rows, total = _history_rows(states, _hash_ident(f"session:{session_id}"), page)
+    # Echo the identity exactly like the listing does (card t_920fb7dc): an
+    # IP-derived client gets its minted id back so a later history call —
+    # and the jobs it submits — share one identity.
+    response.set_cookie(
+        key=_session_cookie_name(),
+        value=session_id,
+        httponly=True,
+        samesite="lax",
+        path="/",
+    )
+    if not request.headers.get(_session_header_name(), "").strip():
+        response.headers[_session_header_name()] = session_id
+    if format == "csv":
+        buf = io.StringIO()
+        writer = csv.DictWriter(buf, fieldnames=list(HISTORY_COLUMNS))
+        writer.writeheader()
+        writer.writerows(rows)
+        return Response(
+            content=buf.getvalue(),
+            media_type="text/csv",
+            headers={"Content-Disposition":
+                     'attachment; filename="_session_history.csv"'},
+        )
+    response.headers["Content-Disposition"] = \
+        'attachment; filename="_session_history.json"'
+    return {"history": rows, "count": len(rows), "total": total,
+            "limit": page, "columns": list(HISTORY_COLUMNS)}
 
 
 @app.get("/v1/jobs/{token}")

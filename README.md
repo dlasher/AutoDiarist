@@ -41,6 +41,7 @@ GET    /v1/jobs                  -> list MY jobs (session-scoped; newest first; 
 GET    /v1/jobs/{token}          -> status (+ queue_position and queue-aware ETA while queued; running-phase ETA while processing; stage + monotonic progress; progress_percent)
 DELETE /v1/jobs/{token}          -> cancel a queued OR running job (running: 202 + cancelling, then engine kill and a terminal cancelled state)
 GET    /v1/jobs/{token}/download -> output_result.json (default) or ?format=md
+GET    /v1/history               -> MY transcript history (session-scoped derived view; newest first; ?limit=1..200, default 30; ?format=json|csv export)
 ```
 
 `MOCK_PIPELINE=1` short-circuits the ASR stage with two deterministic
@@ -49,7 +50,8 @@ behaves identically, which is what the API integration tests run against.
 
 ## HTTP API
 
-Six endpoints, all under `/v1/jobs`. Base URL in the examples below is the
+Seven endpoints: six under `/v1/jobs` plus the session history view
+`/v1/history`. Base URL in the examples below is the
 quickstart default (`http://127.0.0.1:8000`). All error responses use the
 FastAPI envelope `{"detail": "..."}` unless noted. Every status code here is
 implemented in `api/main.py`.
@@ -378,6 +380,54 @@ that is not `done`; `422` `Unknown format requested. Use format=json or
 format=md` for any other `format` value; `404` for unknown tokens (and, as a
 consistency guard, `Result file missing` / `Markdown report missing` if a
 finished job's artifact is gone from disk).
+
+### GET /v1/history — history & exports (V1.7, card t_a8a71898)
+
+```bash
+curl -sS -H 'X-Session: user-a' 'http://127.0.0.1:8000/v1/history'
+curl -sS -H 'X-Session: user-a' 'http://127.0.0.1:8000/v1/history?format=csv' -o history.csv
+curl -sS -H 'X-Session: user-a' 'http://127.0.0.1:8000/v1/history?limit=100'
+```
+
+A session-scoped **derived view** of what *you* submitted — the same
+on-disk `status.json` files and the same hashed `session_ident` filter that
+back `GET /v1/jobs`. There is deliberately **no separate history store**:
+rows disappear exactly when the retention sweep or disk-pressure eviction
+removes the job, so history can never become an unbounded disk consumer.
+Scoping is a security requirement, not a preference: one tenant's history is
+never visible to another, and there is no cross-session/admin mode.
+
+Window and ordering: newest-first (identical clock and tiebreak to the
+listing — `created_at` desc, `seq` desc), default `HISTORY_DEFAULT_LIMIT` =
+**30** rows; `?limit=` takes precedence and **clamps** into
+`[1, MAX_LIST_LIMIT]` (200) — out-of-range values clamp, they never 4xx
+(FastAPI `422` only for a non-integer `limit`). The 30 is a code default,
+not an env knob.
+
+`?format=json` (default) returns `{"history": [...], "count", "total",
+"limit", "columns"}` with `Content-Disposition: attachment;
+filename="_session_history.json"`. `?format=csv` returns the **identical
+row set** rendered by the stdlib `csv` writer (RFC-4180 escaping — filenames
+with commas, quotes or newlines round-trip intact) as `text/csv` with
+`Content-Disposition: attachment; filename="_session_history.csv"`. Export
+filenames carry no tenant-identifying info; `422` for any other `format`
+value.
+
+Pinned column set (identical in CSV and JSON; the header row is always
+present, even for an empty history):
+
+| column | meaning |
+|---|---|
+| `token` | job token — links `GET /v1/jobs/{token}` and the downloads |
+| `filename` | the upload's original file name |
+| `audio_sha256` | content fingerprint (card t_971ed589); `null` for legacy jobs persisted before the field existed |
+| `status` | `queued` / `processing` / `done` / `failed` / `cancelled` |
+| `created_at` | job-creation stamp, ISO-8601 UTC (`YYYY-MM-DDTHH:MM:SSZ`); legacy fallback `queued_at` |
+| `completed_at` | ISO-8601 UTC from the terminal `status.json` file mtime — the **same clock the retention sweep uses**; `null` while the job is not terminal |
+| `duration_seconds` | audio length probed at admission; `null` when unknown |
+| `download_json` | relative URL `/v1/jobs/<token>/download?format=json` |
+| `download_md` | relative URL `/v1/jobs/<token>/download?format=md` — the per-job `markdown_report.md` already answers the .md export ask; history builds no md tables |
+| `cache_hit` | reserved for the cache card: always present, `false` until that card stamps it, so the column set never changes |
 
 ### DELETE /v1/jobs/{token} — cancel a queued OR running job
 

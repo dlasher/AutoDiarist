@@ -1,5 +1,48 @@
 # Changelog
 
+## [Unreleased] — session-scoped HISTORY view + CSV/JSON exports: derived from existing status.json, default window 30, pinned column set (card t_a8a71898)
+
+**`GET /v1/history?limit=30&format=json|csv`** answers "what transcripts have
+I made" as a **pure derived view** over the per-job `status.json` files that
+already back `GET /v1/jobs` (decision B1): no history store, table, or
+journal was added, and the retention sweep / disk-pressure eviction are
+untouched — history rows simply cannot outlive (or out-disk) the jobs they
+list.
+
+- **Security scoping, not a preference** (B6): rows come only from the
+  caller's hashed `session_ident`, resolved through the exact same
+  X-Session-header / cookie / IP / anonymous chain as the listing. One
+  tenant's history is never visible to another (asserted by test); there is
+  deliberately no cross-session or admin view. Export filenames carry no
+  tenant-identifying info.
+- **Window** (B2): module constant `HISTORY_DEFAULT_LIMIT = 30` (the owner's
+  "about the last 30") — a code default, not an env knob. `?limit=` takes
+  precedence and clamps into `[1, MAX_LIST_LIMIT]` (200) on the exact
+  listing precedent; out-of-range never 4xx. Order newest-first, identical
+  to `_session_job_entries` (`created_at` desc, `seq` desc tiebreak, with
+  the same legacy `queued_at` fallback).
+- **Pinned column set, identical in CSV and JSON** (B3): `token`,
+  `filename`, `audio_sha256` (card t_971ed589; null for legacy jobs, never a
+  crash — B7), `status`, `created_at` and `completed_at` (ISO-8601 UTC;
+  completion is the terminal `status.json` file mtime — the SAME clock
+  `_job_mtime`/the retention sweep uses — null while non-terminal),
+  `duration_seconds`, `download_json` / `download_md` (relative URLs to the
+  existing per-job download; the .md export ask is already satisfied
+  per-job by `markdown_report.md` — B4: no md history tables), and the
+  reserved `cache_hit` (always emitted, `state.get("cache_hit", False)`) so
+  the cache card can stamp it without ever changing the column set again.
+- **CSV** (B5): stdlib `csv` writer only — RFC-4180 escaping round-trips
+  adversarial filenames (comma/quote/newline tested). `text/csv` +
+  `Content-Disposition: attachment; filename="_session_history.csv"`; JSON
+  answers `_session_history.json`. Unknown `format` is 422 (mirrors the
+  download endpoint's spelling).
+
+Tests: `tests/api/test_history.py` (9 tests — cross-session isolation,
+newest-first + the 30 default window, limit clamping, JSON/CSV row-for-row
+agreement + dispositions, adversarial-filename CSV round-trip, legacy
+null-hash row, reserved cache_hit key, empty-session 200 with header-only
+CSV). Suite: 567 passed, 2 skipped (main baseline 557 + 2 skipped).
+
 ## [Unreleased] — audio content fingerprint: SHA-256 of the DECODED 16 kHz PCM at admission, surfaced on state + 202 + poll + listing (card t_971ed589)
 
 **Every admitted job now carries `audio_sha256`** — a content fingerprint
