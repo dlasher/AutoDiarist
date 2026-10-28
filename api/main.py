@@ -2192,11 +2192,15 @@ async def create_job(request: Request, response: Response, file: UploadFile = Fi
         config_fp = _cache_config_fp()
         source = _cache_lookup(JOBS_DIR, audio_sha256, config_fp, session_ident)
         if source is not None:
-            return _serve_cache_hit(
+            served = _serve_cache_hit(
                 response, request, token, job_dir, audio_path, name,
                 session, session_id, session_source, session_ident,
                 audio_sha256, source,
             )
+            if served is not None:
+                return served
+            # stale mid-hit: row purged + partial copies cleaned above;
+            # admission continues as a MISS through the normal path below.
 
     # 3. Admission control under the queue lock: queue depth is the single
     #    system-level backpressure gate (AC1, card t_daebf369). Since V1.5
@@ -2315,7 +2319,7 @@ def _serve_cache_hit(response: Response, request: Request,
                      token: str, job_dir: Path, audio_path: Path, name: str,
                      session: str, session_id: str, session_source: str,
                      session_ident: str, audio_sha256: str,
-                     source_token: str) -> JobResponse:
+                     source_token: str) -> JobResponse | None:
     """Serve a HIT as a fresh, self-contained done job (card t_ac748379).
 
     AC C3/C5: the job is NEVER started — no queue entry, no worker, the
@@ -2327,10 +2331,28 @@ def _serve_cache_hit(response: Response, request: Request,
     mirrored from the source's terminal state; ETA fields are null because
     the result already exists. Session cookie/header echo is identical to
     the normal admission path (C.9: the flag changes delivery, never the
-    response shape clients already depend on)."""
+    response shape clients already depend on.
+
+    Returns None (after cleanup) if the source went stale in the race
+    window between the lookup and the copy — e.g. a concurrent retention
+    sweep evicted it: the row and the partial artifact copies are removed
+    (the uploaded audio stays), and the caller falls through to a FRESH
+    run. A hit must never 500."""
     source_state = _read_state(source_token) or {}
     admitted_at = time.time()
     with _queue_lock:
+        # Revalidate under the SAME lock every state transition and every
+        # sweep removal takes: if the source terminalised (cancelled) or
+        # vanished between the lookup and here, this is a MISS, not a
+        # half-written hit.
+        fresh = _read_state(source_token)
+        if not (fresh and fresh.get("status") == "done"
+                and (JOBS_DIR / source_token / "output_result.json").exists()
+                and (JOBS_DIR / source_token / "markdown_report.md").exists()):
+            _cache_purge_tokens(JOBS_DIR, [source_token])
+            logger.info("cache: source=%s stale at serve time; falling"
+                        " through to a fresh run", source_token)
+            return None
         seq = max((s.get("seq", 0) for s in _iter_states()), default=0) + 1
         state = {
             "token": token,
@@ -2353,9 +2375,23 @@ def _serve_cache_hit(response: Response, request: Request,
             "cache_source_token": source_token,
             "completed_at": admitted_at,
         }
-        for artifact in ("output_result.json", "markdown_report.md"):
-            shutil.copyfile(JOBS_DIR / source_token / artifact,
-                            job_dir / artifact)
+        try:
+            for artifact in ("output_result.json", "markdown_report.md"):
+                shutil.copyfile(JOBS_DIR / source_token / artifact,
+                                job_dir / artifact)
+        except OSError:
+            # Source vanished under us: purge the row and the partial
+            # artifact copies — but NOT the job dir itself, which holds the
+            # uploaded audio the fresh run needs (the normal admission path
+            # below writes its state here and the worker overwrites both
+            # artifacts on completion). A hit must never 500.
+            for artifact in ("output_result.json", "markdown_report.md"):
+                with suppress(OSError):
+                    (job_dir / artifact).unlink(missing_ok=True)
+            _cache_purge_tokens(JOBS_DIR, [source_token])
+            logger.info("cache: source=%s evicted mid-hit; falling through"
+                        " to a fresh run", source_token)
+            return None
         _write_state(state)
     _cache_record_hit(JOBS_DIR, audio_sha256, _cache_config_fp(),
                       session_ident, source_token)
