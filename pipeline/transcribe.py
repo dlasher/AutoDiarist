@@ -1339,11 +1339,15 @@ class _DiarHeartbeat:
         if done <= self._published:
             return False
         self._published = done
+        # Card t_79f9cdc6 design point 3: the tick total is now priced at
+        # the diarization stage's OWN measured rate, so relabel the model
+        # — clients must be able to tell a stage-rate number from the old
+        # ASR-shaped elapsed_time_model one.
         try:
             if self._labelled:
                 self._progress("diar", done, self.total,
                                estimated=True,
-                               estimate_method="elapsed_time_model")
+                               estimate_method="stage_rate_model")
             else:
                 self._progress("diar", done, self.total)
         except Exception:  # a progress sink must never kill the stage
