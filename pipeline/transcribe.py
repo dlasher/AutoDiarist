@@ -47,6 +47,7 @@ import queue
 import re
 import shutil
 import signal
+import string
 import subprocess
 import tempfile
 import threading
@@ -93,6 +94,11 @@ DEFAULT_VRAM_LIMIT_MIB = 3584.0  # 3.5 GiB cap from card t_95726260
 DEFAULT_MIN_FRAGMENT_SECONDS = 2.0
 DEFAULT_TIMEOUT_SECONDS = 1800.0
 _LANG_TAG = re.compile(r"\s*<\s*[A-Za-z]{2,3}(?:-[A-Za-z0-9]{1,8})?\s*>")
+
+# Outer characters stripped before comparing a segment-text token against a
+# word-vector entry (card t_1b74a0e5 token/run matching). string.punctuation
+# plus the typographic quotes/dashes the engine's transcripts carry.
+_TOKEN_PUNCT = string.punctuation + "\u2018\u2019\u201c\u201d\u2026"
 _SPEAKER_INDEX = re.compile(r"speaker\s*(\d+)", re.IGNORECASE)
 # nemotron auto-slices audio into ~30 s windows inside the engine (spike
 # measurement); streamed chunk-line end times map onto that window grid so
@@ -650,7 +656,11 @@ def _parse_crispasr_items(payload: Mapping[str, Any]) -> list[dict[str, Any]]:
                 if not isinstance(word, Mapping):
                     continue
                 try:
-                    parsed.append({"text": str(word.get("text") or ""),
+                    # Card t_1b74a0e5: the segment text is tag-stripped
+                    # above; the word vector must be stripped too, or
+                    # <en-US> markers leak into every consumer of _words.
+                    parsed.append({"text": _strip_lang_tags(
+                                       str(word.get("text") or "")),
                                    "t0": float(word["t0"]) / 100.0,
                                    "t1": float(word["t1"]) / 100.0})
                 except (KeyError, TypeError, ValueError):
@@ -727,6 +737,46 @@ def _parse_sherpa_regions(text: str) -> list[dict[str, Any]]:
     return regions
 
 
+def _assign_tokens_to_runs(text: str, words: list[dict[str, Any]],
+                           run_index: list[int]) -> list[tuple[str, int]]:
+    """Map every token of a segment's ORIGINAL text onto a speaker run.
+
+    Card t_1b74a0e5: the engine's segment text and its word vector are two
+    sources that genuinely disagree - word texts carry <en-US> markers the
+    segment text has already had stripped, and the vector omits whole words
+    the text has (measured: 32 lost words / 206 chars on the 249 s panel).
+    Phase 2 therefore uses the word vector only for TIMING and derives the
+    sub-segment texts from the original text, so that joining the runs
+    reproduces the original exactly (modulo whitespace).
+
+    Walk the text tokens left to right against the words in order,
+    comparing case- and outer-punctuation-insensitively (word texts are
+    tag-stripped first, defensively, so a tagged vector still matches). A
+    token that matches consumes its word and joins that word's run. A
+    token with no matching word is an extra the vector lacks: it joins the
+    run of the NEXT unmatched word - the run around the timestamp gap it
+    precedes (measured on the old path, where 'with a focus' joined the run
+    starting with the next word) - falling back to the PREVIOUS run once
+    the vector is exhausted (the panel's tail shape, 'our customizable
+    strategic solutions allow.').
+    """
+    def norm(value: str) -> str:
+        return _strip_lang_tags(value).strip(_TOKEN_PUNCT).casefold()
+
+    assigned: list[tuple[str, int]] = []
+    wi = 0
+    last_run = run_index[-1]
+    for token in text.split():
+        if wi < len(words) and norm(token) == norm(words[wi]["text"]):
+            assigned.append((token, run_index[wi]))
+            wi += 1
+        elif wi < len(words):
+            assigned.append((token, run_index[wi]))
+        else:
+            assigned.append((token, last_run))
+    return assigned
+
+
 def _merge_diarization_regions(
     segments: list[dict[str, Any]], regions: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
@@ -786,19 +836,35 @@ def _merge_diarization_regions(
             out.append(item)
             continue
         run_start = 0
+        run_index = [0] * len(words)
+        run_bounds: list[tuple[int, int]] = [(0, 0)]
         for i in range(1, len(words) + 1):
             if i < len(words) and word_spk[i] == word_spk[run_start]:
                 continue
-            run = words[run_start:i]
-            sub = {"text": " ".join(w["text"] for w in run),
+            run_bounds[-1] = (run_start, i)
+            for j in range(run_start, i):
+                run_index[j] = len(run_bounds) - 1
+            if i < len(words):
+                run_bounds.append((0, 0))
+                run_start = i
+        # Card t_1b74a0e5: sub-segment text is derived from the ORIGINAL
+        # segment text (never re-joined from the word vector, which drops
+        # words the text has and leaks language tags the text had
+        # stripped). Invariant: joining the run texts reproduces the
+        # original modulo whitespace.
+        run_tokens: list[list[str]] = [[] for _ in run_bounds]
+        for tok, run in _assign_tokens_to_runs(item["text"], words, run_index):
+            run_tokens[run].append(tok)
+        for k, (start, end) in enumerate(run_bounds):
+            run = words[start:end]
+            sub = {"text": " ".join(run_tokens[k]),
                    "t0": run[0]["t0"] if run[0]["t0"] > 0 else item["t0"],
                    "t1": run[-1]["t1"] if run[-1]["t1"] > 0 else item["t1"],
-                   "_speaker_raw": (word_spk[run_start]
-                                    if word_spk[run_start] is not None
+                   "_speaker_raw": (word_spk[start]
+                                    if word_spk[start] is not None
                                     else item["_speaker_raw"]),
                    "_words": run}
             out.append(sub)
-            run_start = i
     return out
 
 

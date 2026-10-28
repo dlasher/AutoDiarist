@@ -422,7 +422,7 @@ def _reconstruct_preserves_text(seg, regions):
     assert len(out) > 1, "two-speaker word runs must split the segment"
     assert len({s.get("_speaker_raw") for s in out}) > 1, out
     reconstructed = " ".join(
-        s["text"].split() for s in sorted(out, key=lambda s: s["t0"]))
+        t for s in sorted(out, key=lambda s: s["t0"]) for t in s["text"].split())
     assert reconstructed == " ".join(seg["text"].split()), (
         f"text lost across the split: "
         f"{sum(len(s['text'].split()) for s in out)} words rebuilt vs "
@@ -449,18 +449,38 @@ def test_split_keeps_words_the_word_vector_is_missing():
 
 def test_split_lost_word_attaches_to_the_run_around_the_timestamp_gap():
     # The panel's real shape: the vector skips a word entirely (no entry),
-    # and the token before it straddles the turn boundary -- 'gamma' sits in
-    # the 10-13 s gap, so it lands in the run holding the gap-adjacent word.
+    # and the missing token sits before the next matched word. Measured on
+    # the old path's output: 'with a focus' (absent from the vector) joined
+    # the run that STARTS with the next matched word ('on ...'), so extra
+    # tokens attach to the run of the NEXT matching word, falling back to
+    # the previous run at the segment tail.
     seg = {"text": "alpha beta gamma delta", "t0": 0.0, "t1": 16.0,
            "_speaker_raw": None,
            "_words": [{"text": "alpha", "t0": 0.5, "t1": 4.0},
                       {"text": "beta", "t0": 5.0, "t1": 11.0},
                       {"text": "delta", "t0": 15.0, "t1": 15.5}]}
-    # word_spk: alpha->0, beta->0 (10-11 overlap ties to lower index),
-    # delta->1. 'gamma' is not in the vector at all; old code dropped it.
+    # word_spk: alpha->0, beta->0 (5.0 vs 1.0 overlap), delta->1.
+    # 'gamma' is not in the vector at all; old code dropped it.
     out = _reconstruct_preserves_text(
         seg, [_region(0.0, 10.0, 0), _region(10.0, 16.0, 1)])
-    assert [s["text"] for s in out] == ["alpha beta gamma", "delta"]
+    assert [s["text"] for s in out] == ["alpha beta", "gamma delta"]
+
+
+def test_split_lost_words_at_segment_tail_join_previous_run():
+    # The tail case of the same rule: the vector stops mid-sentence, so the
+    # extra tokens have NO next matching word and land in the run of the
+    # PREVIOUS word ('our customizable strategic solutions allow.' -> the
+    # run holding the last vector word).
+    seg = {"text": "one two three four five", "t0": 0.0, "t1": 16.0,
+           "_speaker_raw": None,
+           "_words": [{"text": "one", "t0": 0.5, "t1": 2.0},
+                      {"text": "two", "t0": 2.5, "t1": 4.0},
+                      {"text": "three", "t0": 5.0, "t1": 9.0}]}
+    # all vector words -> spk0; extra tail tokens -> previous run (spk0).
+    out = tr._merge_diarization_regions(
+        [dict(seg)], [_region(0.0, 8.0, 0), _region(9.0, 16.0, 1)])
+    assert len(out) == 1, out  # single speaker: no split, text intact
+    assert out[0]["text"] == "one two three four five"
 
 
 def test_split_word_texts_are_also_language_tag_stripped():
@@ -468,7 +488,9 @@ def test_split_word_texts_are_also_language_tag_stripped():
     # (transcribe.py line 641) but the word vector was not (line 653), so a
     # tag inside a word text leaked into rebuilt output. Words must come out
     # tag-free too -- and reconstruction must still equal the original.
-    stripped = tr._strip_lang_tags("alpha <en-US> beta gamma <en-GB>delta")
+    # (Engine spacing: tags are emitted between spaces, so stripping does
+    # not join neighbouring tokens.)
+    stripped = tr._strip_lang_tags("alpha <en-US> beta gamma <en-GB> delta")
     assert stripped == "alpha beta gamma delta"
     seg = {"text": stripped, "t0": 0.0, "t1": 16.0, "_speaker_raw": None,
            "_words": [{"text": "alpha", "t0": 0.5, "t1": 4.0},
