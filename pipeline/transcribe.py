@@ -1547,7 +1547,14 @@ def transcribe_and_diarize(
             regions = run_sherpa_diarization(str(audio_path),
                                              progress=progress, cancel=cancel,
                                              duration=known)
-            _merge_diarization_regions(items, regions)
+            # CONTRACT: _merge_diarization_regions RETURNS a new list — the
+            # Phase-2 word-split sub-segments exist only there, never on the
+            # input items. Discarding the return (gate t_7685c6da regression)
+            # finalized the original one-segment ASR item and collapsed the
+            # panel clip to 1 speaker instead of 2; the direct-call merge
+            # tests could not see it because non-split segments mutate
+            # _speaker_raw in place.
+            items = _merge_diarization_regions(items, regions)
             segments = _finalize_segments(items)
         else:
             segments = _run_crispasr(str(audio_path), work_dir,

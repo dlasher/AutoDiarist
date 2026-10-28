@@ -58,9 +58,22 @@ short-file behaviour masked the defect from every earlier check.
   trap — so the stub's slowness, not file length, is what is asserted.
 - Config: new knob `CRISPASR_SHERPA_TIMEOUT_SEC` catalogued
   (`scripts/check-config-catalog.py` green at 63 entries).
-- Gates: AC2 byte-identity (segment count, speaker count, text hash) on
-  the 249 s panel and the 119-minute file runs on the NV host against
-  the pre-split reference; see the card handoff for results.
+- Gates: AC2 byte-identity (segment count, speaker count, text and full
+  JSON sha256) VERIFIED via the identity gate (`/root/identity_gate.sh`,
+  NV host, old baked path vs new split path in the same pinned container,
+  serial on the T400): on the intro clip the fixed branch reproduces the
+  OLD transcript exactly — old sha == new sha ==
+  `d9b0fbfcdc1dbb93501f4f10bcd91a9b0ede2cf9640811521c5f183ebc1e7266`
+  (4 segments, 2 speakers) — and the planner's round-1 panel gate on the
+  249 s fixture (18 segments, 3 speakers) was byte-identical as well
+  (full sha `cf5f569da282…`). The gate's run BEFORE the planner's
+  harness fix caught a real call-site regression — the merge's returned
+  list was discarded, collapsing the clip to 1 segment / 1 speaker —
+  fixed and pinned by a call-site test
+  (`test_transcribe_and_diarize_call_site_keeps_the_word_split`, which
+  fails with the fix reverted). The 119-minute identity gate is PENDING
+  (the long-file run had no surviving artifacts at handoff time); the
+  long-file live progress/ETA check is the planner's remaining step.
 
 ## [Unreleased] — transcript cache: per-request X-Cache opt-in (lookup AND store), CACHE_DISABLED kill switch, key = decoded-audio sha256 + config fingerprint + session (card t_ac748379)
 

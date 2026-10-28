@@ -247,6 +247,92 @@ def test_long_job_publishes_progress_during_slow_diarization(tmp_path, monkeypat
 
 
 # ---------------------------------------------------------------------------
+# CALL-SITE regression (gate t_7685c6da, planner receipt 06:14): the merge
+# RETURNS a new list — the word-split sub-segments exist ONLY there. The old
+# call site threw it away and finalized the original one-segment ASR item,
+# collapsing the panel clip to 1 speaker. The direct-call merge tests pass on
+# that broken code (in-place _speaker_raw mutation hides it when there are no
+# words), which is exactly the blind spot. This test goes through
+# transcribe_and_diarize() with the gate's shape and fails with the fix
+# reverted.
+# ---------------------------------------------------------------------------
+
+def _asr_fake_words(tmp_path: Path, argv_dump: Path) -> Path:
+    """ASR-only fake engine, -ojf shape: ONE segment carrying word times.
+
+    The nemotron -ojf JSON emits words with t0/t1 in centiseconds (the
+    parser divides by 100); the segment spans both diarizer regions, so
+    only the Phase-2 word split can reproduce the engine's own boundaries.
+    """
+    out = {
+        "transcription": [
+            {"timestamps": {"from": "00:00:00,000", "to": "00:00:20,000"},
+             "offsets": {"from": 0, "to": 20000},
+             "text": "alpha beta gamma delta",
+             "words": [
+                 {"text": "alpha", "t0": 50, "t1": 950},     # 0.5-9.5 s, spk0
+                 {"text": "beta", "t0": 1050, "t1": 1150},   # 10.5-11.5 s, spk0
+                 {"text": "gamma", "t0": 1350, "t1": 1450},  # 13.5-14.5 s, spk1
+                 {"text": "delta", "t0": 1550, "t1": 1950},  # 15.5-19.5 s, spk1
+             ],
+             "chunk_id": 0},
+        ]
+    }
+    marker = str(Path(argv_dump).with_name("engine-exited"))
+    script = f"""
+if [ "$1" = "--version" ]; then echo "ggml backends : cpu,cuda"; exit 0; fi
+printf '%s\\n' "$@" > {argv_dump}
+OF=""
+while [ $# -gt 0 ]; do
+  if [ "$1" = "-of" ]; then OF="$2"; fi
+  shift
+done
+echo "crispasr: progress = 100% (1/1 slices)" >&2
+cat > "$OF.json" <<'EOF'
+{json.dumps(out)}
+EOF
+touch {marker}
+"""
+    return _fake_binary(tmp_path, "crispasr-words", script)
+
+
+def test_transcribe_and_diarize_call_site_keeps_the_word_split(tmp_path,
+                                                               monkeypatch):
+    engine = _asr_fake_words(tmp_path, tmp_path / "engine-argv.txt")
+    sherpa = _fake_binary(
+        tmp_path, "sherpa-two-regions",
+        "printf '0.000 -- 12.000 speaker_00 duration=12.000\\n'\n"
+        "printf '13.000 -- 20.000 speaker_01 duration=7.000\\n'\n"
+        "exit 0\n")
+    monkeypatch.setenv("CRISPASR_BIN", str(engine))
+    monkeypatch.setenv("DIAR_METHOD", "sherpa")
+    monkeypatch.setenv("SHERPA_BIN", str(sherpa))
+    gguf = tmp_path / tr.Q4K_GGUF_NAME
+    gguf.write_bytes(b"ggmf")
+    monkeypatch.setenv("GGUF_MODEL", str(gguf))
+    for env, fname in (("SHERPA_SEGMENT_MODEL", "seg.onnx"),
+                       ("SHERPA_EMBEDDING_MODEL", "emb.onnx")):
+        (tmp_path / fname).write_bytes(b"onnx-stub")
+        monkeypatch.setenv(env, str(tmp_path / fname))
+    monkeypatch.setattr(tr, "_probe_duration", lambda path: 60.0)
+
+    segments = tr.transcribe_and_diarize(str(_wav_fixture(tmp_path)))
+
+    # The engine emitted ONE segment; the word split must return MORE, with
+    # BOTH speakers (gate shape: 4 segs / 2 speakers old == 4 / 2 new).
+    assert len(segments) > 1, segments
+    speakers = {s["speaker"] for s in segments}
+    assert len(speakers) > 1, segments
+    # And the split points sit at the word-run boundaries, engine order:
+    # spk0 words 0.5-11.5 s, spk1 words 13.5-19.5 s.
+    assert [(s["speaker"], round(s["t0"], 3), round(s["t1"], 3))
+            for s in segments] == [
+        ("Speaker 1", 0.5, 11.5),
+        ("Speaker 2", 13.5, 19.5),
+    ]
+
+
+# ---------------------------------------------------------------------------
 # Merge fidelity: pure replication of assign_speakers_from_sherpa
 # ---------------------------------------------------------------------------
 
