@@ -1200,6 +1200,26 @@ def _sherpa_timeout_seconds(duration: float) -> float:
 DIAR_HEARTBEAT_INTERVAL_DEFAULT = 2.0     # seconds between published ticks
 DIAR_CHUNK_ESTIMATE_DEFAULT = 2.0         # estimated seconds per tick
 DEFAULT_PROCESSING_RATE = 0.185           # s CPU per audio s (T400, api/main twin)
+# Measured diarization cost per second of audio (card t_79f9cdc6): the
+# stage is CPU-bound and costs ~3.6-3.8x the ASR stage — 0.3661 s/s-audio
+# on the 8411 s SEWP file, 0.4781 on the 249 s panel; the ratio is stable
+# across a 34x spread of audio length. api/main's _diarization_rate is the
+# ETA twin.
+DEFAULT_DIARIZATION_RATE = 0.3661         # s wall per audio s (T400 measured)
+
+
+def diarization_rate_per_audio_second() -> float:
+    """Seconds of diarization wall per second of audio (measured NV host,
+    card t_79f9cdc6): the stage's OWN cost knob
+    DIAR_SECONDS_PER_AUDIO_SECOND (default 0.3661 — 0.3661 s/s-audio on
+    the 8411 s SEWP file, 0.4781 on the 249 s panel, ~3.6-3.8x the ASR
+    stage). One rate constant cannot serve two stages measured 3.6-3.8x
+    apart: the ASR-priced tick model over-predicted the diarization work
+    and made the running-phase ETA GROW while the stage progressed.
+    Junk/zero falls back to the measured default like every heartbeat
+    knob (_env_positive_float discipline)."""
+    return _env_positive_float("DIAR_SECONDS_PER_AUDIO_SECOND",
+                               DEFAULT_DIARIZATION_RATE)
 
 
 def processing_rate_per_audio_second() -> float:
@@ -1395,8 +1415,11 @@ def run_sherpa_diarization(
     heartbeat: _DiarHeartbeat | None = None
     if progress is not None:
         interval, chunk = diar_heartbeat_settings()
+        # Card t_79f9cdc6: the stage is priced at ITS OWN measured rate —
+        # the ASR constant over-predicted the tick count 2.7x (779
+        # estimated vs 286 published on the 8411 s file).
         total, tick_seconds = diar_tick_plan(duration=duration,
-                                             rate=processing_rate_per_audio_second(),
+                                             rate=diarization_rate_per_audio_second(),
                                              chunk_seconds=chunk)
         if total > 0:
             heartbeat = _DiarHeartbeat(progress, total, interval, tick_seconds)

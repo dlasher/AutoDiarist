@@ -161,8 +161,19 @@ CATALOG: tuple[ConfigVar, ...] = (
               "2.0", "pipeline/transcribe.py",
               "Estimated CPU seconds of diarization work per heartbeat tick "
               "(card t_868131e3): total = ceil(audio x rate / this), rate = "
-              "PROCESSING_SECONDS_PER_AUDIO_SECOND. Non-numeric or "
-              "non-positive warns and keeps 2.0."),
+              "DIAR_SECONDS_PER_AUDIO_SECOND (card t_79f9cdc6 re-priced the "
+              "stage at its own measured rate; was the ASR constant). "
+              "Non-numeric or non-positive warns and keeps 2.0."),
+    ConfigVar("DIAR_SECONDS_PER_AUDIO_SECOND", "0.3661",
+              "pipeline/transcribe.py; api/main.py",
+              "Seconds of diarization wall time per second of audio. "
+              "Measured on the NV host: 0.3661 s/s-audio for the 8411 s "
+              "SEWP file and 0.4781 for the 249 s panel, against the ASR "
+              "stage's 0.1016 and 0.1245 - a stable ~3.6-3.8x across a 34x "
+              "spread of audio length. The heartbeat's tick total and the "
+              "running-phase ETA for the diarizing stage use THIS, not the "
+              "ASR rate (card t_79f9cdc6). Non-numeric or non-positive "
+              "falls back to the measured default."),
     ConfigVar("SHERPA_LD_LIBRARY_PATH", "/opt/sherpa/lib", "wrapper",
               "Library path the wrapper uses for the sherpa subprocess."),
     # ---- serving --------------------------------------------------------
