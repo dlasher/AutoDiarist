@@ -287,6 +287,33 @@ honesty chain (null until the new attempt genuinely advances past the
 preserved fraction), and one end-to-end
 drive through the real mock pipeline + production claim path polled live
 while `processing`. 528 passed / 2 skipped full suite; no GPU.
+## [Unreleased] — status payload honesty: `completed_at`, `audio_duration_seconds`, restart-reclaim markers (card t_73254ea6)
+
+Three additive fields on the job status payload; no existing field changed
+its name, type, or semantics.
+
+- **`completed_at`** — stamped by the SAME code path, under the same
+  `_queue_lock`, as the terminal status itself (`update_state` for
+  `done`/`failed`; the cancel endpoint for `cancelled`; first terminal
+  transition wins). Present on every terminal job, ABSENT (not `null`) on
+  `queued`/`processing` — clients can finally compute a job's own elapsed
+  time without wall-clock polling.
+- **`audio_duration_seconds`** — the probed audio length under an
+  unambiguous name for ratio-to-realtime math, kept in lockstep with the
+  existing `duration_seconds` (set at admission, refreshed by the
+  decode-time probe of the real 16k wav, `null` under the same conditions).
+- **Restart-reclaim markers** — an orphaned `processing` job requeued by
+  the boot pass now carries `interrupted_at` + `recovered_reason:
+  "service_restart"` alongside the existing "Requeued after service
+  restart" message. Chosen model: EXPLICIT FIELDS, status stays `queued`
+  — deliberately NOT a distinct status value, so the scheduler, in-flight
+  count, fair-share ordering, queue-depth accounting and the retention/
+  disk sweeps cannot be corrupted by a state they do not understand. The
+  reclaimed job stays claimable and its preserved progress never regresses.
+
+`tests/api/test_status_fields.py` (8 tests) pins every invariant, incl. a
+full lifecycle table for `completed_at` and a simulated crash/restart
+reclaim. Suite 508 -> 516 collected, all green.
 
 ## [Unreleased] — falsified "identical output" A/B claim corrected; both hosts' service-level concurrency curves published (card t_ee479fdf)
 
