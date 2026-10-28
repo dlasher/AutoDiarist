@@ -402,3 +402,136 @@ def test_sherpa_failure_raises_not_silent(monkeypatch, tmp_path):
     monkeypatch.setenv("SHERPA_BIN", str(fail))
     with pytest.raises(tr.CrispasrError):
         tr.run_sherpa_diarization(str(_wav_fixture(tmp_path)))
+
+
+# ---------------------------------------------------------------------------
+# Text-loss regression (card t_1b74a0e5, defect inside t_7685c6da):
+# the engine's SEGMENT text and its WORD VECTOR disagree -- segment text is
+# language-tag-stripped and can contain words the vector omits (measured on
+# the 249 s panel: text 3231 chars / 464 words vs word-join 2743 / 432, so
+# " ".join(w["text"] for w in run) dropped 32 interior words and leaked
+# <en-US> tags). Phase 2 must therefore SPLIT with the word timestamps but
+# derive the sub-segment texts from the ORIGINAL segment text, exactly like
+# the engine's assign_speakers_from_global_sherpa keeps the original.
+# Invariant: join(sub texts) == original segment text, per source segment.
+# ---------------------------------------------------------------------------
+
+def _reconstruct_preserves_text(seg, regions):
+    """Split `seg` and assert the sub-segments reproduce its text exactly."""
+    out = tr._merge_diarization_regions([seg], regions)
+    assert len(out) > 1, "two-speaker word runs must split the segment"
+    assert len({s.get("_speaker_raw") for s in out}) > 1, out
+    reconstructed = " ".join(
+        t for s in sorted(out, key=lambda s: s["t0"]) for t in s["text"].split())
+    assert reconstructed == " ".join(seg["text"].split()), (
+        f"text lost across the split: "
+        f"{sum(len(s['text'].split()) for s in out)} words rebuilt vs "
+        f"{len(seg['text'].split())} in the original segment:\n"
+        f"  rebuilt: {reconstructed!r}\n  original: {seg['text']!r}")
+    assert "<" not in reconstructed and ">" not in reconstructed, reconstructed
+    return out
+
+
+def test_split_keeps_words_the_word_vector_is_missing():
+    # Planner's exact shape: the word vector carries alpha/beta (tag-free),
+    # the segment text carries <en-US> plus a word the vector omits (gamma).
+    seg = {"text": "alpha beta gamma delta", "t0": 0.0, "t1": 16.0,
+           "_speaker_raw": None,
+           "_words": [{"text": "alpha", "t0": 0.5, "t1": 4.0},
+                      {"text": "beta", "t0": 5.0, "t1": 9.0},
+                      {"text": "gamma", "t0": 11.0, "t1": 14.0},
+                      {"text": "delta", "t0": 15.0, "t1": 15.5}]}
+    # word_spk: alpha->0, beta->0, gamma->1 (carry-forward), delta->1
+    out = _reconstruct_preserves_text(
+        seg, [_region(0.0, 10.0, 0), _region(10.0, 16.0, 1)])
+    assert [s["text"] for s in out] == ["alpha beta", "gamma delta"]
+
+
+def test_split_lost_word_attaches_to_the_run_around_the_timestamp_gap():
+    # The panel's real shape: the vector skips a word entirely (no entry),
+    # and the missing token sits before the next matched word. Measured on
+    # the old path's output: 'with a focus' (absent from the vector) joined
+    # the run that STARTS with the next matched word ('on ...'), so extra
+    # tokens attach to the run of the NEXT matching word, falling back to
+    # the previous run at the segment tail.
+    seg = {"text": "alpha beta gamma delta", "t0": 0.0, "t1": 16.0,
+           "_speaker_raw": None,
+           "_words": [{"text": "alpha", "t0": 0.5, "t1": 4.0},
+                      {"text": "beta", "t0": 5.0, "t1": 11.0},
+                      {"text": "delta", "t0": 15.0, "t1": 15.5}]}
+    # word_spk: alpha->0, beta->0 (5.0 vs 1.0 overlap), delta->1.
+    # 'gamma' is not in the vector at all; old code dropped it.
+    out = _reconstruct_preserves_text(
+        seg, [_region(0.0, 10.0, 0), _region(10.0, 16.0, 1)])
+    assert [s["text"] for s in out] == ["alpha beta", "gamma delta"]
+
+
+def test_split_lost_words_at_segment_tail_join_previous_run():
+    # The tail case of the same rule: the vector stops mid-sentence, so the
+    # extra tokens have NO next matching word and land in the run of the
+    # PREVIOUS word ('our customizable strategic solutions allow.' -> the
+    # run holding the last vector word).
+    seg = {"text": "one two three four five", "t0": 0.0, "t1": 16.0,
+           "_speaker_raw": None,
+           "_words": [{"text": "one", "t0": 0.5, "t1": 2.0},
+                      {"text": "two", "t0": 2.5, "t1": 4.0},
+                      {"text": "three", "t0": 5.0, "t1": 9.0}]}
+    # all vector words -> spk0; extra tail tokens -> previous run (spk0).
+    out = tr._merge_diarization_regions(
+        [dict(seg)], [_region(0.0, 8.0, 0), _region(9.0, 16.0, 1)])
+    assert len(out) == 1, out  # single speaker: no split, text intact
+    assert out[0]["text"] == "one two three four five"
+
+
+def test_split_word_texts_are_also_language_tag_stripped():
+    # AC2 of the split card: the segment text is stripped at parse time
+    # (transcribe.py line 641) but the word vector was not (line 653), so a
+    # tag inside a word text leaked into rebuilt output. Words must come out
+    # tag-free too -- and reconstruction must still equal the original.
+    # (Engine spacing: tags are emitted between spaces, so stripping does
+    # not join neighbouring tokens.)
+    stripped = tr._strip_lang_tags("alpha <en-US> beta gamma <en-GB> delta")
+    assert stripped == "alpha beta gamma delta"
+    seg = {"text": stripped, "t0": 0.0, "t1": 16.0, "_speaker_raw": None,
+           "_words": [{"text": "alpha", "t0": 0.5, "t1": 4.0},
+                      {"text": "<en-US> beta", "t0": 5.0, "t1": 9.0},
+                      {"text": "gamma", "t0": 11.0, "t1": 14.0},
+                      {"text": "<en-GB>delta", "t0": 15.0, "t1": 15.5}]}
+    out = _reconstruct_preserves_text(
+        seg, [_region(0.0, 10.0, 0), _region(10.0, 16.0, 1)])
+    assert [s["text"] for s in out] == ["alpha beta", "gamma delta"]
+
+
+def test_split_word_vector_missing_interior_sentence_words():
+    # The panel's second mechanism verbatim ('our customizable strategic
+    # solutions allow.'): the vector stops mid-sentence and the text carries
+    # extra tokens WITH punctuation. Punctuation-insensitive matching must
+    # reproduce the text exactly, period included.
+    original = "one two three four five six seven"
+    words = [{"text": "one", "t0": 0.5, "t1": 2.0},
+             {"text": "two", "t0": 2.5, "t1": 4.0},
+             {"text": "five", "t0": 9.0, "t1": 11.0},
+             {"text": "six", "t0": 12.0, "t1": 14.0},
+             {"text": "seven", "t0": 15.0, "t1": 15.5}]
+    seg = {"text": original, "t0": 0.0, "t1": 16.0, "_speaker_raw": None,
+           "_words": words}
+    # regions: spk0 0-10 (five straddles -> tie to lower), spk1 10-16
+    out = _reconstruct_preserves_text(
+        seg, [_region(0.0, 10.0, 0), _region(10.0, 16.0, 1)])
+    assert " ".join(s["text"] for s in out) == original
+
+
+def test_parse_crispasr_items_strips_lang_tags_from_word_texts():
+    # The word vector is built at parse time; its texts must be stripped
+    # exactly like the segment text, so any consumer of _words sees clean
+    # words (no <en-US> in output no matter how the text is derived).
+    payload = {"transcription": [{
+        "offsets": {"from": 0, "to": 6000},
+        "text": "alpha <en-US> beta gamma",
+        "words": [{"text": "alpha", "t0": 50, "t1": 2000},
+                  {"text": "<en-US> beta", "t0": 2500, "t1": 4000},
+                  {"text": "gamma", "t0": 4500, "t1": 5500}],
+    }]}
+    items = tr._parse_crispasr_items(payload)
+    assert items[0]["text"] == "alpha beta gamma"
+    assert [w["text"] for w in items[0]["_words"]] == ["alpha", "beta", "gamma"]
