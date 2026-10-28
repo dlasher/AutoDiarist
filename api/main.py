@@ -1489,12 +1489,16 @@ def _engine_progress(update_state):
     per-chunk boundaries refines within the band for free.
     """
 
-    def on_progress(stage: str, done: int, total: int) -> None:
+    def on_progress(stage: str, done: int, total: int,
+                    estimated: bool = False,
+                    estimate_method: str | None = None) -> None:
         public = _ENGINE_STAGES.get(
             stage, stage if stage in STAGE_PROGRESS else "transcribing")
         done = min(int(done), max(1, int(total)))
         update_state("processing", _stage_progress(public, done / max(1, total)),
-                     f"{public.capitalize()} pass {done}/{total}", stage=public)
+                     f"{public.capitalize()} pass {done}/{total}", stage=public,
+                     estimated=estimated or None,
+                     estimate_method=estimate_method)
 
     return on_progress
 
@@ -1534,7 +1538,8 @@ def process_job_background(token: str, audio_path: str, filename: str,
             raise JobCancelled(
                 f"cancellation requested by client: {token}")
 
-    def update_state(st, prog=None, msg="", err="", stage=None, dur=None, code=None):
+    def update_state(st, prog=None, msg="", err="", stage=None, dur=None,
+                     code=None, estimated=None, estimate_method=None):
         with _queue_lock:
             if state_file.exists():
                 try:
@@ -1608,6 +1613,20 @@ def process_job_background(token: str, audio_path: str, filename: str,
                     _running_eta_floor.pop(token, None)
                 if msg:
                     st_data["message"] = msg
+                # Card t_868131e3 AC4: a diarization heartbeat tick is a
+                # time-based ESTIMATE, never a measured work boundary, so
+                # the status must say so while that value is the newest
+                # progress. Every other publication (a real stage boundary
+                # or the final (total, total)) clears the marker — a
+                # client must never see a stale estimate label on top of
+                # measured progress.
+                if estimated:
+                    st_data["progress_estimated"] = True
+                    if estimate_method:
+                        st_data["progress_estimate_method"] = estimate_method
+                else:
+                    st_data.pop("progress_estimated", None)
+                    st_data.pop("progress_estimate_method", None)
                 if err:
                     st_data["error"] = err
                 tmp = job_dir / "status.json.tmp"
