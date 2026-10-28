@@ -566,6 +566,7 @@ failure happened, and each class has a different operator/client action:
 | `INPUT_TOO_LARGE` | The upload exceeded `MAX_UPLOAD_BYTES` (HTTP 413)                              | Smaller input; the bytes themselves are the problem.                  |
 | `ENGINE_CRASHED`  | The engine ran and failed with no known signature                              | Report a bug — include the `error` string.                            |
 | `CONFIG_ERROR`    | Deployment env is wrong (e.g. missing sherpa assets, bad `DIAR_METHOD`)        | Fix the environment; retrying the job cannot help.                    |
+| `DIARIZATION_DEGRADED` | The engine exited 0 but the diarization silently degraded (OOM-killed sherpa pre-pass -> collapsed speakers); the service REFUSED the transcript (card t_dc5c2abb) | Raise the container memory limit or lower concurrency, or use a shorter file; the `error` string carries the region count and the engine's own exit code. |
 | `INTERNAL`        | Honest catch-all for everything else (e.g. empty transcript results)           | Read the `error` string; nothing above matched.                       |
 
 Cancelled jobs are NOT failures: `error_code` is null on `cancelled`,

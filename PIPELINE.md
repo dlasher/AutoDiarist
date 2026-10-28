@@ -122,6 +122,20 @@ Engine JSON `transcription` entries map to pipeline Segment dicts
 - Zero surviving rows raises `CrispasrError` (an empty transcript is a job
   failure, never a silent fallback). A zero exit without the `.json` output
   file is likewise a hard `CrispasrError`.
+- Degradation guard (card t_dc5c2abb): before the JSON is even parsed,
+  `_reject_degraded_sherpa` inspects the engine's stderr for its OWN
+  fallback signatures (`sherpa global run failed with exit code N`,
+  `sherpa → N speaker regions over M ASR segments` — the latter prints
+  only on the degraded per-slice path, source-confirmed). Presence on
+  long audio (≥ `DIARIZATION_MIN_CHECK_SECONDS`) raises the typed
+  `DiarizationDegradedError` (`error_code: DIARIZATION_DEGRADED`): the
+  per-slice path re-initialises speaker identity every slice, so the
+  transcript is a fake even when labels exist. `_check_diarization_plausibility`
+  applies the duration-scaled region floor to any caller holding an
+  explicit region table (the split path runs the wrapper directly and
+  never sees the engine's stderr — it gets its own detection, card
+  scope item 4). Short audio is exempt by design: a 137 s single-speaker
+  recording is legitimate output, not a defect.
 
 ### Fragment merge
 
