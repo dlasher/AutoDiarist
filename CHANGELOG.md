@@ -1,5 +1,6 @@
 # Changelog
 
+<<<<<<< HEAD
 ## [Unreleased] — long-file progress: ASR/diarization split restores live per-slice progress on the shipped sherpa path (card t_7685c6da)
 
 **A long job's bar moves during ASR now — one progress value per engine
@@ -74,6 +75,41 @@ short-file behaviour masked the defect from every earlier check.
   fails with the fix reverted). The 119-minute identity gate is PENDING
   (the long-file run had no surviving artifacts at handoff time); the
   long-file live progress/ETA check is the planner's remaining step.
+=======
+## [Unreleased] — silent speaker collapse: the service now REFUSES degraded diarization (`DIARIZATION_DEGRADED`) instead of emitting a collapsed transcript (card t_dc5c2abb)
+
+A long file whose **global sherpa pre-pass is OOM-killed** (measured NV
+host: `sherpa global run failed with exit code 137` on an 8411 s
+7-speaker panel) silently falls back to per-slice sherpa and completed
+"successfully" with **2 speaker regions over 1 ASR segment** — a
+transcript with meaningless speaker labels the existing zero-label guard
+does not catch. A collapsed answer shipped is worse than a loud failure.
+
+- **New typed refusal** `pipeline.transcribe.DiarizationDegradedError`
+  and **new machine-readable `error_code: DIARIZATION_DEGRADED`**
+  (distinct from `OUT_OF_MEMORY`, which describes the *cause*: clients
+  branch on the diarization degradation itself; the engine message names
+  region count, audio duration, the engine's own exit code, and the
+  remedy — no container logs needed).
+- **Engine-path detection (AC5):** `_run_crispasr` now parses the
+  captured stderr for the engine's own degradation signatures before the
+  output is accepted. Source-confirmed invariant: `sherpa → N speaker
+  regions over M ASR segments` prints ONLY on the per-slice fallback
+  path (the healthy global pass prints `sherpa global → N`), so its
+  presence on long audio is conclusive.
+- **Region-table floor (split path, AC1/AC3):**
+  `_check_diarization_plausibility(regions, duration)` refuses long audio
+  with implausibly few regions (floor `max(2, minutes x rate)`) and is
+  the entry point the split path (card t_7685c6da, runs the wrapper
+  directly and never sees engine stderr) plugs into.
+- **Calibrated by measurement, not guessed:** the collapsed 8411 s run
+  produced 0.0143 regions/min vs 3.37 for the clean run (235x gap); the
+  `DIARIZATION_MIN_CHECK_SECONDS` (600) exemption keeps the measured
+  legitimate 137 s single-speaker control (0.44/min) ACCEPTED — a bare
+  rate floor would reject it. Both knobs are catalogued and
+  README/CONFIG/TROUBLESHOOTING/PIPELINE-documented.
+- The zero-label refusal (card t_5a287979) is unchanged and still fires.
+>>>>>>> origin/coder/t_dc5c2abb
 
 ## [Unreleased] — transcript cache: per-request X-Cache opt-in (lookup AND store), CACHE_DISABLED kill switch, key = decoded-audio sha256 + config fingerprint + session (card t_ac748379)
 

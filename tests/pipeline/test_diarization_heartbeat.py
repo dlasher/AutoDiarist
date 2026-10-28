@@ -72,9 +72,27 @@ def _sherpa_models(tmp_path: Path, monkeypatch) -> Path:
     return tmp_path / "seg.onnx"
 
 
-def _region_lines():
-    return ("printf '0.500 -- 3.000 speaker_00 duration=2.500\\n'\n"
-            "printf '3.000 -- 36.000 speaker_01 duration=33.000\\n'\n")
+def _region_lines(count: int = 2):
+    """Region table for the stub diarizer.
+
+    ``count`` regions spread over 36 s. The default 2 matches the
+    short-audio fixtures; long-audio fixtures must pass a count above
+    card t_dc5c2abb's duration-scaled floor, because a 2-region table over
+    long audio is the measured OOM-fallback shape and is refused.
+    """
+    if count <= 2:
+        return ("printf '0.500 -- 3.000 speaker_00 duration=2.500\\n'\n"
+                "printf '3.000 -- 36.000 speaker_01 duration=33.000\\n'\n")
+    lines = []
+    step = 36.0 / count
+    for i in range(count):
+        start = i * step
+        end = (i + 1) * step
+        # speaker_N with NO zero padding: the parser's strict regex is
+        # r"(\d+(?:\.\d+)?)\s+--\s+(\d+(?:\.\d+)?)\s+speaker_(\d+)"
+        lines.append("printf '%.3f -- %.3f speaker_%d duration=%.3f\\n'\n"
+                     % (start, end, i, step))
+    return "".join(lines)
 
 
 def _collector():
@@ -266,7 +284,12 @@ EOF
 def test_split_run_diar_band_moves_and_starts_after_asr(tmp_path, monkeypatch):
     marker = tmp_path / "engine-exited"
     engine = _asr_only_fake(tmp_path, marker)
-    stub = _fake_binary(tmp_path, "sherpa-slow4", "sleep 0.6\n" + _region_lines())
+    # 600 s of audio needs a REALISTIC region count: card t_dc5c2abb's
+    # guard refuses a 2-region table for long audio (the measured
+    # OOM-fallback shape), so a 2-region stub over 600 s would be
+    # correctly refused. 12 regions over 10 minutes is well above the
+    # floor (5) and keeps the fixture legitimate.
+    stub = _fake_binary(tmp_path, "sherpa-slow4", "sleep 0.6\n" + _region_lines(12))
     monkeypatch.setenv("CRISPASR_BIN", str(engine))
     monkeypatch.setenv("DIAR_METHOD", "sherpa")
     monkeypatch.setenv("SHERPA_BIN", str(stub))

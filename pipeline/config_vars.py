@@ -116,6 +116,15 @@ CATALOG: tuple[ConfigVar, ...] = (
               "Diarization backend; any other value is a CrispasrConfigError."),
     ConfigVar("MIN_FRAGMENT_SECONDS", "2.0", "pipeline/transcribe.py",
               "Fragments shorter than this are merged into neighbours at render."),
+    ConfigVar("DIARIZATION_MIN_REGIONS_PER_MINUTE", "0.5", "pipeline/transcribe.py",
+              "Speaker-region plausibility floor per audio minute (card "
+              "t_dc5c2abb). Measured calibration: the collapsed 8411 s run "
+              "produced 0.0143 regions/min vs 3.37 for the clean run; the "
+              "gap is 235x, so 0.5 is nowhere near a knife's edge."),
+    ConfigVar("DIARIZATION_MIN_CHECK_SECONDS", "600.0", "pipeline/transcribe.py",
+              "Small-audio exemption for the degradation guard: shorter "
+              "files are never judged by the region floor (a 137 s "
+              "single-speaker recording at 0.44 regions/min must PASS)."),
     ConfigVar("SILENCE_SPLIT_SECONDS", "1.5", "pipeline/renderer.py",
               "Silence gap that starts a new speaker run in the rendered report."),
     # ---- sherpa subprocess (diarization engine) -------------------------------

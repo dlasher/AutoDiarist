@@ -155,6 +155,20 @@ class CrispasrConfigError(CrispasrError):
     """CRISPASR_BIN / GGUF_MODEL / DIAR_METHOD configuration is invalid."""
 
 
+class DiarizationDegradedError(CrispasrError):
+    """The labeling diarization pass degraded to collapsed speaker
+    regions (card t_dc5c2abb).
+
+    Distinct from the zero-label CrispasrError (t_5a287979 AC4): there the
+    engine emitted NO labels at all (missing models); here the engine
+    exited 0 with a plausible-looking transcript whose speaker separation
+    is meaningless — the measured shape is 2 regions for 8411 s after the
+    global sherpa pre-pass was OOM-killed (exit 137) and the engine fell
+    back per-slice. Both refuse loudly; this one names the degradation,
+    the measured numbers, and the remedy.
+    """
+
+
 def _env_str(name: str, default: str = "") -> str:
     return os.environ.get(name, default).strip()
 
@@ -636,6 +650,189 @@ def _normalize_speakers(
                 "transcript"
             )
     return segments
+
+
+# ---------------------------------------------------------------------------
+# Sherpa degradation detection (card t_dc5c2abb)
+# ---------------------------------------------------------------------------
+#
+# The engine's GLOBAL sherpa pre-pass buffers the whole file; on long
+# audio it can be OOM-killed (exit 137), after which the engine silently
+# FALLS BACK to per-slice sherpa. Measured on the NV host (8411.072 s
+# panel file): the fallback produced 2 speaker regions over 1 ASR segment
+# and the run completed "successfully" with a collapsed-speaker transcript
+# the zero-label guard does not catch.
+#
+# Engine stderr signatures (source-confirmed in crispasr_diarize_cli.cpp,
+# v0.8.43: the 'over M ASR segments' line prints ONLY on the per-slice
+# fallback path; the global success path prints 'sherpa global -> N'):
+_SHERPA_GLOBAL_FAILED = re.compile(
+    r"sherpa global run (?:failed with exit code \d+"
+    r"|timed out after \d+ s|produced no segments)")
+_SHERPA_FALLBACK_REGIONS = re.compile(
+    r"sherpa →\s+(\d+) speaker regions over\s+(\d+) ASR segments")
+_SHERPA_GLOBAL_REGIONS = re.compile(
+    r"sherpa global →\s+(\d+) speaker regions")
+
+# Calibration (measured legit counts, card body + planner receipt):
+#   8411 s clean run  -> 472 regions, 6 speakers  (3.37 segments/min)
+#   8411 s DEFECT     ->   2 regions              (0.0143 regions/min)
+#   249 s panel       -> 18 segments, 3 speakers  (legit, exempt anyway)
+#   137 s control     ->  1 region,  1 speaker    (legit single-speaker;
+#         a BARE rate floor would reject it at 0.44/min — the exemption
+#         below is what keeps AC3 true)
+# The gap legit-vs-defect on long audio is a factor of 235, so the floor
+# constants are not a knife's edge. Refuse only when BOTH conditions
+# hold: audio long enough that a tiny region count cannot be a legitimate
+# recording, AND the region count below a floor that scales with
+# duration. Operator-tunable via the two knobs (catalogued in
+# pipeline/config_vars.py); defaults are the measured shape.
+DIARIZATION_MIN_REGIONS_PER_MINUTE_DEFAULT = 0.5
+DIARIZATION_MIN_CHECK_SECONDS_DEFAULT = 600.0
+
+
+def _parse_sherpa_stderr(text: str) -> dict[str, Any]:
+    """Extract the engine's own sherpa degradation signals from stderr.
+
+    Returns ``{global_failed, fallback_regions, fallback_asr_segments,
+    global_regions}``; the *_regions keys are None when the line was never
+    printed. Total on arbitrary input (never raises). LAST matching line
+    wins per pattern: the fallback path prints one 'over M ASR segments'
+    line per slice (slice-local numbers — see _reject_degraded_sherpa,
+    where PRESENCE of the line is the signal, not its count), and the
+    captured number is message evidence only.
+    """
+    signal: dict[str, Any] = {"global_failed": None,
+                              "fallback_regions": None,
+                              "fallback_asr_segments": None,
+                              "global_regions": None}
+    if not text:
+        return signal
+    for line in text.splitlines():
+        match = _SHERPA_GLOBAL_FAILED.search(line)
+        if match:
+            signal["global_failed"] = line.strip()
+        match = _SHERPA_FALLBACK_REGIONS.search(line)
+        if match:
+            signal["fallback_regions"] = int(match.group(1))
+            signal["fallback_asr_segments"] = int(match.group(2))
+        match = _SHERPA_GLOBAL_REGIONS.search(line)
+        if match:
+            signal["global_regions"] = int(match.group(1))
+    return signal
+
+
+def _diarization_region_floor(duration_seconds: float) -> int:
+    """Minimum speaker regions a duration-``duration_seconds`` diarization
+    must produce to be believable (card t_dc5c2abb, AC1 threshold shape:
+    absolute floor scaled with duration with the small-audio exemption
+    applied by the caller — see calibration block above)."""
+    rate = _env_float("DIARIZATION_MIN_REGIONS_PER_MINUTE",
+                      DIARIZATION_MIN_REGIONS_PER_MINUTE_DEFAULT)
+    if rate < 0:
+        rate = 0.0
+    return max(2, int(duration_seconds / 60.0 * rate))
+
+
+def _check_diarization_plausibility(
+    regions: Sequence[Any] | int,
+    duration_seconds: float | None,
+    *,
+    engine_signal: str | None = None,
+    transcript_summary: str | None = None,
+) -> None:
+    """Refuse a collapsed speaker-region table; loud, typed, diagnostic.
+
+    ``regions`` is the DIARIZER's speaker-region table (the split path's
+    wrapper output; on the engine path a stand-in carrying the engine's
+    own reported region count) — NOT the transcript segment count: the
+    two are different quantities (472 segments came from 6 speakers on
+    the clean 8411 s run). ``duration_seconds`` is the audio length;
+    None/short audio falls under the small-audio exemption.
+
+    Raises ``DiarizationDegradedError`` (maps to the NEW
+    ``DIARIZATION_DEGRADED`` error code, AC4: distinct from the zero-label
+    refusal and from OUT_OF_MEMORY even though OOM is the usual root
+    cause). Never rejects a legitimate single-speaker recording below the
+    check threshold (AC3)."""
+    if duration_seconds is None or duration_seconds <= 0:
+        return
+    min_check = _env_float("DIARIZATION_MIN_CHECK_SECONDS",
+                           DIARIZATION_MIN_CHECK_SECONDS_DEFAULT)
+    if duration_seconds < min_check:
+        # Small-audio exemption: a short recording with one or two
+        # regions is exactly what a single-speaker upload looks like.
+        return
+    count = len(regions) if isinstance(regions, Sequence) else int(regions)
+    floor = _diarization_region_floor(duration_seconds)
+    if count >= floor:
+        return
+    message = (
+        f"crispasr diarization degraded: {count} speaker regions for "
+        f"{duration_seconds:.0f} s of audio "
+        f"(floor {floor} regions at {duration_seconds / 60.0:.1f} min) — "
+        "the global sherpa pre-pass failed and the engine's per-slice "
+        "fallback collapsed the speakers; refusing to emit a "
+        "collapsed-speaker transcript. Likely cause: the pre-pass was "
+        "OOM-killed — raise the container memory limit (or lower "
+        "concurrency), or use a shorter file"
+    )
+    if engine_signal:
+        message += f". Engine signal: {engine_signal}"
+    if transcript_summary:
+        message += f". {transcript_summary}"
+    raise DiarizationDegradedError(message)
+
+
+def _reject_degraded_sherpa(stderr_path: str,
+                            duration_seconds: float | None) -> None:
+    """Engine-path degradation check from the captured stderr FILE (AC5).
+
+    Source invariant (crispasr 0.8.43 diarize_cli, confirmed by reading
+    the code): ``sherpa → N speaker regions over M ASR segments`` prints
+    ONLY when the global pre-pass cache was invalid and the engine fell
+    back to per-slice sherpa — the path that re-inits speaker identity
+    every slice; the healthy path prints ``sherpa global → N`` instead.
+    So on this path EITHER degradation line is conclusive for long
+    audio, independent of the region count: N here is slice-local and
+    small by construction. Short audio stays under the same
+    small-audio-exemption as the region-table floor: a single-slice file
+    degraded to per-slice is byte-for-byte the global result.
+    """
+    try:
+        text = Path(stderr_path).read_text(errors="replace")
+    except OSError:
+        return  # stderr unreadable: nothing to inspect, never invent
+    signal = _parse_sherpa_stderr(text)
+    degraded = signal["global_failed"] is not None \
+        or signal["fallback_regions"] is not None
+    if not degraded:
+        return
+    min_check = _env_float("DIARIZATION_MIN_CHECK_SECONDS",
+                           DIARIZATION_MIN_CHECK_SECONDS_DEFAULT)
+    if not duration_seconds or duration_seconds < min_check:
+        return
+    regions = signal["fallback_regions"]
+    parts = [
+        (f"crispasr diarization degraded: the global sherpa pre-pass failed "
+         f"and the engine fell back to per-slice diarization for "
+         f"{duration_seconds:.0f} s of audio")
+    ]
+    if regions is not None:
+        floor = _diarization_region_floor(duration_seconds)
+        parts.append(
+            f"last fallback line carried {regions} slice-local speaker "
+            f"regions (a duration-scaled floor of {floor} whole-file "
+            f"regions is the calibration from the measured 8411 s run: "
+            f"472 segments clean vs 2 regions collapsed)")
+    if signal["global_failed"]:
+        parts.append(f"Engine signal: {signal['global_failed']}")
+    parts.append(
+        "refusing to emit a collapsed-speaker transcript. Likely cause: "
+        "the pre-pass was OOM-killed (exit 137 = SIGKILL) — raise the "
+        "container memory limit (or lower concurrency), or use a "
+        "shorter file")
+    raise DiarizationDegradedError(". ".join(parts))
 
 
 def parse_crispasr_output(payload: Mapping[str, Any]) -> list[dict[str, Any]]:
@@ -1534,7 +1731,8 @@ def _run_crispasr(wav_path: str, work_dir: str,
                   progress: Callable[[str, int, int], None] | None = None,
                   chunk_total: int = 0,
                   cancel: CancelControl | None = None,
-                  raw_items: bool = False) -> list[dict[str, Any]]:
+                  raw_items: bool = False,
+                  duration_seconds: float | None = None) -> list[dict[str, Any]]:
     """One whole-file crispasr invocation -> parsed Segment dicts.
 
     Live progress needs TWO channels (card t_2e901945, measured on the
@@ -1721,6 +1919,22 @@ def _run_crispasr(wav_path: str, work_dir: str,
         payload = json.loads(Path(json_path).read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError) as exc:
         raise CrispasrError(f"cannot parse crispasr JSON at {json_path!r}: {exc}") from exc
+    # Card t_dc5c2abb: the engine exited 0 — but did its GLOBAL sherpa
+    # pre-pass silently degrade to the per-slice fallback on the way? The
+    # fallback line prints only on that path (source-confirmed), so its
+    # presence IS the degradation signal: the transcript is a fake with
+    # per-slice speaker identities, whatever the region count says.
+    # The duration-scaled region FLOOR is the split path's own detection
+    # (there the wrapper region table is the inspected quantity, not the
+    # engine's line); on this path the signal check is strictly stronger
+    # evidence than the floor, and the floor is what makes the message
+    # diagnostic with the measured numbers.
+    known_duration = (duration_seconds if duration_seconds and duration_seconds > 0
+                      else _probe_duration_quiet(wav_path))
+    _reject_degraded_sherpa(stderr_path, known_duration)
+    # Card t_7685c6da: raw_items hands the UNSPLIT items back so the
+    # split path can merge the pipeline-side diarization regions into
+    # them (the merge returns a NEW list; see _merge_diarization_regions).
     segments = _parse_crispasr_items(payload) if raw_items \
         else _finalize_segments(_parse_crispasr_items(payload))
     sampler.log_summary("crispasr_diarized_asr", fleet_cap)
@@ -1874,7 +2088,8 @@ def transcribe_and_diarize(
             # stage on the SAME 16 kHz mono wav the engine was handed.
             items = _run_crispasr(str(audio_path), work_dir,
                                   progress=progress, chunk_total=chunk_total,
-                                  cancel=cancel, raw_items=True)
+                                  cancel=cancel, raw_items=True,
+                                  duration_seconds=known)
             regions = run_sherpa_diarization(str(audio_path),
                                              progress=progress, cancel=cancel,
                                              duration=known)
@@ -1886,13 +2101,24 @@ def transcribe_and_diarize(
             # tests could not see it because non-split segments mutate
             # _speaker_raw in place.
             items = _merge_diarization_regions(items, regions)
+            # Card t_dc5c2abb: the split path has no engine stderr to
+            # inspect for the fallback line (the wrapper is spawned
+            # directly), so its degradation detection is the duration-
+            # scaled region FLOOR over the wrapper's own region table —
+            # the SAME _check_diarization_plausibility the engine path
+            # uses, applied to the region table instead of the engine's
+            # reported count.
+            _check_diarization_plausibility(regions, known)
             segments = _finalize_segments(items)
         else:
             segments = _run_crispasr(str(audio_path), work_dir,
                                      progress=progress, chunk_total=chunk_total,
-                                     cancel=cancel)
-        if progress is not None and not split:
-            progress("diar", 1, 1)
+                                     cancel=cancel,
+                                     duration_seconds=(duration
+                                                       if duration and duration > 0
+                                                       else None))
+    if progress is not None and not split:
+        progress("diar", 1, 1)
     if cancel is not None and cancel.cancelled():
         raise JobCancelled(
             "cancellation accepted at the diarization boundary: "

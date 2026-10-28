@@ -30,6 +30,14 @@ carry no code (AC7) — cancel and failure stay distinct signals.
   ENGINE_CRASHED    The engine ran and failed with no known signature
                     (non-zero exit, missing/unusable output). Action:
                     report a bug, include the ``error`` string.
+  DIARIZATION_DEGRADED
+                    The engine exited 0 but the speaker-diarization pass
+                    degraded silently (card t_dc5c2abb: the global sherpa
+                    pre-pass was OOM-killed and the per-slice fallback
+                    collapsed the speakers — measured 2 regions over a
+                    8411 s 7-speaker file). The service REFUSED to emit
+                    the transcript. Action: raise the container memory
+                    limit (or lower concurrency), or use a shorter file.
   CONFIG_ERROR      Deployment configuration is wrong — e.g. the loud
                     missing-sherpa-assets guard or a bad DIAR_METHOD.
                     Action: fix the env; retrying the same job cannot
@@ -50,6 +58,7 @@ import subprocess
 from pipeline.transcribe import (
     CrispasrConfigError,
     CrispasrError,
+    DiarizationDegradedError,
     TranscodeError,
     TranscriptionOOM,
 )
@@ -60,11 +69,12 @@ UNSUPPORTED_AUDIO = "UNSUPPORTED_AUDIO"
 INPUT_TOO_LARGE = "INPUT_TOO_LARGE"
 ENGINE_CRASHED = "ENGINE_CRASHED"
 CONFIG_ERROR = "CONFIG_ERROR"
+DIARIZATION_DEGRADED = "DIARIZATION_DEGRADED"
 INTERNAL = "INTERNAL"
 
 VOCABULARY = frozenset({
     OUT_OF_MEMORY, TIMEOUT, UNSUPPORTED_AUDIO, INPUT_TOO_LARGE,
-    ENGINE_CRASHED, CONFIG_ERROR, INTERNAL,
+    ENGINE_CRASHED, CONFIG_ERROR, DIARIZATION_DEGRADED, INTERNAL,
 })
 
 # Signatures are matched case-insensitively against the RAW recorded
@@ -79,6 +89,17 @@ _OOM_PATTERNS = re.compile(
     re.IGNORECASE,
 )
 _TIMEOUT_PATTERNS = re.compile(r"timed out|timeout(?: [=>]\d|\b )", re.IGNORECASE)
+# Card t_dc5c2abb: the silent-speaker-collapse refusal. Checked FIRST —
+# its message mentions the OOM kill as the *cause*, but the failure the
+# client must act on is the degraded diarization (the transcript), not a
+# bare memory crash: the remedy is memory limit/shorter file for the
+# diarization specifically, and callers branch on the distinct code.
+_DEGRADED_PATTERNS = re.compile(
+    r"diarization degraded|diarization produced \d+ speaker regions"
+    r"|\d+ speaker regions for [\d.]+ s of audio"
+    r"|sherpa pre-pass failed and the engine fell back",
+    re.IGNORECASE,
+)
 # Upload-over-cap text: the POST 413 detail ("File exceeds maximum size of
 # N bytes") and any HTTP 413 envelope that reached a job record.
 _SIZE_PATTERNS = re.compile(
@@ -114,6 +135,11 @@ def _text(exc: BaseException | None) -> str:
 
 def _classify_text(text: str) -> str | None:
     """Pattern rules; None when nothing specific matched."""
+    if _DEGRADED_PATTERNS.search(text):
+        # First: a degraded-diarization message may quote the OOM kill or
+        # the pre-pass timeout as the CAUSE; the failure class the client
+        # branches on is the diarization degradation itself.
+        return DIARIZATION_DEGRADED
     if _OOM_PATTERNS.search(text):
         return OUT_OF_MEMORY
     if _TIMEOUT_PATTERNS.search(text):
@@ -138,6 +164,10 @@ def classify(exc: BaseException | None = None, message: str = "") -> str:
     text = message or _text(exc)
     if isinstance(exc, TranscriptionOOM):
         return OUT_OF_MEMORY
+    if isinstance(exc, DiarizationDegradedError):
+        # Typed first: the guard raised this exact refusal; never let a
+        # trailing quoted OOM line steal the classification.
+        return DIARIZATION_DEGRADED
     specific = _classify_text(text)
     if specific is not None:
         return specific
